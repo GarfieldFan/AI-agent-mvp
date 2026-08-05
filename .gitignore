@@ -1,0 +1,21 @@
+# frontend has its own separate git repository (create-next-app scaffold init)
+/frontend/
+
+# machine-specific config — see .env.example for the template
+/.env
+
+# Claude Code local settings (personal, not shared)
+/.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# runtime data — uploaded RAG documents / CTE media uploads (backend/apis/documents.py, backend/apis/media.py)
+/backend/storage/
+
+# editor scratch space
+/.scratch/
+
+# stray Windows artifact, not real project content
+/backend/nul

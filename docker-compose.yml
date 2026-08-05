@@ -1,0 +1,86 @@
+services:
+  backend:
+    build: ./backend
+    container_name: mvp_fastapi_backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+      - "${COMFYUI_HOST_OUTPUT_DIR}:/comfy_output"
+    environment:
+      - DATABASE_URL=postgresql://my_user:my_password@postgres-db:5432/my_mvp_db
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+      # Everything below composes from the atomic values in .env (see
+      # .env.example) rather than being hardcoded — none of these are
+      # actually fixed: ComfyUI could be swapped for a different SD
+      # backend, a portable ComfyUI install can move, and host/ports
+      # differ per machine. Same "swappable, not hardcoded" principle
+      # already applied to the chat/embedding AI providers — see the root
+      # AGENTS.md's CTE section.
+      # Reachable *from inside this container* (server-side calls).
+      - COMFYUI_URL=http://${COMFYUI_HOST:-host.docker.internal}:${COMFYUI_PORT:-8188}
+      # Reachable *from the browser* — used to build <img> src URLs.
+      - COMFYUI_PUBLIC_URL=http://${HOST:-localhost}:${COMFYUI_PORT:-8188}
+      - COMFYUI_WS_URL=ws://${COMFYUI_HOST:-host.docker.internal}:${COMFYUI_PORT:-8188}/ws
+      - COMFYUI_OUTPUT_DIR=/comfy_output
+      # This backend's own browser-facing URL — needed to build absolute
+      # URLs for content it serves itself (e.g. CTE media-library
+      # uploads, apis/media.py), the same way COMFYUI_PUBLIC_URL does for
+      # ComfyUI-served images.
+      - BACKEND_PUBLIC_URL=http://${HOST:-localhost}:${BACKEND_PORT:-8000}
+      # RAG document uploads (backend/apis/documents.py). Lives under the
+      # existing ./backend bind mount (see volumes: below) — no separate
+      # named volume needed, and backend/.dockerignore keeps uploaded
+      # files from getting baked into the image on rebuild.
+      - DOCUMENT_STORAGE_DIR=/app/storage/documents
+      # CTE media-library uploads (backend/apis/media.py). Deliberately a
+      # *separate* directory from COMFYUI_OUTPUT_DIR above — user uploads
+      # shouldn't be tied to wherever the image-gen backend happens to
+      # write its own output, since that backend/location can change.
+      # Same bind-mount/.dockerignore reasoning as DOCUMENT_STORAGE_DIR.
+      - MEDIA_UPLOAD_DIR=/app/storage/media
+      - WATCHFILES_FORCE_POLLING=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - postgres-db
+
+  frontend:
+    build: ./frontend
+    container_name: mvp_nextjs_frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      # Consumed by the browser, not the Next.js server — see HOST's
+      # comment in .env.example: both containers publish their ports to
+      # the host, and the browser reaches them from outside Docker's
+      # network entirely.
+      - NEXT_PUBLIC_API_URL=http://${HOST:-localhost}:${BACKEND_PORT:-8000}
+      # Consumed by Next.js Server Components (running inside this
+      # container) — "backend" is the other service's docker-compose name,
+      # resolved via Docker's internal DNS. See lib/api.ts's comment: this
+      # is NOT interchangeable with NEXT_PUBLIC_API_URL above, and isn't
+      # HOST/BACKEND_PORT-derived for the same reason.
+      - INTERNAL_API_URL=http://backend:8000
+    depends_on:
+      - backend
+
+  postgres-db:
+    image: pgvector/pgvector:pg16
+    container_name: mvp_postgres_db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: my_user
+      POSTGRES_PASSWORD: my_password
+      POSTGRES_DB: my_mvp_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
