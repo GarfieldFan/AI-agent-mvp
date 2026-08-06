@@ -20,6 +20,36 @@ full every session; `HISTORY.md` is allowed to keep growing.
 ## Architecture snapshot
 
 ```
+                +----------------------+
+                |       Next.js UI     |
+                +----------+-----------+
+                           |
+                          REST
+                           |
+                +----------v-----------+
+                |        FastAPI        |
+                +----------+-----------+
+                           |
+        +------------------+------------------+
+        |                  |                  |
++-------v------+   +-------v------+   +-------v-------+
+| AI Providers |   |     RAG      |   | Agent console |
++-------+------+   +-------+------+   +-------+-------+
+        |                  |                  |
+  Ollama / OpenAI    pgvector DB +      deterministic
+  Anthropic /           Documents      pipelines only —
+    Gemini                              no LLM tool-
+                                       calling/agent loop
+                                        yet (CRM, ComfyUI
+                                         poster gen, page
+                                              gen)
+```
+
+REST only (no WebSocket — chat is a single non-streaming call today, see
+Phase 3 below). "Agent console" is the deliberate name, not "AI Agent" —
+see "Architecture decisions" below for why that distinction matters.
+
+```
 ai-employee/
 ├── ai-mvp-project-plan.pdf   the plan (source of truth for scope/rationale)
 ├── HISTORY.md                 full chronological development log — read on demand, not by default
