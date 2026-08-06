@@ -1,0 +1,186 @@
+"use client";
+
+import * as React from "react";
+import { Send } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { ChatMessageBubble } from "@/components/modules/chat/chat-message-bubble";
+import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { ErrorMessage } from "@/components/common/error-message";
+import { ApiError } from "@/lib/api";
+import { sendChatMessage, type ChatApiTurn } from "@/lib/chat";
+import type { ChatMessage, ChatOption } from "@/lib/types";
+
+// The intent-triage steps (0-3) below are a scripted local flow, not an LLM
+// call — see the project plan's chatbot module for the
+// intent-recognition -> structured-field-capture -> CRM/human handoff
+// shape this mirrors. Once that flow completes ("done"), free-text
+// messages go to the real backend (POST /api/chat — see backend/apis/chat.py),
+// which is RAG-grounded as of 2026-08-04: it answers from uploaded
+// documents when relevant (rendered below via SourceCitationList in
+// ChatMessageBubble) and falls back to plain conversation otherwise.
+// TODO(Phase 3): replace the scripted steps with LLM-driven
+// `{ type, options }` responses too, once the backend can produce them.
+const CATEGORY_OPTIONS: ChatOption[] = [
+  { label: "General inquiry", value: "general" },
+  { label: "Technical support", value: "support" },
+  { label: "Careers", value: "careers" },
+];
+
+const TAG_OPTIONS: ChatOption[] = [
+  { label: "Urgent", value: "urgent" },
+  { label: "Needs a callback", value: "callback" },
+  { label: "Just browsing", value: "browsing" },
+];
+
+const CHANNEL_OPTIONS: ChatOption[] = [
+  { label: "Email", value: "email" },
+  { label: "Phone", value: "phone" },
+  { label: "No preference", value: "none" },
+];
+
+function labelFor(options: ChatOption[], value: string) {
+  return options.find((option) => option.value === value)?.label ?? value;
+}
+
+export function ChatPanel() {
+  // Starts at 1 so it never collides with the seed message's "msg-0" — kept
+  // out of the useState initializer below since refs must not be read
+  // during render, only from event handlers.
+  const idRef = React.useRef(1);
+  const nextId = () => `msg-${idRef.current++}`;
+
+  const [messages, setMessages] = React.useState<ChatMessage[]>(() => [
+    {
+      id: "msg-0",
+      role: "assistant",
+      content: "Hi! I can help route your question. What would you like help with?",
+      control: { type: "radio", options: CATEGORY_OPTIONS },
+      createdAt: new Date(0).toISOString(),
+    },
+  ]);
+  const [step, setStep] = React.useState<0 | 1 | 2 | 3 | "done">(0);
+  const [draft, setDraft] = React.useState("");
+  const [pending, setPending] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const bottomRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, pending, error]);
+
+  function pushMessage(message: Omit<ChatMessage, "id" | "createdAt">) {
+    setMessages((prev) => [
+      ...prev,
+      { ...message, id: nextId(), createdAt: new Date(0).toISOString() },
+    ]);
+  }
+
+  function handleControlSubmit(value: string | string[]) {
+    if (step === 0 && typeof value === "string") {
+      pushMessage({ role: "user", content: labelFor(CATEGORY_OPTIONS, value) });
+      pushMessage({
+        role: "assistant",
+        content: "Got it. Do any of these apply to you? (select all that fit)",
+        control: { type: "checkbox", options: TAG_OPTIONS },
+      });
+      setStep(1);
+      return;
+    }
+
+    if (step === 1 && Array.isArray(value)) {
+      pushMessage({
+        role: "user",
+        content: value.map((v) => labelFor(TAG_OPTIONS, v)).join(", ") || "None",
+      });
+      pushMessage({
+        role: "assistant",
+        content: "Thanks — what's the best way to follow up with you?",
+        control: { type: "select", options: CHANNEL_OPTIONS },
+      });
+      setStep(2);
+      return;
+    }
+
+    if (step === 2 && typeof value === "string") {
+      pushMessage({ role: "user", content: labelFor(CHANNEL_OPTIONS, value) });
+      pushMessage({
+        role: "assistant",
+        content: "Anything else you'd like us to know? (optional — type below and send)",
+        control: { type: "text" },
+      });
+      setStep(3);
+    }
+  }
+
+  async function handleSend(event: React.FormEvent) {
+    event.preventDefault();
+    const text = draft.trim();
+    if (!text || pending) return;
+
+    const history: ChatApiTurn[] = messages
+      .filter((message) => message.content)
+      .map((message) => ({ role: message.role, content: message.content }));
+
+    pushMessage({ role: "user", content: text });
+    setDraft("");
+    setError(null);
+
+    if (step === 3) {
+      pushMessage({
+        role: "assistant",
+        content:
+          "Thanks — that's been captured. (CRM handoff and live agent transfer are placeholder integrations for now.)",
+      });
+      setStep("done");
+      return;
+    }
+
+    setPending(true);
+    try {
+      const { reply, sources } = await sendChatMessage(text, history);
+      pushMessage({ role: "assistant", content: reply, sources: sources.length ? sources : undefined });
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Could not reach the chat backend.";
+      setError(message);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <div className="flex h-[32rem] flex-col overflow-hidden rounded-xl border">
+      <ScrollArea className="flex-1 p-4">
+        <div className="flex flex-col gap-3">
+          {messages.map((message) => (
+            <ChatMessageBubble
+              key={message.id}
+              message={message}
+              onControlSubmit={handleControlSubmit}
+            />
+          ))}
+          {pending ? <LoadingSpinner label="Thinking…" className="pl-1" /> : null}
+          {error ? (
+            <ErrorMessage description={error} onRetry={() => setError(null)} />
+          ) : null}
+          <div ref={bottomRef} />
+        </div>
+      </ScrollArea>
+
+      <form onSubmit={handleSend} className="flex items-center gap-2 border-t p-3">
+        <Input
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          placeholder="Type a message…"
+          className="flex-1"
+          disabled={pending}
+        />
+        <Button type="submit" size="icon" aria-label="Send message" disabled={!draft.trim() || pending}>
+          <Send className="size-4" />
+        </Button>
+      </form>
+    </div>
+  );
+}
