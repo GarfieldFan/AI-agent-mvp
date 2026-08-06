@@ -14,7 +14,41 @@ action, even under prompt injection.
 
 ## Demo
 
-[Watch the walkthrough on YouTube](https://youtu.be/dWj7zUT_sXU)
+[![Watch the walkthrough on YouTube](https://img.youtube.com/vi/dWj7zUT_sXU/maxresdefault.jpg)](https://youtu.be/dWj7zUT_sXU)
+
+## Architecture
+
+```
+                +----------------------+
+                |       Next.js UI     |
+                +----------+-----------+
+                           |
+                          REST
+                           |
+                +----------v-----------+
+                |        FastAPI        |
+                +----------+-----------+
+                           |
+        +------------------+------------------+
+        |                  |                  |
++-------v------+   +-------v------+   +-------v-------+
+| AI Providers |   |     RAG      |   | Agent console |
++-------+------+   +-------+------+   +-------+-------+
+        |                  |                  |
+  Ollama / OpenAI    pgvector DB +      deterministic
+  Anthropic /           Documents      pipelines only —
+    Gemini                              no LLM tool-
+                                       calling/agent loop
+                                        yet (CRM, ComfyUI
+                                         poster gen, page
+                                              gen)
+```
+
+REST only — chat is a single non-streaming call today. "Agent console"
+is the deliberate name, not "AI agent": every capability behind it
+(CRM, ComfyUI poster generation, page generation) is a deterministic
+pipeline call today, not an LLM tool-calling loop — see "Why it's
+architecturally interesting" below.
 
 ## What it does
 
