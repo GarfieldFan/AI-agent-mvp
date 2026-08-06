@@ -19,3 +19,6 @@ __pycache__/
 
 # stray Windows artifact, not real project content
 /backend/nul
+
+# personal interview-prep notes, not project content
+/interview-talking-points.md
