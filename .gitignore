@@ -1,6 +1,3 @@
-# frontend has its own separate git repository (create-next-app scaffold init)
-/frontend/
-
 # machine-specific config — see .env.example for the template
 /.env
 
