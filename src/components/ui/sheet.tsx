@@ -41,14 +41,21 @@ function SheetContent({
   children,
   side = "right",
   showCloseButton = true,
+  showOverlay = true,
   ...props
 }: SheetPrimitive.Popup.Props & {
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
+  /** Added 2026-08-06 for CTE's live style editor — that sheet stays open
+   * while the admin tries several values and watches the page update
+   * behind it, so a dimming/blurring overlay actively works against the
+   * point. Defaults to `true` (unchanged behavior for every other Sheet
+   * use, e.g. MobileNav, where a backdrop is the normal, wanted thing). */
+  showOverlay?: boolean
 }) {
   return (
     <SheetPortal>
-      <SheetOverlay />
+      {showOverlay && <SheetOverlay />}
       <SheetPrimitive.Popup
         data-slot="sheet-content"
         data-side={side}

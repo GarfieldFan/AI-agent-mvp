@@ -2,6 +2,7 @@ import { cn } from "@/lib/utils";
 import { Container } from "@/components/layout/container";
 import { Editable } from "@/components/theme/cte/editable";
 import { ThemeIcon } from "@/components/theme/icon-registry";
+import { resolveRichText, richTextStyle } from "@/components/theme/rich-text";
 import { ThemeImageBox } from "@/components/theme/theme-image-box";
 import type { TextBlockSection as TextBlockSectionData } from "@/lib/theme";
 
@@ -17,6 +18,9 @@ export function TextBlockSection({
   image_position = "right",
   background_image,
 }: TextBlockSectionProps) {
+  const headingRt = resolveRichText(heading);
+  const bodyRt = resolveRichText(body);
+
   // Mutually exclusive with `image` — a section either sits over a photo
   // or beside one, not both. See lib/theme.ts's field comments.
   if (background_image) {
@@ -34,14 +38,14 @@ export function TextBlockSection({
         <div className="absolute inset-0 bg-black/55" />
         <Container className="relative py-24 text-center">
           <div className="mx-auto max-w-2xl space-y-2 text-white">
-            <h2 className="text-2xl font-semibold">
-              <Editable path={`${sectionIndex}.heading`} fieldType="text" value={heading}>
-                {heading}
+            <h2 className="text-2xl font-semibold" style={richTextStyle(headingRt)}>
+              <Editable path={`${sectionIndex}.heading`} fieldType="rich-text" value={headingRt}>
+                {headingRt.content}
               </Editable>
             </h2>
-            <p className="text-sm text-white/85">
-              <Editable path={`${sectionIndex}.body`} fieldType="text" value={body}>
-                {body}
+            <p className="text-sm text-white/85" style={richTextStyle(bodyRt)}>
+              <Editable path={`${sectionIndex}.body`} fieldType="rich-text" value={bodyRt}>
+                {bodyRt.content}
               </Editable>
             </p>
           </div>
@@ -59,14 +63,14 @@ export function TextBlockSection({
     >
       {icon ? <ThemeIcon name={icon} className="mt-1 size-6 shrink-0 text-primary" /> : null}
       <div className="space-y-1">
-        <h2 className="text-xl font-semibold">
-          <Editable path={`${sectionIndex}.heading`} fieldType="text" value={heading}>
-            {heading}
+        <h2 className="text-xl font-semibold" style={richTextStyle(headingRt)}>
+          <Editable path={`${sectionIndex}.heading`} fieldType="rich-text" value={headingRt}>
+            {headingRt.content}
           </Editable>
         </h2>
-        <p className="max-w-xl text-sm text-muted-foreground">
-          <Editable path={`${sectionIndex}.body`} fieldType="text" value={body}>
-            {body}
+        <p className="max-w-xl text-sm text-muted-foreground" style={richTextStyle(bodyRt)}>
+          <Editable path={`${sectionIndex}.body`} fieldType="rich-text" value={bodyRt}>
+            {bodyRt.content}
           </Editable>
         </p>
       </div>

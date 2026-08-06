@@ -21,17 +21,69 @@ export type ThemeImage = {
   alt: string;
 };
 
+export type TextSize = "sm" | "base" | "lg" | "xl" | "2xl" | "3xl";
+export type TextWeight = "normal" | "medium" | "semibold" | "bold";
+
+/** A styled text field — added 2026-08-06 for CTE style editing. Every
+ * headline/heading/subheading/body field below accepts `string |
+ * RichText`: a plain string (the only shape the vision LLM ever
+ * produces, and every field's original shape before this existed) means
+ * "use this section's own default styling, unchanged" — only a CTE edit
+ * that actually sets a color/size/weight upgrades a field to this object
+ * form. Deliberately not a set of `xxx_color`/`xxx_size`/`xxx_weight`
+ * sibling fields per text field, which would multiply badly across every
+ * section type — one shared shape instead. Still fully controlled data
+ * (a hex color, a bounded number, a fixed weight enum), never free-form
+ * CSS — same principle as every other style field in this schema; see
+ * `components/theme/rich-text.tsx` for how it's resolved/rendered.
+ *
+ * `size` is a plain pixel number, not the small `TextSize` enum
+ * `TextContentBlock` uses — changed same-day after real testing showed
+ * the enum's top stop (`"3xl"`, 1.875rem/30px) couldn't even reach a
+ * Hero headline's own *default* size (`text-4xl`/`sm:text-5xl`,
+ * 36-48px), let alone exceed it. A headline can legitimately need
+ * anywhere from small print to a huge display size depending on the
+ * source design — a 6-stop enum can't cover that range the way it can
+ * for a body-text field, so this one field gets a bounded numeric input
+ * instead (see the popover's `RT_SIZE_MIN`/`RT_SIZE_MAX`). Still not
+ * arbitrary CSS: one clamped number, applied as `fontSize` in px, same
+ * inline-style mechanism as before. */
+export type RichText = {
+  content: string;
+  color?: string;
+  size?: number;
+  weight?: TextWeight;
+};
+
 export type ThemeCta = {
   label: string;
   href: string;
   variant?: "default" | "outline" | "secondary" | "ghost" | "link";
+  /** Added 2026-08-06 for CTE style editing — plain hex, applied as
+   * inline `style` (same pattern `ButtonBlock` already uses for its own
+   * colors). All three optional; unset means "use `variant`'s fixed
+   * palette," so every existing CTA renders unchanged. `border_color` set
+   * with no `background_color` reads as an outline-style button, same
+   * convention as `ButtonBlock`. */
+  background_color?: string;
+  text_color?: string;
+  border_color?: string;
+  /** Added 2026-08-06, same fixed-stop pattern as `ButtonBlock.rounded`.
+   * Unset keeps the Button component's own default (`rounded-lg`). */
+  rounded?: "none" | "sm" | "lg" | "full";
+  /** Added 2026-08-06 — overrides the fixed `size="lg"` every CTA button
+   * rendered at before this existed. Unset keeps that same "lg" default,
+   * so no existing page changes. */
+  size?: "sm" | "default" | "lg";
+  /** Added 2026-08-06. Only meaningful alongside `border_color`. */
+  border_width?: "thin" | "thick";
 };
 
 export type HeroSection = {
   type: "hero";
   eyebrow?: string;
-  headline: string;
-  subheadline?: string;
+  headline: string | RichText;
+  subheadline?: string | RichText;
   ctas?: ThemeCta[];
   /** Optional — when present, the hero renders two-column (text + image)
    * instead of centered text-only. `image.url` is usually just `"#"` (the
@@ -39,6 +91,19 @@ export type HeroSection = {
    * URL for it) — HeroSection/ThemeImageBox render a placeholder in that
    * case, never a gap or a broken <img>. */
   image?: ThemeImage;
+  /** Added 2026-08-05. Plain hex color (same controlled pattern as
+   * `ContainerBlock.background_color`) for a colored banner-style hero —
+   * without this, a hero with a distinct background color (e.g. a
+   * full-width yellow strip behind just the headline/subheadline, common
+   * right above a separate full-width photo section) had no way to be
+   * represented at all; the hero always used the page's fixed neutral
+   * background. */
+  background_color?: string;
+  /** Added 2026-08-05. Which side `image` renders on; defaults to
+   * `"right"` (text first, image second — the only order this section
+   * supported before this field existed, so every hero that omits it
+   * renders unchanged). Mirrors `TextBlockSection.image_position`. */
+  image_position?: "left" | "right";
 };
 
 export type FeatureItem = {
@@ -50,13 +115,26 @@ export type FeatureItem = {
    * line-art icon, for design blocks the source image showed as photos
    * (e.g. product/people shots) rather than iconography. */
   image?: ThemeImage;
+  /** Added 2026-08-05. Only meaningful when `image` is set. "avatar"
+   * renders `image` as a small circular headshot beside the title instead
+   * of a large rectangular photo card — the testimonial/review pattern
+   * (round profile photo + name + quote), which the plain rectangular
+   * card ("photo", the default) doesn't fit at all. */
+  image_style?: "photo" | "avatar";
   badge?: string;
 };
 
 export type FeatureGridSection = {
   type: "feature-grid";
-  heading?: string;
-  subheading?: string;
+  heading?: string | RichText;
+  subheading?: string | RichText;
+  /** Added 2026-08-05. Only meaningful for `layout: "split"` — a longer
+   * supporting paragraph in the left column, below heading/subheading
+   * (e.g. "We handle affidavits, acknowledgments, jurats..."). */
+  body?: string | RichText;
+  /** Added 2026-08-05. Only meaningful for `layout: "split"` — a single
+   * button in the left column, below heading/subheading/body. */
+  cta?: ThemeCta;
   items: FeatureItem[];
   columns?: 2 | 3 | 4;
   /** "split" puts heading/subheading in a left column and the item grid
@@ -64,6 +142,18 @@ export type FeatureGridSection = {
    * full-width grid. Matches designs where a heading sits beside — not
    * above — its grid. */
   layout?: "stacked" | "split";
+  /** Added 2026-08-05. Controls each item's visual chrome — "card" (the
+   * default: rounded box with a border/background, the existing
+   * avatar/photo/icon variants) vs "plain" (same grid/row arrangement as
+   * "card", but no border/background — image position controlled by
+   * `item_image_position`) vs "list" (ignores `columns` entirely: a
+   * single-column vertical list of rows, a small image on the left and
+   * text on the right, divided by a line between rows). Not every design
+   * presents repeated items as cards. */
+  item_style?: "card" | "plain" | "list";
+  /** Only meaningful when `item_style` is "plain" — whether each item's
+   * image renders above ("top", default) or below its text. */
+  item_image_position?: "top" | "bottom";
 };
 
 export type CarouselSection = {
@@ -75,8 +165,8 @@ export type CarouselSection = {
 export type TextBlockSection = {
   type: "text-block";
   icon?: string;
-  heading: string;
-  body: string;
+  heading: string | RichText;
+  body: string | RichText;
   align?: "left" | "center";
   /** Side-by-side text + image, like Hero's `image`. Ignored if
    * `background_image` is set (the two are mutually exclusive layouts). */
@@ -90,16 +180,159 @@ export type TextBlockSection = {
 
 export type CtaBannerSection = {
   type: "cta-banner";
-  heading: string;
-  body?: string;
+  heading: string | RichText;
+  body?: string | RichText;
   ctas: ThemeCta[];
 };
 
 export type BadgeListSection = {
   type: "badge-list";
-  heading: string;
+  heading: string | RichText;
   badges: string[];
 };
+
+/** Generic, composable block primitives — added 2026-08-05 alongside
+ * `ContainerBlock` below, distinct from the fixed composite sections
+ * above (Hero, FeatureGrid, ...). Prompted by a concrete gap: a source
+ * design with a row split into two 50/50 columns, each with its own
+ * padding around an image+caption, has no composite section shape that
+ * matches it — `generate_landing_page` could only approximate it as
+ * padding on a couple of unrelated cards, losing the actual row/column
+ * structure. `ContainerBlock` (row/column/grid, arbitrarily nestable)
+ * exists to express layouts like that directly, with `ImageBlock` /
+ * `TextContentBlock` / `ButtonBlock` as its children.
+ *
+ * Deliberately a SMALL, fixed set — this is not a general page-builder
+ * block library (no input/textarea/select-type blocks; the chatbot
+ * handles interactive/form needs elsewhere) and there's no free-form CSS
+ * anywhere in it. Every style knob is a constrained enum or a plain hex
+ * color string, the same "controlled, not open-ended" pattern
+ * `GeneratedPage.accent_color` already established — a vision LLM (or a
+ * human via CTE) can pick a color or a size, never write arbitrary CSS. */
+
+/** How much of a `layout: "row"` container's width one child should take,
+ * relative to its siblings — added 2026-08-05 for uneven splits (e.g. a
+ * banner's headline column wider than its subheadline column). A small,
+ * fixed set of discrete stops rather than an arbitrary fraction/percentage
+ * on purpose: the exact ratio the vision LLM picks matters far less than
+ * it reliably picking *some* reasonable uneven split when one exists —
+ * matches the same "controlled options, not open-ended values" reasoning
+ * as every other enum in this schema. "auto" (the default) means an equal
+ * share among every sibling that's also "auto" — unchanged from this
+ * schema's original behavior, so no existing saved page's rendering
+ * changes just because this field now exists. Meaningless outside
+ * `layout: "row"` (column/grid children size differently) — ignored
+ * there. */
+export type BlockWidth = "auto" | "1/4" | "1/3" | "1/2" | "2/3" | "3/4" | "full";
+
+export type ImageBlock = {
+  type: "image";
+  image: ThemeImage;
+  aspect_ratio?: "square" | "video" | "portrait" | "auto";
+  rounded?: "none" | "sm" | "lg" | "full";
+  width?: BlockWidth;
+};
+
+/** Named TextContentBlock, not TextBlock, to avoid colliding with
+ * `TextBlockSection` above — that's a fixed composite (icon+heading+body,
+ * optional image), this is a single, atomic run of styled text with no
+ * fixed shape of its own. */
+export type TextContentBlock = {
+  type: "text";
+  content: string;
+  size?: TextSize;
+  weight?: TextWeight;
+  /** Hex color, e.g. "#c9a227" — same controlled-color pattern as
+   * `accent_color`. Falls back to the theme's default text color when
+   * unset, not literally forced to black/white. */
+  color?: string;
+  align?: "left" | "center" | "right";
+  width?: BlockWidth;
+};
+
+export type ButtonBlock = {
+  type: "button";
+  label: string;
+  href: string;
+  background_color?: string;
+  text_color?: string;
+  /** When set, renders an outlined button in this color instead of a
+   * filled one — border color and "is this outlined" are the same knob,
+   * there's no separate filled-with-a-visible-border style. */
+  border_color?: string;
+  /** Added 2026-08-06, same fixed-stop pattern as `ImageBlock.rounded`.
+   * Unset keeps the Button component's own default (`rounded-lg`). */
+  rounded?: "none" | "sm" | "lg" | "full";
+  /** Added 2026-08-06 — a small button reads very differently from a
+   * hero CTA; both are common in real designs. Unset keeps whatever size
+   * the rendering call site already hardcodes. */
+  size?: "sm" | "default" | "lg";
+  /** Added 2026-08-06. Only meaningful alongside `border_color`. Unset
+   * (or "thin") is the existing 1px border every button already had;
+   * "thick" is a heavier 2px border for designs with a bolder outline. */
+  border_width?: "thin" | "thick";
+  width?: BlockWidth;
+};
+
+export type ContainerBlock = {
+  type: "container";
+  layout: "row" | "column" | "grid";
+  /** Only meaningful for `layout: "grid"`. */
+  columns?: 2 | 3 | 4;
+  gap?: "none" | "sm" | "md" | "lg";
+  padding?: "none" | "sm" | "md" | "lg";
+  /** Added 2026-08-06 — CTE style-editing pass. Same fixed-stop pattern as
+   * `padding` (space outside the container's own border, vs. `padding`'s
+   * space inside it). Omitted/`"none"` renders exactly as before this
+   * field existed. */
+  margin?: "none" | "sm" | "md" | "lg";
+  background_color?: string;
+  /** Full-bleed background photo behind the container's children — same
+   * "no real URL means a placeholder, never a gap" handling as every
+   * other `ThemeImage` use in this schema (see `ThemeImageBox`). */
+  background_image?: ThemeImage;
+  border_color?: string;
+  /** Cross-axis alignment for `row`/`column` layouts (e.g. a "row" with
+   * `align: "center"` vertically centers shorter children next to a
+   * taller one). Ignored for `grid`. */
+  align?: "start" | "center" | "end" | "stretch";
+  /** Added 2026-08-06. Main-axis alignment for `row`/`column` layouts —
+   * `align`'s counterpart on the other axis. This is what actually lets a
+   * container's content lean left/right (`row`) or top/bottom (`column`)
+   * instead of only ever starting flush at the beginning of the axis.
+   * Ignored for `grid`, same scope as `align`. Omitted keeps the original
+   * "start" behavior every existing container already renders with. */
+  justify?: "start" | "center" | "end" | "between";
+  /** Added 2026-08-05. Only meaningful when this `ContainerBlock` is a
+   * top-level `PageSection` (a nested one is already inside its parent's
+   * box, so this would have nothing to break out of). Every section
+   * normally renders inside the page's standard max-width `Container` —
+   * `full_bleed: true` skips that wrapper for this one section, so it
+   * spans the full viewport width edge-to-edge (e.g. a full-width banner
+   * photo with no side whitespace). The container's own `padding`/`gap`
+   * still apply as normal; this only removes the *page's* outer
+   * constraint, not this container's own spacing. */
+  full_bleed?: boolean;
+  /** How much of the *parent* row's width this container itself should
+   * take, when this container is a child inside another container's
+   * `children` (see `BlockWidth`'s doc comment) — same field, same
+   * meaning as on the leaf block types. */
+  width?: BlockWidth;
+  /** Added 2026-08-05. Without this, a container's height is purely
+   * whatever its children/padding happen to add up to — fine for most
+   * uses, but wrong for a `background_image` container meant to read as
+   * a substantial photo block (a full-bleed hero banner, a photo card
+   * with text overlaid on it): a couple of lines of text would otherwise
+   * leave the photo far shorter than the design shows. A small fixed set
+   * of stops, not an arbitrary pixel/rem value — same "controlled options"
+   * reasoning as `width`/`BlockWidth`. Ignored (no min-height applied)
+   * when unset, so every container without this field renders exactly as
+   * before it existed. */
+  min_height?: "sm" | "md" | "lg" | "xl" | "screen";
+  children: Block[];
+};
+
+export type Block = ImageBlock | TextContentBlock | ButtonBlock | ContainerBlock;
 
 export type PageSection =
   | HeroSection
@@ -107,7 +340,8 @@ export type PageSection =
   | CarouselSection
   | TextBlockSection
   | CtaBannerSection
-  | BadgeListSection;
+  | BadgeListSection
+  | ContainerBlock;
 
 export type GeneratedPage = {
   sections: PageSection[];

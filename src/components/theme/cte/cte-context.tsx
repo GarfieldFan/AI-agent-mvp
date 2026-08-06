@@ -7,11 +7,28 @@ import type { CteSelection } from "@/lib/cte";
 type CteContextValue = {
   active: boolean;
   select: (selection: CteSelection) => void;
+  /** Added 2026-08-06 (CTE part 7) — move/delete/insert-at-position for
+   * *any* array in the tree (feature-item/cta arrays,
+   * `ContainerBlock.children`), not just the top-level `sections` array
+   * `CteEditorPanel` already handled directly. Exposed through context
+   * (like `select`) so a deeply-nested renderer (e.g. `BlockRenderer`,
+   * several levels of container nesting deep) can trigger a top-level
+   * `sections` mutation without threading callbacks down as props through
+   * every intermediate component. `itemPath`/`arrayPath` use the same
+   * dot-path addressing as `select`'s `path` (see lib/cte.ts). */
+  move: (itemPath: string, direction: -1 | 1) => void;
+  remove: (itemPath: string) => void;
+  insertAt: (arrayPath: string, index: number, value: unknown) => void;
 };
+
+const noop = () => {};
 
 const CteContext = React.createContext<CteContextValue>({
   active: false,
-  select: () => {},
+  select: noop,
+  move: noop,
+  remove: noop,
+  insertAt: noop,
 });
 
 export const useCte = () => React.useContext(CteContext);
@@ -30,12 +47,30 @@ export const useCte = () => React.useContext(CteContext);
 export function CteProvider({
   active,
   onSelect,
+  onMove,
+  onRemove,
+  onInsertAt,
   children,
 }: {
   active: boolean;
   onSelect: (selection: CteSelection) => void;
+  /** Optional — omitted by the (currently nonexistent) callers that don't
+   * need structural editing; default to no-ops so `useCte()` always has a
+   * safe function to call. */
+  onMove?: (itemPath: string, direction: -1 | 1) => void;
+  onRemove?: (itemPath: string) => void;
+  onInsertAt?: (arrayPath: string, index: number, value: unknown) => void;
   children: React.ReactNode;
 }) {
-  const value = React.useMemo<CteContextValue>(() => ({ active, select: onSelect }), [active, onSelect]);
+  const value = React.useMemo<CteContextValue>(
+    () => ({
+      active,
+      select: onSelect,
+      move: onMove ?? noop,
+      remove: onRemove ?? noop,
+      insertAt: onInsertAt ?? noop,
+    }),
+    [active, onSelect, onMove, onRemove, onInsertAt],
+  );
   return <CteContext.Provider value={value}>{children}</CteContext.Provider>;
 }

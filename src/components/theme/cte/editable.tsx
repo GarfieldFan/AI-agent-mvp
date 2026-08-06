@@ -6,6 +6,53 @@ import { Pencil } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useCte } from "@/components/theme/cte/cte-context";
 import type { EditableFieldType } from "@/lib/cte";
+import type { TextWeight } from "@/lib/theme";
+
+// Nearest named TextWeight for a CSS `font-weight` computed value (a
+// numeric string like "400"/"600"/"700" in every modern browser) —
+// matches Tailwind's own font-normal/medium/semibold/bold scale.
+function weightFromComputed(value: string): TextWeight | undefined {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return undefined;
+  if (numeric >= 700) return "bold";
+  if (numeric >= 600) return "semibold";
+  if (numeric >= 500) return "medium";
+  return "normal";
+}
+
+// `getComputedStyle(...).color` always resolves to `rgb(r, g, b)` (or
+// `rgba(...)`), never a hex string — converted here since `ColorField`'s
+// `<input type="color">` needs hex.
+function rgbToHex(value: string): string | undefined {
+  const match = value.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (!match) return undefined;
+  const [, r, g, b] = match;
+  return "#" + [r, g, b].map((n) => Number(n).toString(16).padStart(2, "0")).join("");
+}
+
+/** Reads the *actual currently-rendered* size/weight/color of a rich-text
+ * field straight off its DOM node — added 2026-08-06 at the user's
+ * request ("CTE 里应该有一个当前值，而不是 default 或者 unset"). Unlike
+ * most other style fields in this schema (`ContainerBlock.layout`
+ * defaults to a single fixed "row", `TextContentBlock.weight` to
+ * "normal", ...), `RichText`'s "unset" state has no *one* universal
+ * default to show — Hero's headline, a FeatureGrid heading, and a
+ * CtaBanner body each render at a different hardcoded size/weight/color
+ * of their own. Reading it off the live element is the only way to show
+ * "what this looks like right now" without threading a bespoke default
+ * spec through every one of the 5 fixed sections. Purely a display hint
+ * (see `CteSelection.computedDefaults`'s doc comment) — never written
+ * back unless the user actually keeps/changes the value. */
+function readComputedRichTextDefaults(el: HTMLElement | null): { size?: number; weight?: TextWeight; color?: string } {
+  if (!el) return {};
+  const computed = window.getComputedStyle(el);
+  const size = Math.round(parseFloat(computed.fontSize));
+  return {
+    size: Number.isFinite(size) ? size : undefined,
+    weight: weightFromComputed(computed.fontWeight),
+    color: rgbToHex(computed.color),
+  };
+}
 
 type EditableProps = {
   /** Dot-path into the page's `sections` array this click should edit —
@@ -26,6 +73,22 @@ type EditableProps = {
    * 2026-08-05 bugfix note below for why this must be applied even when
    * edit mode is off, not just when the badge renders. */
   className?: string;
+  /** Added 2026-08-06 for `ContainerBlock`'s `background_color`/
+   * `border_color` (inline styles, not Tailwind classes — see
+   * `ContainerBlock`'s own doc comment for why) — needs the same
+   * always-applied-regardless-of-edit-mode treatment as `className`
+   * above, for the same reason. */
+  style?: React.CSSProperties;
+  /** Added 2026-08-06 (CTE part 9) for `ContainerBlock` specifically:
+   * when a container is rendered as another array's child (`BlockRenderer`
+   * already wraps it in `ArrayItemToolbar`, which grows an `onEdit` button
+   * for exactly this case), suppress this component's own corner badge so
+   * "edit the whole container" isn't offered twice in two different
+   * corners — the outer toolbar's pencil is the one true entry point.
+   * Outline styling still renders (so the dashed border stays visible);
+   * only the clickable badge button itself is omitted. Every other
+   * fieldType leaves this unset. */
+  hideBadge?: boolean;
   children: React.ReactNode;
 };
 
@@ -98,20 +161,36 @@ type EditableProps = {
  * below it. `inline-flex` flows the badge inline like the surrounding
  * text/button actually calls for, only wrapping when there's genuinely
  * no room. */
-export function Editable({ path, fieldType, value, as = "span", className, children }: EditableProps) {
+export function Editable({ path, fieldType, value, as = "span", className, style, hideBadge, children }: EditableProps) {
   const cte = useCte();
   const Tag = as;
+  const contentRef = React.useRef<HTMLElement>(null);
 
   if (!cte.active) {
-    return className ? <Tag className={className}>{children}</Tag> : <>{children}</>;
+    return className || style ? (
+      <Tag className={className} style={style}>
+        {children}
+      </Tag>
+    ) : (
+      <>{children}</>
+    );
   }
 
-  const badgeStyle = fieldType === "text" || fieldType === "cta" ? "inline" : "corner";
+  const badgeStyle = fieldType === "text" || fieldType === "cta" || fieldType === "block-text" ? "inline" : "corner";
+  // "block-container" is the one fieldType whose Editable wraps a whole
+  // block *with children of its own* (a row/column/grid, potentially
+  // holding several other Editable-wrapped blocks) — added 2026-08-06
+  // (CTE part 7) after a real screenshot showed its corner badge sharing
+  // the same color as an adjacent child's badge, making them impossible
+  // to tell apart at a glance. A distinct color reads as "this edits the
+  // whole container," not "this edits the last child in it."
+  const isContainerBadge = fieldType === "block-container";
 
   function handleClick(event: React.MouseEvent) {
     event.preventDefault();
     event.stopPropagation();
-    cte.select({ path, fieldType, value });
+    const computedDefaults = fieldType === "rich-text" ? readComputedRichTextDefaults(contentRef.current) : undefined;
+    cte.select({ path, fieldType, value, computedDefaults });
   }
 
   const badge = (
@@ -126,7 +205,8 @@ export function Editable({ path, fieldType, value, as = "span", className, child
         // every time regardless of available room, which is what made
         // short text/small buttons look "pushed up"/half-hidden. See this
         // component's 2026-08-05 bugfix note.
-        "z-10 inline-flex shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow transition hover:brightness-110",
+        "z-10 inline-flex shrink-0 items-center justify-center rounded-full shadow transition hover:brightness-110",
+        isContainerBadge ? "bg-blue-600 text-white" : "bg-primary text-primary-foreground",
         badgeStyle === "inline" ? "ml-1 size-4 align-middle" : "absolute top-2 right-2 size-6",
       )}
     >
@@ -136,6 +216,14 @@ export function Editable({ path, fieldType, value, as = "span", className, child
 
   return (
     <Tag
+      // Callback ref, not `contentRef` directly: `Tag` is a dynamic
+      // "span" | "div", so its JSX-inferred ref type is narrower
+      // (HTMLSpanElement/HTMLDivElement) than `contentRef`'s plain
+      // `HTMLElement` — a callback sidesteps the mismatch without an
+      // `any` cast.
+      ref={(node: HTMLElement | null) => {
+        contentRef.current = node;
+      }}
       className={cn(
         "rounded outline-dashed outline-1 outline-primary/40",
         badgeStyle === "corner" && "relative",
@@ -145,9 +233,10 @@ export function Editable({ path, fieldType, value, as = "span", className, child
         // component's bugfix note for why that conflict matters here.
         className,
       )}
+      style={style}
     >
       {children}
-      {badge}
+      {hideBadge ? null : badge}
     </Tag>
   );
 }
