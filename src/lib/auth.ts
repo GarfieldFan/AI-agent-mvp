@@ -55,15 +55,55 @@ function readStorage(): AuthState {
   return cachedState;
 }
 
+/** Reads the token's own "exp" claim client-side — the backend never
+ * hard-401s on an expired/invalid token (see apis/deps.py's docstring:
+ * it silently downgrades to the anonymous `user` role instead, since the
+ * public chatbot needs to keep working with no token at all), so there's
+ * no server response to react to here. A malformed/undecodable token is
+ * treated as expired too — same "assume the worst" default. */
+function isTokenExpired(token: string): boolean {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.exp !== "number" || Date.now() >= payload.exp * 1000;
+  } catch {
+    return true;
+  }
+}
+
+/** Pure — this backs `useAuth()`'s `useSyncExternalStore` snapshot, which
+ * must never mutate anything (see the class comment above `cachedRaw` for
+ * the "infinite loop" bug that purity violation caused once already).
+ * Actually clearing an expired token's storage happens in `getAuthToken()`
+ * below, not here. */
 export function getAuthState(): AuthState {
-  return readStorage();
+  const state = readStorage();
+  if (state.token && isTokenExpired(state.token)) return EMPTY_STATE;
+  return state;
 }
 
 /** Just the token — this is the one `lib/api.ts` actually needs on every
  * request; kept separate so callers that only need it don't have to parse
- * the whole state object. */
+ * the whole state object.
+ *
+ * **Also where session expiry actually gets acted on**: found from a real
+ * report — after a token expired, admin-only sections correctly started
+ * 403ing (the backend already did this right), but the header's login
+ * widget kept showing the old logged-in user indefinitely, since nothing
+ * ever cleared the stale localStorage entry. `apiFetch` calls this on
+ * every single request to build the Authorization header, so it's a
+ * side-effect-safe place (outside any render) to detect expiry and call
+ * the real `clearAuth()` — which removes the stored session *and* fires
+ * the change event every `useAuth()` subscriber (including the header's
+ * `AuthStatus`) is listening for, so the UI updates as part of the very
+ * request that would have 403'd anyway, not on some later unrelated
+ * render. */
 export function getAuthToken(): string | null {
-  return readStorage().token;
+  const state = readStorage();
+  if (state.token && isTokenExpired(state.token)) {
+    clearAuth();
+    return null;
+  }
+  return state.token;
 }
 
 export function setAuth(state: { token: string; email: string; role: Role }) {
