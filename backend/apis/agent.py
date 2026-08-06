@@ -622,6 +622,42 @@ def _extract_json_object(text: str) -> str:
 _PAGE_SECTION_ADAPTER: TypeAdapter[PageSection] = TypeAdapter(PageSection)
 
 
+# Section/block types the model has been caught emitting instead of the
+# real shape ("type": "container", "layout": "row"|"column"|"grid") —
+# added 2026-08-07 after a real generation failure showed "type": "row"
+# as a bare top-level section. The system prompt already warns against
+# this exact confusion in several places (see the "IMPORTANT — a
+# hero-style banner..." and "Prefer the specific section types..."
+# passages in _VISION_SYSTEM_PROMPT above) and the model still did it —
+# worth absorbing defensively rather than trusting prompt text alone to
+# eliminate it.
+_LAYOUT_TYPE_ALIASES = {"row", "column", "grid"}
+
+
+def _normalize_container_type_aliases(node: object) -> object:
+    """Recursively rewrites any dict with `"type": "row"|"column"|"grid"`
+    into `{"type": "container", "layout": <that value>, ...rest}` — the
+    schema's real Container shape — before Pydantic ever sees it. Walks
+    into every nested dict/list (not just top-level sections) since the
+    same mislabeling can just as easily show up inside a container's own
+    `"children"` array, which `_coerce_sections` below has no separate
+    per-item salvage pass for (unlike feature-grid items) — Pydantic
+    validates nested `Block`s as one atomic unit, so a single mislabeled
+    nested child would otherwise fail the whole parent container, not
+    just that one child. Non-dict/list values pass through unchanged;
+    a dict already using "container" (or missing "type" entirely, e.g. a
+    `ThemeImage`/`FeatureItem`) is untouched."""
+    if isinstance(node, dict):
+        normalized = {key: _normalize_container_type_aliases(value) for key, value in node.items()}
+        if normalized.get("type") in _LAYOUT_TYPE_ALIASES:
+            layout = normalized.pop("type")
+            normalized = {"type": "container", "layout": layout, **normalized}
+        return normalized
+    if isinstance(node, list):
+        return [_normalize_container_type_aliases(item) for item in node]
+    return node
+
+
 def _coerce_sections(raw_sections: list) -> list[PageSection]:
     """Validates each section — and each feature-grid item — on its own,
     dropping only the pieces that don't fit the schema instead of failing
@@ -642,6 +678,8 @@ def _coerce_sections(raw_sections: list) -> list[PageSection]:
     for raw in raw_sections:
         if not isinstance(raw, dict):
             continue
+
+        raw = _normalize_container_type_aliases(raw)
 
         if raw.get("type") == "feature-grid" and isinstance(raw.get("items"), list):
             valid_items = []

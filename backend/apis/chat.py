@@ -161,17 +161,27 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             f"[{i + 1}] (from {c.document_title}): {c.content}" for i, c in enumerate(chunks)
         )
         user_content = f"Context (use only if relevant to the question):\n{context_block}\n\nQuestion: {req.message}"
-        sources = [
-            ChatSource(
-                document_id=c.document_id,
-                chunk_id=c.chunk_id,
-                document_title=c.document_title,
-                excerpt=c.excerpt,
-                score=c.score,
+        # One citation chip per *document*, not per chunk — `chunks` is
+        # already ordered best-score-first (retrieve()'s query orders by
+        # distance ascending), so keeping the first chunk seen per
+        # document_id keeps its highest-scoring chunk. Without this, a
+        # single multi-chunk document matching on several chunks showed
+        # up as several identical-looking citation chips.
+        seen_document_ids: set[int] = set()
+        sources = []
+        for c in chunks:
+            if c.score < MIN_CITATION_SCORE or c.document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(c.document_id)
+            sources.append(
+                ChatSource(
+                    document_id=c.document_id,
+                    chunk_id=c.chunk_id,
+                    document_title=c.document_title,
+                    excerpt=c.excerpt,
+                    score=c.score,
+                )
             )
-            for c in chunks
-            if c.score >= MIN_CITATION_SCORE
-        ]
 
     messages = [{"role": turn.role, "content": turn.content} for turn in req.history]
     messages.append({"role": "user", "content": user_content})

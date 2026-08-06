@@ -2178,3 +2178,98 @@ increase demo-readiness vs. add new scope:
   unused, and still not CTE-editable).
 
 Ask the user which, if anything, to pick back up.
+
+---
+
+### 2026-08-07 — real `generate_landing_page` failure: model hallucinated `"type": "row"`, JSON also partially corrupted
+
+The user hit a real 502 from the page generator: "None of the model's
+sections matched the page-section schema," with a garbled raw-output
+snippet in the error detail — `{ "sections": [ { "type": "row", "gap:
+columns, children:[{":".url","alt":"..." }, {"type":":" },"children"] }`
+— clearly not well-formed JSON on its face.
+
+**Diagnosis, reproduced exactly rather than guessed at.** Ran the exact
+reported string through `json_repair.repair_json(..., return_objects=True)`
+directly in the backend container (bypassing the actual vision call
+entirely — the raw text was already captured in the error message, no
+need to re-run generation to investigate). Confirmed `repair_json`
+*does* successfully coerce it into a Python dict — `json_repair` is
+aggressive enough to force even quite broken text into some parseable
+structure — but the result is telling: `parsed["sections"]` came back as
+`[{'type': 'row', 'gap: columns, children:[{': '.url', 'alt': '...'},
+{'type': ':'}, 'children']`, i.e. a 3-element list containing one dict
+with `type: 'row'` plus two garbled/garbage keys, a second dict with
+`type: ':'` (pure garbage), and a bare string `'children'`.
+
+Ran this straight through the existing `_coerce_sections()` to confirm
+*why* it produced zero surviving sections (not just assumed): the
+`'row'`-typed dict fails Pydantic validation because `"row"` isn't a
+valid section-type discriminator value (`PageSection`'s union has no
+`"row"` variant — only `"container"` with a separate `"layout"` field
+can be `"row"`); the `':'`-typed dict fails for the same reason; the bare
+string isn't even a dict, so it's skipped at the `isinstance` check
+before validation is attempted at all. Three inputs, three ways to fail,
+zero survivors — exactly matching the observed "None of the model's
+sections matched" 502.
+
+**The `"type": "row"` part is not a one-off fluke worth shrugging off.**
+`_VISION_SYSTEM_PROMPT` (`backend/apis/agent.py`) already contains
+several explicit, repeated warnings about exactly this confusion — e.g.
+"Prefer the specific section types (1-6) over Container whenever one of
+them already fits" and the worked example showing `{"type": "container",
+"layout": "row", ...}` as the only correct shape for a row layout. The
+model still collapsed the two-field concept (`type: "container"` +
+`layout: "row"`) into a single hallucinated `type: "row"` anyway. Given
+how much prompt real-estate is already spent trying to prevent this, it
+reads as a real, recurring risk for row/column/grid-heavy designs, not a
+freak occurrence — worth absorbing in code rather than trusting prompt
+wording alone to eliminate it, consistent with this file's established
+pattern of lenient, salvage-what's-usable validation (`FeatureItem.href`
+defaulting to `"#"`, `_coerce_sections`' per-item feature-grid handling).
+
+**Fix**: new `_normalize_container_type_aliases()` in `backend/apis/
+agent.py` — recursively walks a raw (already-parsed) section dict,
+including into nested `"children"` arrays, and rewrites any `{"type":
+"row"|"column"|"grid", ...}` into `{"type": "container", "layout":
+"row"|"column"|"grid", ...rest}` before Pydantic ever validates it.
+Called at the top of `_coerce_sections()`'s per-section loop, so it
+benefits both `generate_landing_page` and `generate_geo_page` (both
+funnel through the same `_coerce_sections`). Deliberately recursive, not
+just top-level: a mislabeled nested child inside a real container's
+`children` would otherwise fail the *entire* parent container's
+validation in one shot (Pydantic validates a nested discriminated-union
+list atomically — there's no existing per-child salvage loop for
+`children` the way feature-grid items already get one), so the same
+hallucination one level deeper is an even more silent, harder-to-diagnose
+failure mode than the top-level case actually reported here.
+
+**Verified two ways**, both against the real logic, not just reasoned
+about: (1) re-ran the user's *exact* reported garbled string through
+`repair_json` → `_coerce_sections` with the fix applied — went from 0
+recovered sections to 1 (an empty-but-valid `container`/`row`, since the
+original `children` content was itself unrecoverably destroyed by the
+corruption — this fix can't resurrect data that was never parseable to
+begin with, only rescue sections whose *type* was the only thing wrong).
+(2) Regression-checked well-formed input completely unaffected (a
+normal hero + nested row/column container + feature-grid all still
+validate identically), and confirmed the *nested*-child case works too:
+a real outer container whose one child was `{"type": "row", ...}`
+previously dropped the whole outer container — now the outer container
+survives with that child correctly normalized to
+`layout: "row"`.
+
+**What this fix does not solve, and shouldn't be expected to**: the
+non-`type` corruption in this exact case (garbled key names swallowing
+what should have been `gap`/`children` data) is genuinely unrecoverable
+— no amount of schema-level repair can reconstruct content that was
+never validly serialized in the first place. That's a real generation-
+quality ceiling for this specific request (a row/column-shaped design),
+consistent with this project's earlier, separately-documented finding
+that deeply-nested Container/Block JSON is measurably harder for the
+vision model to produce reliably than the flat composite sections — see
+the "Generic Container/Image/Text/Button block schema" and "Deliberately
+kept separate, not unified" entries elsewhere in this file. This fix
+converts a guaranteed-total-failure case into a partial-recovery case
+when the *type* mislabeling is the only thing wrong; it doesn't and
+can't fix badly corrupted JSON syntax elsewhere in the same object.

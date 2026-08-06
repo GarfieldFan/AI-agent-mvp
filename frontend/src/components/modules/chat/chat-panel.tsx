@@ -12,6 +12,7 @@ import { ErrorMessage } from "@/components/common/error-message";
 import { ApiError } from "@/lib/api";
 import { sendChatMessage, type ChatApiTurn } from "@/lib/chat";
 import type { ChatMessage, ChatOption } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 // The intent-triage steps (0-3) below are a scripted local flow, not an LLM
 // call — see the project plan's chatbot module for the
@@ -45,7 +46,15 @@ function labelFor(options: ChatOption[], value: string) {
   return options.find((option) => option.value === value)?.label ?? value;
 }
 
-export function ChatPanel() {
+type ChatPanelProps = {
+  /** True when rendered inside `ChatBubbleWidget`'s own floating card —
+   * that wrapper already supplies a border/rounded corners/shadow, so
+   * this omits its own to avoid a visibly nested double-box look. The
+   * `/chat` page's standalone usage is unaffected (defaults to `false`). */
+  embedded?: boolean;
+};
+
+export function ChatPanel({ embedded = false }: ChatPanelProps) {
   // Starts at 1 so it never collides with the seed message's "msg-0" — kept
   // out of the useState initializer below since refs must not be read
   // during render, only from event handlers.
@@ -151,8 +160,8 @@ export function ChatPanel() {
   }
 
   return (
-    <div className="flex h-[32rem] flex-col overflow-hidden rounded-xl border">
-      <ScrollArea className="flex-1 p-4">
+    <div className={cn("flex h-[32rem] flex-col overflow-hidden", !embedded && "rounded-xl border")}>
+      <ScrollArea className="min-h-0 flex-1 p-4">
         <div className="flex flex-col gap-3">
           {messages.map((message) => (
             <ChatMessageBubble
@@ -169,7 +178,7 @@ export function ChatPanel() {
         </div>
       </ScrollArea>
 
-      <form onSubmit={handleSend} className="flex items-center gap-2 border-t p-3">
+      <form onSubmit={handleSend} className="flex shrink-0 items-center gap-2 border-t p-3">
         <Input
           value={draft}
           onChange={(event) => setDraft(event.target.value)}

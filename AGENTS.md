@@ -148,6 +148,13 @@ Every route here is admin/owner-gated. All of the following are **real**
   turns a design-image upload into a `PageSection[]` JSON schema (never
   raw HTML/CSS — see "Page schema" below), validated leniently (a
   malformed section/item is dropped, not fatal) via Pydantic.
+  `_coerce_sections` also runs a recursive normalization pass first
+  (`_normalize_container_type_aliases`) that rewrites a hallucinated bare
+  `"type": "row"|"column"|"grid"` — at any nesting depth, including
+  inside a container's own `children` — into the real `"type":
+  "container", "layout": "..."` shape, since the model has been caught
+  emitting this despite the prompt explicitly warning against it; see
+  `HISTORY.md` for the real failure case this was found from.
 - **`generate_poster`** — deterministic ComfyUI txt2img + optional text
   overlay, composing `apis/api.py`'s existing functions directly (no
   self-HTTP round-trip).
@@ -187,7 +194,11 @@ separate classifier. A cosine-similarity cutoff (`chat.py`'s
 `MIN_CITATION_SCORE = 0.4`) gates only which chunks are worth showing as
 citation chips — it has **no effect** on what the model sees (an earlier
 version conflated these two decisions and broke cross-lingual retrieval
-entirely; see `HISTORY.md` for the full bug).
+entirely; see `HISTORY.md` for the full bug). Citations are also deduped
+**per document**, not per chunk (`chat.py`, `sources` list keeps only the
+highest-scoring chunk per `document_id`) — a multi-chunk document
+matching on several chunks used to render the same filename as several
+identical-looking citation chips (`SourceCitationList`).
 
 `Editable`/CTE aside — the vision LLM's own output is always plain
 markdown-ish JSON per the schema below, never raw HTML.
@@ -367,6 +378,16 @@ before considering it fully settled.
   instead. Hit twice: once with a Lucide icon prop, once when
   `BlockRenderer` became a Client Component and its Server-Component
   parent (`ContainerBlock`) was still passing it a function.
+- **A `ScrollArea` (base-ui) inside a `flex-col` parent needs `min-h-0`
+  on the `ScrollArea` itself, or it won't scroll.** Its `Viewport` uses
+  real `overflow: scroll`, but a flex item's default `min-height: auto`
+  lets it grow to fit its content instead of shrinking to its allotted
+  flex space — so the viewport never actually overflows, and a mouse
+  wheel over it scrolls the page instead. Hit in `ChatPanel`
+  (`chat-panel.tsx`) inside `ChatBubbleWidget`'s floating card; the fix
+  is `<ScrollArea className="min-h-0 flex-1 ...">`. The sibling
+  input/composer row should also get `shrink-0` so it never gets
+  squeezed instead of the message list.
 
 ## Suggested next step
 
