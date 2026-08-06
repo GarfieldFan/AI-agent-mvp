@@ -12,6 +12,10 @@ abstraction that isn't just a config flag, and a privilege boundary
 designed so the public-facing AI surface can never reach a privileged
 action, even under prompt injection.
 
+## Demo
+
+[Watch the walkthrough on YouTube](https://youtu.be/dWj7zUT_sXU)
+
 ## What it does
 
 - **Public chatbot** (`/chat`) — general conversation, grounded in
