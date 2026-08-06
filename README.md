@@ -1,36 +1,42 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AI Employee — frontend
 
-## Getting Started
+Next.js 16 (App Router) + TypeScript frontend for the AI Employee project
+— see the [root README](../README.md) for what this project is and why.
 
-First, run the development server:
+This is one piece of a multi-service Docker Compose stack, not meant to
+be run standalone in a normal workflow — from the project root:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+docker compose up
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Frontend runs on `http://localhost:3000` with hot reload against the
+bind-mounted `src/`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+If you do need to run it outside Docker (e.g. for a quick isolated check):
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm install
+npm run dev
+```
 
-## Learn More
+You'll need `NEXT_PUBLIC_API_URL` pointing at a running backend (see the
+root `.env.example`) — most of this app's real functionality depends on
+the FastAPI backend + Postgres, which this alone won't give you.
 
-To learn more about Next.js, take a look at the following resources:
+## Documentation
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- **`AGENTS.md`** — current-state component/lib catalog: what exists
+  under `src/components/` and `src/lib/`, one line each, organized by
+  directory. Check here before building something new.
+- **`HISTORY.md`** — the full development log behind every entry in
+  `AGENTS.md`: redesign rationale, bug root-causes, verification detail.
+  Read on demand (grep for a component name), not top-to-bottom.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Stack notes
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Next.js **16** with React 19 — meaningfully different from most
+  training-data-era Next.js knowledge; see `AGENTS.md`'s gotchas section.
+- shadcn/ui, `base-nova` style (`@base-ui/react`, not Radix).
+- Tailwind CSS.
+- `recharts` for the one chart in the admin console.
