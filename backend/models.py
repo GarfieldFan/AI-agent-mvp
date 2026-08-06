@@ -144,6 +144,28 @@ class ChatMessage(Base):
     session: Mapped["ChatSession"] = relationship(back_populates="messages")
 
 
+class CrmEntry(Base):
+    """A captured lead/inquiry — apis/agent.py's `create_crm_entry`, made
+    real 2026-08-06. No third-party CRM account/API key exists for this
+    project (unlike the AI providers, which have well-known, roughly
+    standardized APIs to code a generic client against, there's no single
+    "the" CRM API worth picking without a real vendor account to test
+    it), so this is a genuine internal record store rather than a
+    third-party push — the same "real, not faked" bar as every other
+    capability in this file, just satisfied by storing the lead
+    ourselves instead of forwarding it. Swapping this for a real
+    third-party integration later is a matter of adding that call
+    alongside this insert, not a schema change."""
+
+    __tablename__ = "crm_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    contact_email: Mapped[str] = mapped_column(String(255))
+    summary: Mapped[str] = mapped_column(Text)
+    tags: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
 
