@@ -14,7 +14,10 @@ action, even under prompt injection.
 
 ## Demo
 
-[![Watch the walkthrough on YouTube](https://img.youtube.com/vi/dWj7zUT_sXU/maxresdefault.jpg)](https://youtu.be/dWj7zUT_sXU)
+https://github.com/user-attachments/assets/592c82f9-5d35-4fb9-a723-8e9b2595b4d5
+
+Also on [YouTube](https://youtu.be/dWj7zUT_sXU) if the player above doesn't
+render (e.g. viewing this file outside github.com).
 
 ## Architecture
 
