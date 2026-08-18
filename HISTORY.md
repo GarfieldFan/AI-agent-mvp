@@ -2611,3 +2611,182 @@ Treat as needing a real click-through (open `/dashboard` with a
 deliberately stale token in `localStorage`, confirm the spinner then the
 friendly locked-state copy appear, never the raw 403 text) before
 considering this fully settled.
+
+### 2026-08-19 — embedding gets its own custom endpoint, ComfyUI checkpoint/custom-workflow pickers, `[object Object]` fix, dashboard reorganized into an accordion
+
+A session driven by the user actually running this project against
+their own real local llama.cpp/ComfyUI setup and hitting real friction —
+several genuine bugs found this way, not hypothetical ones.
+
+**`[object Object]` save error in the model settings panel.** User
+reported the dashboard's "Save" button failing with an unreadable
+`[object Object]` message. Root cause: `frontend/src/lib/api.ts`'s
+`apiFetch` assumed a non-2xx response's `detail` field was always a
+plain string (`(errorBody as { detail?: string })?.detail ?? ...`) —
+true for every `HTTPException(..., detail="...")` in this backend, but
+FastAPI's own Pydantic request-body validation (a 422) sends `detail` as
+an *array* of `{loc, msg, type}` objects instead. That array got passed
+straight through as `ApiError.message` (typed `string` but not actually
+one at runtime) and stringified to `"[object Object]"` wherever a
+component displayed it. Fixed with a new `extractErrorMessage(errorBody,
+fallback)` that handles both shapes, joining a validation-error array's
+`msg` fields into one readable string. Verified via curl: a
+deliberately-incomplete `PUT /agent/settings` payload reproduces the
+exact 422 array shape, confirming the diagnosis before writing the fix.
+Caught one real slip while fixing it: `eslint` flagged the new function
+as unused on the first pass — it had been defined but never actually
+wired into the `throw new ApiError(...)` call site.
+
+**Embedding needed its own custom endpoint, separate from chat/vision's
+shared one.** Built earlier this project as "chat, vision, and embedding
+all share one `custom_base_url`" (a confirmed design decision). User then
+set up a real dedicated embedding server (`nomic-embed-text-v1.5.f16`,
+via a new `llama-embed.ps1` launcher script written this session) on a
+different port than their existing chat/vision router — llama.cpp's
+`--embedding` mode is a process-level flag, incompatible with serving a
+chat model from the same router instance, so this wasn't a config
+mistake, it's a fundamental llama.cpp constraint. Confirmed with the user
+(`AskUserQuestion`) before reversing the earlier shared-endpoint design:
+gave embedding its own `AppSettings.embedding_base_url`/
+`embedding_api_key`, its own `CustomEndpointBlock` in the frontend, its
+own live-queried model list. New migration `b8e1c4f2a5d7`.
+
+Real diagnostic trail while chasing this: user's router (port 8080,
+started via `llama-oneclick.ps1`) actually *listed*
+`nomic-embed-text-v1.5.f16` in `/v1/models` (it scans the whole `models/`
+folder recursively, no capability filter for embedding the way it has
+one for vision), which looked like it should work — but a direct `curl
+-X POST http://127.0.0.1:8080/v1/embeddings` against it returned `501
+"This server does not support embeddings. Start it with --embeddings"`.
+Confirmed the *dedicated* embedding process (8081, started with
+`--embedding --pooling mean`) actually returns real 768-dim vectors for
+the same model id. Non-router single-model llama-server reports its
+model "id" as the literal file path passed to `--model` (e.g.
+`D:\AI_Models\llm\llama-cpp\models\nomic-embed-text-v1.5.f16.gguf`), not
+a short friendly name the way router mode does — not a bug, just a real
+difference between the two launch modes worth knowing before assuming
+something's broken.
+
+After the split shipped, user reported "Re-embed all documents" still
+failing with "All connection attempts failed" even with the dedicated
+8081 server confirmed reachable. Root cause turned out to be simpler than
+a code bug: `GET /agent/settings` showed `embedding_provider: "ollama"`
+still persisted — the user had picked "custom" + clicked "Test
+connection" (which only *probes*, never persists) but never actually
+clicked the panel's main "Save" button before navigating to Document
+Manager. Re-embed was therefore still trying to reach Ollama (not
+running on this machine at all), unrelated to the working 8081 endpoint.
+No code fix needed — just walked the user through Save-then-re-embed.
+
+**`llama-embed.ps1` crashed with PowerShell parser errors** ("string is
+missing the terminator", "missing closing '}'") the first time the user
+actually ran it. Root cause: the script (written earlier this session)
+had Chinese comments/strings, and Windows PowerShell 5.1 didn't round-
+trip the file's encoding cleanly through whatever codepage the console
+used, corrupting quote characters mid-string. User's explicit
+instruction afterward: never write non-English text into any file,
+Chinese is for conversation only. Rewrote the whole script in plain
+ASCII/English; verified clean via
+`[System.Management.Automation.Language.Parser]::ParseFile(...)` rather
+than just eyeballing it. Also wrote `start_embed.bat` (double-clicking a
+bare `.ps1` opens Notepad, doesn't run it — same pattern
+`start_qwen3.8.bat` already used for the chat/vision launcher) and
+`start_all.bat` (opens both servers in two *separate* windows via
+`start`, not chained in one script — `llama-oneclick.ps1` is a
+long-running foreground process that never returns, so sequential
+execution in one window would just hang after the first; separate
+windows also mean one crashing doesn't take the other down). Saved as a
+`feedback_language` memory update with this concrete failure as the
+reinforcing example, since it's now a real crash risk, not just a style
+preference.
+
+**ComfyUI image generation gained two more layers of owner-configurability**,
+after the user described wanting something like LocalAI.io's
+"download/configure/swap different SD models" flexibility (their own
+words: "这只是我的构思，可能不成熟" — floated as a rough idea, not a
+fully-formed spec, so this was scoped down via `AskUserQuestion` before
+building):
+1. **Checkpoint file picker within the existing fixed workflow** —
+   `AppSettings.image_comfyui_unet`/`_clip`/`_vae`, live-queried from
+   ComfyUI's own `GET /object_info/{node_class}` (new
+   `apis/api.py::list_comfyui_loader_options`). Confirmed via curl this
+   actually reflects installed files (the user's ComfyUI reported one
+   unet, several real clip/vae options). New migration `c4d9f1a3e6b8`.
+2. **An entirely custom, owner-pasted ComfyUI workflow** — user's actual
+   ask turned out to be bigger than a checkpoint picker: "custom 自己的
+   8188，使用已经配置好的工作流" (use their own already-configured
+   ComfyUI workflow, any architecture, not just this app's fixed one).
+   Landed as `AppSettings.image_comfyui_workflow` (ComfyUI's own "Save
+   API Format" JSON export, pasted verbatim) +
+   `image_comfyui_prompt_node`/`_field` (where to splice the generation
+   prompt in). Scoped to prompt-text-only for v1 (no seed/size node
+   mapping) per explicit user confirmation. `update_settings` validates
+   the JSON parses, the named node exists, and has the named input field
+   at *save* time; `ComfyUIImageProvider.generate()` re-validates at
+   generation time as defense-in-depth. New migration `d7f2a8c1b4e9`.
+   Verified end-to-end by feeding the project's own
+   `comfy/image/image_z_image_turbo.json` back in as a "custom" workflow
+   (node `57:27`, field `text`) — saved cleanly, `generate_poster`
+   produced a real new image through the custom-workflow code path, and
+   a deliberately-wrong node id (`"99"`) correctly 400'd at save time
+   instead of failing later.
+
+**`page-generator-panel.tsx` had a stale hardcoded "qwen3.6"/"36B model"
+label** — leftover from before vision generation became provider-
+agnostic, same class of bug as the earlier `/api/chat` SYSTEM_PROMPT
+"running via Ollama" fix. User caught it by pasting the panel's actual
+rendered copy. Fixed by fetching `GET /agent/settings` on mount and
+building the label from whatever `vision_provider`/`vision_model` is
+actually configured, with a generic fallback phrase if that fetch fails
+or hasn't resolved yet. Grepped the rest of `frontend/src/` and
+`backend/` for the same stale-model-name pattern afterward — nothing
+else user-facing left, the remaining hits are an env-var default and
+code comments.
+
+**Dashboard reorganized into a collapsible accordion.** Eight panels
+stacked flat (Model settings, Document manager, GEO page, Poster, Page
+generator, Saved pages, CRM, Report, Owner agent) had become hard to
+navigate as each grew — `ModelSettingsPanel` alone now has 4 pickers +
+2 custom endpoints + a checkpoint picker + a custom-workflow textarea.
+Confirmed accordion-vs-tabs with the user first (`AskUserQuestion`,
+accordion won for letting more than one group stay open at once). New
+`frontend/src/components/ui/accordion.tsx` — hand-written, not
+`npx shadcn add`, since `@base-ui/react` (already a dependency for
+`select.tsx` etc.) already ships an `accordion` submodule, no new
+package needed. Four groups: AI & knowledge base / Content generation /
+CRM & reporting / Owner agent (owner-only), `multiple` open allowed,
+starts fully collapsed.
+
+**Verified generate_landing_page end-to-end for the first time this
+session** with a real (synthetic, PIL-drawn) mockup image — a 5-region
+page (header/hero/features/CTA/footer) through the currently-configured
+`Qwen3.8_Uncensored` vision model. Result was a strong match: correct
+headline/subheadline/both CTA labels in the hero, plausible icons/
+descriptions the model invented for 3 sparse feature labels, header/
+footer correctly fell back to generic `container` blocks (no dedicated
+section type for either). Saved to a throwaway slug, hit a `.next` dev-
+cache 404 on first render (this project's single most-recurring class of
+bug — a Server Component fetch to the backend from inside the frontend
+container worked fine when replicated by hand via `docker compose exec
+frontend node -e "fetch(...)"`, but the actual route kept 404ing until
+`docker compose restart frontend`), then confirmed the real generated
+copy ("Build Faster With Acme", "Sign Up Free", ...) in the rendered
+HTML. Deleted the test slug afterward — no leftover test data.
+
+**Chrome browser extension still never connected**, consistent with
+every prior session — `tabs_context_mcp` returned "Browser extension is
+not connected" again. Every verification above went through
+curl/`tsc`/`eslint`/direct backend calls instead, same posture as every
+other UI change this project has shipped without a live click-through.
+
+**Committed for the first time in a while** — `a2218be`, 62 files, the
+full accumulated backlog (this session's work plus the prior session's
+owner-agent/rate-limiting/chat-attachments/CRM work that had never been
+committed). Deliberately left 3 untracked items out:
+`ai-mvp-project-plan.pdf` (confirmed via `git log` that a prior commit,
+`cc27ff4`, had deliberately *removed* this exact file from tracking —
+re-adding it would reverse that decision; also turned out to be an
+empty 1-page placeholder PDF, not real content), a personal
+`Video Project (10mb).mp4`, and a 51MB `materials/` folder of local
+test/reference assets (sample PDFs, design screenshots, wix template
+dumps).
