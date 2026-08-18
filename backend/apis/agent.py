@@ -24,44 +24,33 @@ permission-boundary work that has to land first, before that day comes.
 """
 
 import base64
-import json
-import os
-import re
 from datetime import date, datetime, timedelta
 from typing import Annotated, Literal, Union
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from json_repair import repair_json
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from apis.api import (
-    COMFYUI_PUBLIC_URL,
-    COMFYUI_URL,
-    TextOverlayRequest,
-    _build_payload_txt2img,
-    add_text_overlay,
-    wait_for_completion,
-)
+import chat_attachments
+from apis.api import TextOverlayRequest, add_text_overlay
 from apis.deps import Role, require_role
-from apis.model_settings import resolve_chat_provider, resolve_vision_model
+from apis.model_settings import _list_image_providers, resolve_chat_provider, resolve_image_provider, resolve_vision_provider
 from apis.pages import _get_or_create_page
 from db import get_db
+from llm_json import parse_lenient_json
 from models import ChatMessage, ChatSession, CrmEntry, Document, PageVersion
 from providers.base import ProviderNotConfigured
 
 router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1")
-# Which model actually gets used is resolved per-request now (see
-# resolve_vision_model, apis/model_settings.py) — an owner can pick any
-# vision-capable Ollama model from the dashboard, persisted globally. It
-# falls back to model_settings.DEFAULT_VISION_MODEL when nothing's been
-# explicitly chosen. Vision generation only works via Ollama today (see
-# model_settings.py's module docstring) — a non-"ollama" resolved provider
-# is a 501, not silently ignored.
+# Which provider/model actually gets used is resolved per-request (see
+# resolve_vision_provider, apis/model_settings.py) — an owner can pick any
+# vision-capable model from the dashboard (Ollama, custom/llama.cpp, or a
+# configured cloud provider), persisted globally. Falls back to Ollama +
+# model_settings.DEFAULT_VISION_MODEL when nothing's been explicitly
+# chosen.
 
 
 class GenerateLandingPageRequest(BaseModel):
@@ -597,28 +586,6 @@ exists for row/column layouts none of the others can express, not as a default c
 - Output ONLY the JSON object — no ```json fences, no prose before or after it."""
 
 
-def _extract_json_object(text: str) -> str:
-    """Best-effort cleanup of the model's raw output before json.loads().
-
-    Handles two things models do despite being told not to: qwen3.6 is a
-    "thinking" model and may prepend a <think>...</think> reasoning block,
-    and models in general like to wrap JSON in ```json fences. Falls back
-    to slicing between the first '{' and the last '}' if neither pattern
-    matches, so a merely-surrounded-by-prose response still has a chance
-    to parse.
-    """
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-    fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
-    if fence_match:
-        return fence_match.group(1)
-
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start : end + 1]
-    return text
-
-
 _PAGE_SECTION_ADAPTER: TypeAdapter[PageSection] = TypeAdapter(PageSection)
 
 
@@ -707,23 +674,20 @@ async def generate_landing_page(
     """Vision LLM: turn an uploaded design mockup into an ordered list of
     page sections (see PageSection above), not raw markup.
 
-    Sends the image + a schema-describing prompt to a vision-capable local
-    Ollama model (owner-selectable — see resolve_vision_model) via the
-    OpenAI-compatible /v1/chat/completions endpoint (same one
-    backend/apis/chat.py uses, just with an image content part added). The
+    Sends the image + a schema-describing prompt to whatever vision-
+    capable model the owner has selected (Ollama, a custom
+    OpenAI-compatible endpoint, or a configured cloud provider — see
+    resolve_vision_provider, apis/model_settings.py) via the shared
+    `ChatProvider.chat()` abstraction, same one backend/apis/chat.py uses
+    for plain text, just with an image content part added (see
+    providers/base.py's ChatProvider docstring for the shape). The
     model's job is to *pick* which section types apply and fill in their
     content — never to emit HTML/CSS — so the result renders through the
     same reusable components (frontend/src/components/theme/) as the
     hand-authored default template, safely and on-brand, with no
     dangerouslySetInnerHTML.
     """
-    vision_provider, vision_model = resolve_vision_model(db)
-    if vision_provider != "ollama":
-        raise HTTPException(
-            status_code=501,
-            detail=f"Vision generation via {vision_provider!r} isn't implemented yet — "
-            "only Ollama is wired up for this today. See apis/model_settings.py.",
-        )
+    vision = resolve_vision_provider(db)
 
     image_b64 = req.design_image_base64
     if image_b64.strip().lower().startswith("data:") and "," in image_b64:
@@ -734,7 +698,6 @@ async def generate_landing_page(
         user_text += f" Additional notes from the site owner: {req.notes}"
 
     messages = [
-        {"role": "system", "content": _VISION_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [
@@ -745,76 +708,46 @@ async def generate_landing_page(
     ]
 
     try:
-        # Vision + a 36B model + a full page's worth of structured JSON is
-        # slow — much slower than chat.py's plain-text gemma4 replies.
-        # Budget minutes, not seconds.
-        async with httpx.AsyncClient(timeout=240) as client:
-            resp = await client.post(
-                f"{OLLAMA_BASE_URL}/chat/completions",
-                json={
-                    "model": vision_model,
-                    "messages": messages,
-                    "response_format": {"type": "json_object"},
-                    "stream": False,
-                    # Deliberately NOT setting max_tokens: tried 4096 here
-                    # once and it backfired — qwen3.6 is a "thinking" model
-                    # that burns a large, variable number of tokens on
-                    # internal reasoning before it starts writing the
-                    # actual JSON answer, and 4096 was consumed entirely by
-                    # that reasoning, leaving zero budget for the content
-                    # (finish_reason: "length", empty message.content).
-                    # Leaving this unset lets Ollama use the model's full
-                    # context window, which is what every working test so
-                    # far actually ran with.
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        # Vision + a full page's worth of structured JSON is slow — much
+        # slower than chat.py's plain-text replies. Every provider's
+        # chat() now budgets 600s for exactly this reason (was previously
+        # a dedicated timeout on this route's own httpx call) — see
+        # providers/custom.py's comment for the real timing data behind
+        # that number.
+        # Deliberately NOT capping output tokens beyond each provider's
+        # own default: tried a 4096 cap here once and it backfired —
+        # qwen3.6 is a "thinking" model that burns a large, variable
+        # number of tokens on internal reasoning before it starts writing
+        # the actual JSON answer, and 4096 was consumed entirely by that
+        # reasoning, leaving zero budget for the content (finish_reason:
+        # "length", empty message.content).
+        raw_content = await vision.chat(messages, system=_VISION_SYSTEM_PROMPT, json_mode=True)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.TimeoutException:
+        # httpx.TimeoutException's str() is empty by default — a blank
+        # error message here would look like a broken feature rather than
+        # what it actually is. A cold model load (a large local model
+        # llama.cpp/Ollama hasn't loaded into memory yet) can easily blow
+        # past 240s on top of the generation itself — confirmed for real
+        # this session: the model finished loading seconds after this
+        # timeout fired, and a retry succeeded immediately.
+        raise HTTPException(
+            status_code=504,
+            detail=f"{vision.name} (model={getattr(vision, 'model', '?')}) didn't respond within the "
+            "time budget — if this is a large local model being used for the first time, it may still "
+            "be loading. Try again in a moment.",
+        )
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to reach Ollama at {OLLAMA_BASE_URL} (model={vision_model}): {e}",
+            detail=f"Failed to reach {vision.name} (model={getattr(vision, 'model', '?')}): {e}",
         )
 
     try:
-        choice = data["choices"][0]
-        raw_content = choice["message"]["content"]
-    except (KeyError, IndexError):
-        raise HTTPException(status_code=502, detail=f"Unexpected response shape from Ollama: {data}")
-
-    cleaned = _extract_json_object(raw_content)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as strict_error:
-        # Real failure mode seen 2026-08-05 testing the container/block
-        # schema: a long, content-rich generation (several sections deep)
-        # came back with a literal unescaped newline inside a string
-        # value — valid-looking JSON apart from that one character, but
-        # json.loads() has no tolerance for it at all. json_repair handles
-        # exactly this class of near-miss (unescaped control characters,
-        # trailing commas, unquoted keys, ...) that LLMs produce far more
-        # often than outright garbage. Tried only as a fallback, never
-        # first — a repair library papering over a *systematically* broken
-        # prompt would be worse than a clear error, so strict parsing
-        # stays the default path and this only kicks in once it's already
-        # failed.
-        try:
-            parsed = repair_json(cleaned, return_objects=True)
-            if not isinstance(parsed, dict):
-                raise ValueError(f"repaired output was not a JSON object: {type(parsed)}")
-        except Exception:
-            # finish_reason == "length" means Ollama's max_tokens cap cut
-            # the response off mid-generation — worth distinguishing from
-            # the model simply producing malformed JSON on its own.
-            finish_reason = choice.get("finish_reason")
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Model did not return valid JSON ({strict_error}), and the automatic repair "
-                    f"couldn't fix it either. finish_reason={finish_reason!r}. "
-                    f"Raw output: {raw_content[:2000]}"
-                ),
-            )
+        parsed = parse_lenient_json(raw_content)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
     raw_sections = parsed.get("sections")
     if not isinstance(raw_sections, list):
@@ -844,7 +777,7 @@ async def generate_landing_page(
 # page endpoints (apis/pages.py) — nothing GEO-specific needed there.
 GEO_PAGE_SLUG = "seo"
 
-# Reuses PageSection's schema and _coerce_sections/_extract_json_object
+# Reuses PageSection's schema and _coerce_sections/parse_lenient_json
 # below — same validation/leniency infrastructure as generate_landing_page,
 # just fed by ingested document text instead of a design image, and via
 # the plain ChatProvider abstraction (resolve_chat_provider) rather than a
@@ -971,20 +904,10 @@ async def generate_geo_page(db: Session = Depends(get_db)) -> GenerateGeoPageRes
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
 
-    cleaned = _extract_json_object(raw_content)
     try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as strict_error:
-        try:
-            parsed = repair_json(cleaned, return_objects=True)
-            if not isinstance(parsed, dict):
-                raise ValueError(f"repaired output was not a JSON object: {type(parsed)}")
-        except Exception:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Model did not return valid JSON ({strict_error}), and the automatic repair "
-                f"couldn't fix it either. Raw output: {raw_content[:2000]}",
-            )
+        parsed = parse_lenient_json(raw_content)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
     raw_sections = parsed.get("sections")
     if not isinstance(raw_sections, list):
@@ -1022,26 +945,39 @@ class IntegrationStatus(BaseModel):
 
 class IntegrationsResponse(BaseModel):
     comfyui: IntegrationStatus
+    # Added 2026-08-18 alongside image-gen becoming a provider capability
+    # (see apis/model_settings.py) — openai/gemini image-gen availability
+    # just reflects whether their API key is configured, same as every
+    # other cloud-provider "configured" check in this codebase.
+    openai_image: IntegrationStatus
+    gemini_image: IntegrationStatus
 
 
 @router.get("/agent/integrations", response_model=IntegrationsResponse)
-async def get_integrations() -> IntegrationsResponse:
-    """Lightweight reachability check for third-party services a stub
-    route below would actually need — currently just ComfyUI (poster
-    generation). Read-only, no side effects on ComfyUI itself. Lets the
+async def get_integrations(db: Session = Depends(get_db)) -> IntegrationsResponse:
+    """Lightweight reachability/configured check for the services image
+    generation actually needs. Read-only, no side effects. Lets the
     dashboard gray out "Generate poster" up front with a clear reason
     instead of only discovering it's unreachable after clicking "Try it"
     and getting a generic 502. Not meant to grow into a general health-
     check system — add an entry here only when a real capability actually
-    depends on that service being reachable."""
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{COMFYUI_URL}/system_stats")
-            resp.raise_for_status()
-        comfyui = IntegrationStatus(available=True)
-    except httpx.HTTPError as e:
-        comfyui = IntegrationStatus(available=False, detail=f"ComfyUI unreachable at {COMFYUI_URL}: {e}")
-    return IntegrationsResponse(comfyui=comfyui)
+    depends on that service being reachable.
+
+    Reuses apis/model_settings.py's _list_image_providers (same
+    reachability probe the model picker itself uses) rather than
+    duplicating the check — comfyui's result reflects whatever address is
+    *currently configured* (AppSettings.image_comfyui_url or the env-var
+    default), not always the env-var one."""
+    options = {opt.provider: opt for opt in await _list_image_providers(db)}
+    return IntegrationsResponse(
+        comfyui=IntegrationStatus(available=options["comfyui"].selectable, detail=options["comfyui"].note),
+        openai_image=IntegrationStatus(
+            available=options["openai"].selectable, detail=options["openai"].note
+        ),
+        gemini_image=IntegrationStatus(
+            available=options["gemini"].selectable, detail=options["gemini"].note
+        ),
+    )
 
 
 class GeneratePosterRequest(BaseModel):
@@ -1054,14 +990,12 @@ class GeneratePosterResponse(BaseModel):
 
 
 @router.post("/agent/poster/generate", response_model=GeneratePosterResponse)
-async def generate_poster(req: GeneratePosterRequest) -> GeneratePosterResponse:
-    """Generate a text+image poster: submit a ComfyUI text-to-image job,
-    wait for it to finish, then (if `overlay_text` was given) composite
-    real rendered text onto the result. No new image pipeline — this
-    composes apis/api.py's existing ComfyUI wrapper (the same functions
-    its own manual-test form uses), called directly as plain Python
-    functions rather than a self-HTTP round-trip since it's the same
-    process. Deliberately a direct, deterministic call with no LLM/agent
+async def generate_poster(req: GeneratePosterRequest, db: Session = Depends(get_db)) -> GeneratePosterResponse:
+    """Generate a text+image poster via whatever image-gen provider the
+    owner has picked (ComfyUI, OpenAI/DALL·E, or Gemini/Imagen — see
+    resolve_image_provider, apis/model_settings.py), then (if
+    `overlay_text` was given) composite real rendered text onto the
+    result. Deliberately a direct, deterministic call with no LLM/agent
     reasoning involved — matches the "structured admin request, not a
     chatbot command" direction settled on in the root AGENTS.md, and
     keeps this out of the agent-isolation problem entirely (see that
@@ -1069,51 +1003,19 @@ async def generate_poster(req: GeneratePosterRequest) -> GeneratePosterResponse:
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt must not be empty")
 
-    payload = _build_payload_txt2img(prompt=req.prompt)
+    provider = resolve_image_provider(db)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(f"{COMFYUI_URL}/prompt", json=payload)
-            resp.raise_for_status()
-            submit_result = resp.json()
+        image_url, image_bytes = await provider.generate(req.prompt)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to reach ComfyUI at {COMFYUI_URL}: {e}")
-
-    if submit_result.get("node_errors"):
-        raise HTTPException(status_code=422, detail={"node_errors": submit_result["node_errors"]})
-    prompt_id = submit_result.get("prompt_id")
-    if not prompt_id:
-        raise HTTPException(status_code=502, detail=f"ComfyUI did not return a prompt_id: {submit_result}")
-
-    # Reuses apis/api.py's /wait route function directly (websocket-first,
-    # polling fallback, cancel-on-timeout — see its own docstring) instead
-    # of reimplementing any of that here.
-    outcome = await wait_for_completion(prompt_id, timeout=180.0)
-    if outcome["status"] != "completed":
-        raise HTTPException(status_code=502, detail=f"Image generation did not complete: {outcome}")
-
-    image_url = outcome["images"][0]["url"]
+        raise HTTPException(status_code=502, detail=f"Failed to reach {provider.name}: {e}")
 
     if req.overlay_text.strip():
-        # image_url is built from COMFYUI_PUBLIC_URL (localhost:8188) —
-        # correct for the *browser* to load, but unreachable from inside
-        # this container (its own localhost, not the host running
-        # ComfyUI). Same class of bug as the frontend's
-        # INTERNAL_API_URL-vs-NEXT_PUBLIC_API_URL gotcha (root AGENTS.md)
-        # — swap in COMFYUI_URL (host.docker.internal:8188) for this
-        # server-side fetch only; the URL returned to the caller below
-        # still uses the public one.
-        internal_image_url = image_url.replace(COMFYUI_PUBLIC_URL, COMFYUI_URL, 1)
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                img_resp = await client.get(internal_image_url)
-                img_resp.raise_for_status()
-                image_b64 = base64.b64encode(img_resp.content).decode("ascii")
-        except httpx.HTTPError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Image generated but failed to fetch it back for text overlay: {e}",
-            )
-
+        # ImageProvider.generate() always returns the raw bytes alongside
+        # the URL (see providers/base.py's ImageProvider docstring) — no
+        # more provider-specific "fetch it back" step needed here.
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
         # background=True (unlike TextOverlayRequest's own default of
         # False) — a semi-transparent box behind the text is the sensible
         # poster default; without it, text over a busy generated photo is
@@ -1128,16 +1030,50 @@ async def generate_poster(req: GeneratePosterRequest) -> GeneratePosterResponse:
 
 class CrmEntryRequest(BaseModel):
     contact_email: str
+    contact_name: str | None = None
+    contact_phone: str | None = None
     summary: str
     tags: list[str] = []
+    # Free-form like `tags` (not a DB enum — see models.CrmEntry's doc
+    # comment), but apis/chat.py's automatic capture and CrmPanel's
+    # manual-entry form both stick to appointment/quote/claim/inquiry so
+    # the leads view below can actually group on it.
+    category: str | None = None
+    # Set by apis/chat.py's automatic capture when the visitor attached a
+    # file via POST /chat/upload — see models.CrmEntry's doc comment. No
+    # manual-entry UI for this yet (CrmPanel's own form has no file
+    # picker), so this is null for hand-entered rows.
+    attachment_url: str | None = None
 
 
 class CrmEntryResponse(BaseModel):
     crm_id: str
     contact_email: str
+    contact_name: str | None
+    contact_phone: str | None
     summary: str
     tags: list[str]
+    category: str | None
+    status: str
+    attachment_url: str | None
+    analysis_notes: str | None
     created_at: datetime
+
+
+def _crm_entry_response(entry: CrmEntry) -> CrmEntryResponse:
+    return CrmEntryResponse(
+        crm_id=str(entry.id),
+        contact_email=entry.contact_email,
+        contact_name=entry.contact_name,
+        contact_phone=entry.contact_phone,
+        summary=entry.summary,
+        tags=entry.tags,
+        category=entry.category,
+        status=entry.status,
+        attachment_url=entry.attachment_url,
+        analysis_notes=entry.analysis_notes,
+        created_at=entry.created_at,
+    )
 
 
 @router.post("/agent/crm/entries", response_model=CrmEntryResponse)
@@ -1151,17 +1087,19 @@ def create_crm_entry(req: CrmEntryRequest, db: Session = Depends(get_db)) -> Crm
     see `models.CrmEntry`'s doc comment for the full reasoning. `crm_id`
     in the response is just the new row's own id, stringified — there's
     no external system assigning a different identifier."""
-    entry = CrmEntry(contact_email=req.contact_email, summary=req.summary, tags=req.tags)
+    entry = CrmEntry(
+        contact_email=req.contact_email,
+        contact_name=req.contact_name,
+        contact_phone=req.contact_phone,
+        summary=req.summary,
+        tags=req.tags,
+        category=req.category,
+        attachment_url=req.attachment_url,
+    )
     db.add(entry)
     db.commit()
     db.refresh(entry)
-    return CrmEntryResponse(
-        crm_id=str(entry.id),
-        contact_email=entry.contact_email,
-        summary=entry.summary,
-        tags=entry.tags,
-        created_at=entry.created_at,
-    )
+    return _crm_entry_response(entry)
 
 
 @router.get("/agent/crm/entries", response_model=list[CrmEntryResponse])
@@ -1171,12 +1109,135 @@ def list_crm_entries(db: Session = Depends(get_db)) -> list[CrmEntryResponse]:
     real capability in this file already meets (DocumentManager,
     PageManager, ...)."""
     entries = db.query(CrmEntry).order_by(CrmEntry.created_at.desc()).all()
-    return [
-        CrmEntryResponse(
-            crm_id=str(e.id), contact_email=e.contact_email, summary=e.summary, tags=e.tags, created_at=e.created_at
-        )
-        for e in entries
-    ]
+    return [_crm_entry_response(e) for e in entries]
+
+
+@router.delete("/agent/crm/entries/{entry_id}", status_code=204)
+def delete_crm_entry(entry_id: int, db: Session = Depends(get_db)) -> None:
+    """Removes a captured lead entirely — no undo, unlike the status
+    `PATCH` below. Was a real gap until 2026-08-08: there was no way to
+    clear out a spam/junk/test entry short of a direct DB query. Also
+    best-effort deletes the entry's own attached file, if it had one —
+    deleting "this lead and its evidence" together is the expected
+    meaning of removing a lead, not a leak `cleanup_orphaned_uploads`
+    would otherwise have to catch later."""
+    entry = db.query(CrmEntry).filter(CrmEntry.id == entry_id).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="CRM entry not found")
+
+    attachment_path = chat_attachments.resolve_local_path(entry.attachment_url) if entry.attachment_url else None
+    db.delete(entry)
+    db.commit()
+    if attachment_path is not None:
+        chat_attachments.delete_file(attachment_path)
+
+
+class CrmStatusUpdateRequest(BaseModel):
+    status: Literal["new", "contacted", "closed"]
+
+
+@router.patch("/agent/crm/entries/{entry_id}/status", response_model=CrmEntryResponse)
+def update_crm_entry_status(
+    entry_id: int, req: CrmStatusUpdateRequest, db: Session = Depends(get_db)
+) -> CrmEntryResponse:
+    """The one mutation a captured lead supports — moving it through
+    new -> contacted -> closed as admin/owner follow up. Nothing else
+    about an entry is editable after capture."""
+    entry = db.query(CrmEntry).filter(CrmEntry.id == entry_id).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="CRM entry not found")
+    entry.status = req.status
+    db.commit()
+    db.refresh(entry)
+    return _crm_entry_response(entry)
+
+
+class CrmScanRequest(BaseModel):
+    # Freeform, owner-authored — e.g. "extract the policy number and
+    # incident date" for an insurance claim photo. Unlike apis/chat.py's
+    # automatic extraction (a fixed name/phone/email/intent schema), this
+    # is deliberately open-ended: the owner decides what's worth pulling
+    # out of any given attachment, not just the fields this app already
+    # models.
+    instructions: str
+
+
+@router.post("/agent/crm/entries/{entry_id}/scan", response_model=CrmEntryResponse)
+async def scan_crm_entry_attachment(
+    entry_id: int, req: CrmScanRequest, db: Session = Depends(get_db)
+) -> CrmEntryResponse:
+    """Owner-triggered deep scan of a captured lead's attached file — also
+    reachable as the owner-agent's `scan_crm_attachment` tool (see
+    owner-agent/tools.py). Distinct from apis/chat.py's automatic
+    extraction: that one runs unconditionally with a fixed schema the
+    moment a visitor attaches something; this one runs on demand, once,
+    with whatever the admin/owner actually asked for, and appends its
+    answer to `analysis_notes` (timestamped, never overwriting an earlier
+    scan) rather than silently dropping a failure — see
+    chat_attachments.scan_with_instructions's docstring for why the two
+    functions have opposite failure postures."""
+    entry = db.query(CrmEntry).filter(CrmEntry.id == entry_id).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="CRM entry not found")
+    if not entry.attachment_url:
+        raise HTTPException(status_code=400, detail="This entry has no attached file to scan.")
+
+    file_path = chat_attachments.resolve_local_path(entry.attachment_url)
+    if file_path is None:
+        raise HTTPException(status_code=404, detail="The attached file could not be found on disk.")
+
+    try:
+        result = await chat_attachments.scan_with_instructions(db, file_path, req.instructions)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Analysis provider request failed: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    note = f"[{timestamp}] Scan ({req.instructions.strip()}):\n{result.strip()}"
+    entry.analysis_notes = f"{entry.analysis_notes}\n\n{note}" if entry.analysis_notes else note
+    db.commit()
+    db.refresh(entry)
+    return _crm_entry_response(entry)
+
+
+class CleanupUploadsRequest(BaseModel):
+    # A visitor uploads, then (normally) sends the chat turn referencing
+    # it within seconds — but nothing enforces that. This is how long an
+    # unreferenced file gets to "prove" it's actually attached to
+    # something before it's considered abandoned, so a slow typer never
+    # has their in-flight upload deleted out from under them.
+    older_than_hours: int = chat_attachments.DEFAULT_ORPHAN_AGE_HOURS
+    # True previews what would be deleted (freed_bytes/deleted_files still
+    # populated) without touching disk — a "let me see first" pass.
+    dry_run: bool = False
+
+
+class CleanupUploadsResponse(BaseModel):
+    scanned: int
+    orphaned: int
+    deleted: int
+    freed_bytes: int
+    deleted_files: list[str]
+
+
+@router.post("/agent/storage/cleanup-uploads", response_model=CleanupUploadsResponse)
+def cleanup_uploads(req: CleanupUploadsRequest, db: Session = Depends(get_db)) -> CleanupUploadsResponse:
+    """Removes chat-upload files nothing in this app references anymore —
+    a visitor who attached a photo and then never sent (or sent, but it
+    never became a real lead) a turn referencing it leaves exactly this
+    kind of orphan behind, with nothing else cleaning it up on its own.
+    See chat_attachments.cleanup_orphaned_uploads for the "referenced"
+    definition (checks both CrmEntry.attachment_url and any ChatMessage
+    transcript, not just captured leads) and why there's an age floor.
+    On-demand only, same as every other capability in this file — no
+    scheduler/cron exists in this stack to run it automatically."""
+    result = chat_attachments.cleanup_orphaned_uploads(
+        db, older_than_hours=req.older_than_hours, dry_run=req.dry_run
+    )
+    return CleanupUploadsResponse(**result)
 
 
 class ReportRequest(BaseModel):
@@ -1253,3 +1314,39 @@ def generate_report(req: ReportRequest, db: Session = Depends(get_db)) -> Report
         current += timedelta(days=1)
 
     return ReportResponse(report_type=req.report_type, start_date=req.start_date, end_date=req.end_date, points=points)
+
+
+class ChatCompletionRequest(BaseModel):
+    messages: list[dict]
+    system: str | None = None
+    json_mode: bool = False
+
+
+class ChatCompletionResponse(BaseModel):
+    reply: str
+
+
+@router.post("/agent/chat-completion", response_model=ChatCompletionResponse)
+async def chat_completion(req: ChatCompletionRequest, db: Session = Depends(get_db)) -> ChatCompletionResponse:
+    """Thin proxy onto resolve_chat_provider(db).chat() — the one place
+    the isolated owner-agent service (own container, no DB access — see
+    the root AGENTS.md's "Owner agent" section) can reach the owner's
+    actual chat provider/model pick (AppSettings, apis/model_settings.py)
+    instead of being hardcoded to one vendor. Added 2026-08-18: the
+    owner's own words on why — "this project isn't about making choices
+    for the user, it's about giving the user choices," which a
+    Ollama-only owner-agent brain contradicted.
+
+    Same admin/owner gate as every other route in this router;
+    owner-agent's own deps.py already requires owner specifically before
+    ever forwarding the caller's bearer token here — defense in depth,
+    same pattern its 8 tool calls (tools.py) already use, not a new
+    trust boundary."""
+    provider = resolve_chat_provider(db)
+    try:
+        reply = await provider.chat(req.messages, system=req.system, json_mode=req.json_mode)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+    return ChatCompletionResponse(reply=reply)

@@ -18,6 +18,8 @@ from apis.media import router as media_router
 from apis.model_settings import router as model_settings_router
 from apis.pages import admin_router as pages_admin_router
 from apis.pages import public_router as pages_public_router
+from chat_attachments import CHAT_UPLOAD_DIR
+from rate_limit import RateLimitMiddleware
 
 app = FastAPI()
 
@@ -26,6 +28,16 @@ app = FastAPI()
 # can be added later without code changes.
 CORS_ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:3000").split(",")
 
+# Order matters here, and it's the opposite of what it looks like: Starlette
+# wraps the *most recently added* middleware as the *outermost* layer (see
+# Starlette's Router.build_middleware_stack — user_middleware is built via
+# insert(0, ...), then wrapped in reversed order). RateLimitMiddleware is
+# added first so CORSMiddleware (added second) ends up outermost, wrapping
+# even a 429 short-circuited by the rate limiter — added the other way
+# around, a rate-limited browser request would come back with no CORS
+# headers at all and surface as an opaque CORS failure instead of a
+# readable 429 in the frontend.
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
@@ -51,6 +63,14 @@ app.include_router(media_router, prefix="/api")
 # guessable/listable without the (gated) GET /api/agent/media endpoint.
 MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/api/media/uploads", StaticFiles(directory=str(MEDIA_UPLOAD_DIR)), name="media-uploads")
+
+# Serves apis/chat.py's POST /chat/upload attachments back out — same
+# "publicly readable by filename, not listable" shape as the media mount
+# above. Filenames are random uuid4s (never the client-supplied name), so
+# this is safe to leave open even though the upload endpoint itself has
+# no auth gate at all.
+CHAT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/api/chat/uploads", StaticFiles(directory=str(CHAT_UPLOAD_DIR)), name="chat-uploads")
 
 if __name__ == "__main__":
     import uvicorn

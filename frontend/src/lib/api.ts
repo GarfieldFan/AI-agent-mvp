@@ -20,6 +20,34 @@ const API_BASE_URL =
     ? (process.env.INTERNAL_API_URL ?? "http://backend:8000")
     : (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000");
 
+/** FastAPI's `detail` field is usually a plain string (every
+ * `HTTPException(..., detail="...")` in this backend), but a 422 from
+ * Pydantic's own request-body validation (e.g. a missing/mistyped field
+ * — a stale frontend bundle sending an old payload shape is the classic
+ * trigger) sends `detail` as a *list* of `{loc, msg, type}` objects
+ * instead. Passed through unhandled, that array/object ends up as
+ * `ApiError.message` (typed `string`, but not actually one at runtime)
+ * and renders as a bare "[object Object]" wherever a component displays
+ * it — this normalizes both shapes into an actual readable string. */
+function extractErrorMessage(errorBody: unknown, fallback: string): string {
+  const detail = (errorBody as { detail?: unknown } | undefined)?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((entry) => {
+        if (!entry || typeof entry !== "object" || !("msg" in entry)) return null;
+        const msg = String((entry as { msg: unknown }).msg);
+        const loc = "loc" in entry && Array.isArray((entry as { loc: unknown }).loc)
+          ? (entry as { loc: unknown[] }).loc.join(".")
+          : null;
+        return loc ? `${loc}: ${msg}` : msg;
+      })
+      .filter((m): m is string => !!m);
+    if (messages.length > 0) return messages.join("; ");
+  }
+  return fallback;
+}
+
 export class ApiError extends Error {
   status: number;
   body: unknown;
@@ -66,11 +94,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
 
   if (!response.ok) {
     const errorBody = await response.json().catch(() => undefined);
-    throw new ApiError(
-      response.status,
-      (errorBody as { detail?: string })?.detail ?? response.statusText,
-      errorBody,
-    );
+    throw new ApiError(response.status, extractErrorMessage(errorBody, response.statusText), errorBody);
   }
 
   if (response.status === 204) {

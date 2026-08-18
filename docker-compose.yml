@@ -11,6 +11,12 @@ services:
       - DATABASE_URL=postgresql://my_user:my_password@postgres-db:5432/my_mvp_db
       - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
       - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+      # Shared with the owner-agent service below — same default as
+      # backend/auth.py's own hardcoded fallback, made explicit here so
+      # there's one source of truth for the two services' shared secret
+      # instead of two independently-hardcoded Python literals that happen
+      # to match today and could silently drift apart later.
+      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-secret-change-me}
       # Everything below composes from the atomic values in .env (see
       # .env.example) rather than being hardcoded — none of these are
       # actually fixed: ComfyUI could be swapped for a different SD
@@ -67,6 +73,30 @@ services:
       # is NOT interchangeable with NEXT_PUBLIC_API_URL above, and isn't
       # HOST/BACKEND_PORT-derived for the same reason.
       - INTERNAL_API_URL=http://backend:8000
+      # Owner Agent panel calls this origin directly from the browser (no
+      # SSR fetch involved), so only the NEXT_PUBLIC_ variant is needed —
+      # see frontend/src/lib/owner-agent.ts.
+      - NEXT_PUBLIC_OWNER_AGENT_URL=http://${HOST:-localhost}:${OWNER_AGENT_PORT:-8100}
+    depends_on:
+      - backend
+
+  owner-agent:
+    build: ./owner-agent
+    container_name: mvp_owner_agent
+    ports:
+      - "${OWNER_AGENT_PORT:-8100}:8100"
+    volumes:
+      - ./owner-agent:/app
+      - ./owner-agent/logs:/app/logs
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-secret-change-me}
+      # Docker DNS, server-to-server — same principle as the frontend's
+      # INTERNAL_API_URL, not the HOST-based publicly-reachable URL: this
+      # service calls backend from inside the Compose network, never from
+      # a browser.
+      - BACKEND_URL=http://backend:8000
+      - CORS_ALLOW_ORIGINS=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
+      - WATCHFILES_FORCE_POLLING=true
     depends_on:
       - backend
 
@@ -74,7 +104,15 @@ services:
     image: pgvector/pgvector:pg16
     container_name: mvp_postgres_db
     ports:
-      - "5432:5432"
+      # 127.0.0.1-bound, not 0.0.0.0 — backend/owner-agent reach this over
+      # Docker's internal network (postgres-db:5432) and never need this
+      # mapping at all; it exists purely so a local DB client on this same
+      # machine (pgAdmin, DBeaver, psql, ...) can still connect. Binding to
+      # every interface would mean anyone who can reach this host's network
+      # (LAN, public WiFi, ...) could connect directly with the hardcoded
+      # my_user/my_password below and bypass every RBAC/JWT check in the
+      # app entirely.
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: my_user
       POSTGRES_PASSWORD: my_password

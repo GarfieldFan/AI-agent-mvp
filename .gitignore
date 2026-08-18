@@ -8,8 +8,12 @@
 __pycache__/
 *.pyc
 
-# runtime data — uploaded RAG documents / CTE media uploads (backend/apis/documents.py, backend/apis/media.py)
+# runtime data — uploaded RAG documents / CTE media uploads / public chat
+# attachments (backend/apis/documents.py, backend/apis/media.py, backend/apis/chat.py)
 /backend/storage/
+
+# runtime data — owner-agent's action log (owner-agent/logging_.py)
+/owner-agent/logs/
 
 # editor scratch space
 /.scratch/

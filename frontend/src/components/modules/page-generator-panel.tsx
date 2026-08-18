@@ -14,6 +14,7 @@ import { FileDropzone } from "@/components/common/file-dropzone";
 import { SectionRenderer } from "@/components/theme/section-renderer";
 import { apiFetch, ApiError } from "@/lib/api";
 import { fileToBase64 } from "@/lib/file";
+import { getModelSettings } from "@/lib/models";
 import { listPages, savePageVersion, type PageSummary } from "@/lib/pages";
 import { slugify } from "@/lib/slug";
 import { cn } from "@/lib/utils";
@@ -282,11 +283,14 @@ function LockableSectionPreview({
 
 /** The one agent-console capability that's actually real (see
  * backend/apis/agent.py's generate_landing_page) — upload a design image,
- * a vision LLM (qwen3.6) turns it into a PageSection[], previewed here via
- * the same SectionRenderer any saved page renders through. Not landing-
- * page-specific despite the endpoint's name — SavePageForm below can park
- * a generation onto any slug (home, about, a promo page, ...), so this is
- * a general page generator, not just a landing-page one. */
+ * a vision LLM (whichever the owner has selected in Model settings, see
+ * `visionLabel` below — was hardcoded to "qwen3.6" until 2026-08-19, wrong
+ * ever since vision generation became provider-agnostic) turns it into a
+ * PageSection[], previewed here via the same SectionRenderer any saved
+ * page renders through. Not landing-page-specific despite the endpoint's
+ * name — SavePageForm below can park a generation onto any slug (home,
+ * about, a promo page, ...), so this is a general page generator, not
+ * just a landing-page one. */
 export function PageGeneratorPanel() {
   const [file, setFile] = React.useState<File | null>(null);
   const [notes, setNotes] = React.useState("");
@@ -295,6 +299,24 @@ export function PageGeneratorPanel() {
   const [items, setItems] = React.useState<PreviewItem[] | null>(null);
   const [accentColor, setAccentColor] = React.useState<string | undefined>(undefined);
   const [lockedIds, setLockedIds] = React.useState<Set<string>>(new Set());
+  // Display only — reflects whatever's actually configured in Model
+  // settings, not a fixed model name. Null until loaded (or if the
+  // fetch fails, e.g. logged out) falls back to a generic label below.
+  const [visionLabel, setVisionLabel] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    getModelSettings()
+      .then((settings) => {
+        if (!cancelled) setVisionLabel(`${settings.vision_provider} / ${settings.vision_model}`);
+      })
+      .catch(() => {
+        // Non-critical — the label just falls back to a generic phrase below.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Reassembled from `items`/`accentColor` on every render rather than
   // stored directly — `items` (with its stable per-item ids, see
@@ -362,11 +384,12 @@ export function PageGeneratorPanel() {
   return (
     <div className="space-y-4 rounded-xl border p-4">
       <div className="space-y-1">
-        <h3 className="text-sm font-medium">Page generator</h3>
+        <h3 className="text-lg font-semibold">Page generator</h3>
         <p className="text-xs text-muted-foreground">
           Upload a design image (mockup, screenshot, even a rough sketch). A
-          vision LLM (qwen3.6) turns it into page sections, previewed below
-          — save it to a slug to publish it (see below).
+          vision LLM ({visionLabel ?? "your configured vision model"}) turns it
+          into page sections, previewed below — save it to a slug to publish
+          it (see below).
         </p>
       </div>
 
@@ -396,7 +419,9 @@ export function PageGeneratorPanel() {
       </div>
 
       {status === "loading" ? (
-        <LoadingSpinner label="Generating with qwen3.6 — vision + a 36B model takes about 1-2 minutes…" />
+        <LoadingSpinner
+          label={`Generating with ${visionLabel ?? "your configured vision model"} — vision + a full page schema can take a few minutes for a large local model…`}
+        />
       ) : null}
 
       {status === "error" && error ? (

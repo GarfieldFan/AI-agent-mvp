@@ -18,15 +18,15 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from apis.deps import CurrentUser, Role, get_current_user, require_role
+from apis.model_settings import resolve_embedding_provider
 from db import get_db
 from ingest import chunk_text, parse_document
-from models import Document, DocumentChunk
+from models import AppSettings, Document, DocumentChunk
 from providers.base import ProviderNotConfigured
-from providers.registry import get_embedding_provider
 
 router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
 
@@ -54,9 +54,57 @@ class DocumentSummary(BaseModel):
     chunk_count: int
     uploaded_by: str | None = None
     created_at: datetime
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    # True when this document's chunks (if any) were embedded under a
+    # different provider/model than AppSettings' current one — e.g. the
+    # owner switched embedding providers since this document was last
+    # (re-)ingested. See POST /agent/documents/reembed-all.
+    needs_reembed: bool = False
 
 
-def _to_summary(document: Document) -> DocumentSummary:
+class ReembedFailure(BaseModel):
+    document_id: int
+    filename: str
+    error: str
+
+
+class ReembedAllResponse(BaseModel):
+    processed: int
+    succeeded: int
+    failed: list[ReembedFailure]
+
+
+def _current_embedding_config(db: Session) -> tuple[str | None, str | None]:
+    """(provider, model) actually in effect right now — via
+    resolve_embedding_provider so this matches exactly what ingestion/
+    retrieval will use, including the env-var fallback when nothing's
+    been explicitly saved. None/None (rather than raising) when custom is
+    selected but not configured — every document then correctly shows as
+    needing re-embed, since the active config is unusable anyway."""
+    try:
+        provider = resolve_embedding_provider(db)
+    except ProviderNotConfigured:
+        return None, None
+    return provider.name, getattr(provider, "model", None)
+
+
+def _record_embedding_dimensions(db: Session, vectors: list[list[float]]) -> None:
+    """Stamps AppSettings.embedding_dimensions with the actual length of a
+    just-computed vector — more trustworthy than any provider's claimed
+    static dimension (custom especially, see providers/custom.py), and
+    gives the owner-facing picker something real to display."""
+    if not vectors:
+        return
+    row = db.get(AppSettings, 1)
+    if row is None:
+        row = AppSettings(id=1)
+        db.add(row)
+    row.embedding_dimensions = len(vectors[0])
+
+
+def _to_summary(document: Document, current: tuple[str | None, str | None]) -> DocumentSummary:
+    current_provider, current_model = current
     return DocumentSummary(
         id=document.id,
         filename=document.filename,
@@ -67,6 +115,9 @@ def _to_summary(document: Document) -> DocumentSummary:
         chunk_count=len(document.chunks),
         uploaded_by=document.uploaded_by,
         created_at=document.created_at,
+        embedding_provider=document.embedding_provider,
+        embedding_model=document.embedding_model,
+        needs_reembed=(document.embedding_provider, document.embedding_model) != (current_provider, current_model),
     )
 
 
@@ -114,7 +165,7 @@ async def ingest_document(
         if not chunks:
             raise ValueError("No extractable text found in this document.")
 
-        embedder = get_embedding_provider()
+        embedder = resolve_embedding_provider(db)
         vectors = await embedder.embed(chunks)
 
         for index, (chunk_content, vector) in enumerate(zip(chunks, vectors)):
@@ -128,6 +179,9 @@ async def ingest_document(
             )
 
         document.status = "ready"
+        document.embedding_provider = embedder.name
+        document.embedding_model = getattr(embedder, "model", None)
+        _record_embedding_dimensions(db, vectors)
         db.commit()
     except ProviderNotConfigured as e:
         document.status = "error"
@@ -139,13 +193,14 @@ async def ingest_document(
         db.commit()
 
     db.refresh(document)
-    return _to_summary(document)
+    return _to_summary(document, _current_embedding_config(db))
 
 
 @router.get("/agent/documents", response_model=list[DocumentSummary])
 def list_documents(db: Session = Depends(get_db)) -> list[DocumentSummary]:
     documents = db.scalars(select(Document).order_by(Document.created_at.desc())).all()
-    return [_to_summary(d) for d in documents]
+    current = _current_embedding_config(db)
+    return [_to_summary(d, current) for d in documents]
 
 
 @router.delete("/agent/documents/{document_id}", status_code=204)
@@ -159,3 +214,58 @@ def delete_document(document_id: int, db: Session = Depends(get_db)) -> None:
     db.commit()
     if storage_file.exists():
         storage_file.unlink()
+
+
+@router.post("/agent/documents/reembed-all", response_model=ReembedAllResponse)
+async def reembed_all_documents(db: Session = Depends(get_db)) -> ReembedAllResponse:
+    """Re-parses and re-embeds every document's raw file (still on disk
+    under STORAGE_DIR — see IngestDocumentRequest's storage step) against
+    whatever embedding provider/model is *currently* configured. This is
+    the recovery path after apis/model_settings.py's update_settings
+    clears document_chunks on an embedding provider switch — see this
+    module's DocumentSummary.needs_reembed and the root AGENTS.md.
+
+    Synchronous, like ingest_document — no background job queue exists in
+    this codebase; fine for MVP-sized document sets, commits per-document
+    so one failure doesn't roll back documents that already succeeded."""
+    documents = db.scalars(select(Document)).all()
+    succeeded = 0
+    failed: list[ReembedFailure] = []
+
+    for document in documents:
+        try:
+            raw_bytes = (STORAGE_DIR / document.storage_path).read_bytes()
+            text = parse_document(raw_bytes, document.content_type, document.filename)
+            chunks = chunk_text(text)
+            if not chunks:
+                raise ValueError("No extractable text found in this document.")
+
+            embedder = resolve_embedding_provider(db)
+            vectors = await embedder.embed(chunks)
+
+            db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
+            for index, (chunk_content, vector) in enumerate(zip(chunks, vectors)):
+                db.add(
+                    DocumentChunk(
+                        document_id=document.id,
+                        chunk_index=index,
+                        content=chunk_content,
+                        embedding=vector,
+                    )
+                )
+
+            document.status = "ready"
+            document.error_message = None
+            document.embedding_provider = embedder.name
+            document.embedding_model = getattr(embedder, "model", None)
+            _record_embedding_dimensions(db, vectors)
+            db.commit()
+            succeeded += 1
+        except Exception as e:
+            db.rollback()
+            document.status = "error"
+            document.error_message = f"Re-embed failed: {e}"
+            db.commit()
+            failed.append(ReembedFailure(document_id=document.id, filename=document.filename, error=str(e)))
+
+    return ReembedAllResponse(processed=len(documents), succeeded=succeeded, failed=failed)

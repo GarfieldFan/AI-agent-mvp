@@ -93,6 +93,20 @@ class UploadMediaResponse(BaseModel):
     url: str
 
 
+def save_media_bytes(raw_bytes: bytes, prefix: str, suffix: str = ".png") -> str:
+    """Persists raw image bytes under MEDIA_UPLOAD_DIR and returns a
+    stable, servable URL — shared by upload_media below and
+    providers/openai.py's/providers/gemini.py's image providers, which
+    need this for the same reason CTE's own uploads do: a generated
+    image needs to keep existing after the request completes, and this
+    project has no reason to trust a cloud vendor's own (often
+    short-lived) hosted URL for that."""
+    MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{prefix}_{uuid.uuid4().hex}{suffix}"
+    (MEDIA_UPLOAD_DIR / stored_name).write_bytes(raw_bytes)
+    return f"{BACKEND_PUBLIC_URL}/api/media/uploads/{stored_name}"
+
+
 @router.post("/agent/media/upload", response_model=UploadMediaResponse)
 def upload_media(req: UploadMediaRequest) -> UploadMediaResponse:
     content_b64 = req.content_base64
@@ -109,11 +123,5 @@ def upload_media(req: UploadMediaRequest) -> UploadMediaResponse:
     if suffix not in IMAGE_EXTENSIONS:
         suffix = ".png"
 
-    MEDIA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    stored_name = f"upload_{uuid.uuid4().hex}{suffix}"
-    (MEDIA_UPLOAD_DIR / stored_name).write_bytes(raw_bytes)
-
-    return UploadMediaResponse(
-        filename=stored_name,
-        url=f"{BACKEND_PUBLIC_URL}/api/media/uploads/{stored_name}",
-    )
+    url = save_media_bytes(raw_bytes, prefix="upload", suffix=suffix)
+    return UploadMediaResponse(filename=url.rsplit("/", 1)[-1], url=url)

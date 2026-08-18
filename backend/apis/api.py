@@ -35,12 +35,29 @@ COMFYUI_WS_URL: str = os.environ.get("COMFYUI_WS_URL", "ws://host.docker.interna
 # COMFYUI_OUTPUT_DIR env var in docker-compose.yml; the Windows path below
 # is only a fallback for running the wrapper directly on the host (no
 # container) where the two DO coincide.
-COMFYUI_OUTPUT_DIR = Path(os.environ.get("COMFYUI_OUTPUT_DIR", r"D:\AI Models\comfy\output"))
+COMFYUI_OUTPUT_DIR = Path(os.environ.get("COMFYUI_OUTPUT_DIR", r"D:\AI_Models\comfy\output"))
 
 # A TTF/OTF font with the glyph coverage you need (e.g. Noto Sans SC for
 # Chinese) must be placed here. PIL's built-in default font is a tiny
 # bitmap font with Latin-only coverage — fine for testing, not for a demo.
 POSTER_FONT_PATH = Path(__file__).parent.parent / "assets" / "fonts" / "NotoSansSC-Bold.otf"
+
+
+async def list_comfyui_loader_options(base_url: str, node_class: str, param_name: str) -> list[str]:
+    """Live-query ComfyUI's own `/object_info/{node_class}` for what files
+    it currently reports as loadable for one widget (e.g. `UNETLoader`'s
+    `unet_name`) — the actual list of `.safetensors`/etc. files ComfyUI
+    found in its own models folder, not a hardcoded guess. Returns []
+    on any failure (unreachable, node class not installed, ...) rather
+    than raising — this is enrichment for a picker, not load-bearing."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{base_url}/object_info/{node_class}")
+            resp.raise_for_status()
+            data = resp.json()
+        return list(data[node_class]["input"]["required"][param_name][0])
+    except (httpx.HTTPError, KeyError, IndexError, TypeError):
+        return []
 
 
 def _load_workflow(path: Path) -> dict:
@@ -254,18 +271,26 @@ async def generate_image(req: GenerateImageRequest):
         )
 
 
-async def _fetch_history_result(prompt_id: str) -> dict:
+async def _fetch_history_result(
+    prompt_id: str, *, base_url: str = COMFYUI_URL, public_url: str = COMFYUI_PUBLIC_URL
+) -> dict:
     """Fetch and normalize ComfyUI's /history/{prompt_id} into our response
-    shape. Shared by the /history route and the /wait endpoint below."""
+    shape. Shared by the /history route and the /wait endpoint below.
+
+    `base_url`/`public_url` default to the env-var-configured instance
+    (unchanged behavior for this module's own routes and any existing
+    caller) — providers/comfyui.py's ComfyUIImageProvider is the only
+    caller that ever passes an override, when the owner has pointed image
+    generation at a different ComfyUI instance via the model picker."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
+            resp = await client.get(f"{base_url}/history/{prompt_id}")
             resp.raise_for_status()
             history = resp.json()
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to connect to ComfyUI at {COMFYUI_URL}: {e}",
+            detail=f"Failed to connect to ComfyUI at {base_url}: {e}",
         )
 
     # ComfyUI returns {} if the prompt_id hasn't finished (or doesn't exist yet)
@@ -298,7 +323,7 @@ async def _fetch_history_result(prompt_id: str) -> dict:
                     "subfolder": img.get("subfolder", ""),
                     "type": img.get("type", "output"),
                     "url": (
-                        f"{COMFYUI_PUBLIC_URL}/view?filename={img.get('filename')}"
+                        f"{public_url}/view?filename={img.get('filename')}"
                         f"&subfolder={img.get('subfolder', '')}"
                         f"&type={img.get('type', 'output')}"
                     ),
@@ -330,15 +355,25 @@ async def get_history(prompt_id: str):
     return await _fetch_history_result(prompt_id)
 
 
-async def _wait_via_websocket(prompt_id: str, timeout: float):
+async def _wait_via_websocket(
+    prompt_id: str,
+    timeout: float,
+    *,
+    ws_url: str = COMFYUI_WS_URL,
+    base_url: str = COMFYUI_URL,
+    public_url: str = COMFYUI_PUBLIC_URL,
+):
     """Try to catch ComfyUI's completion event over its native websocket
     instead of polling. Returns a result dict on a definitive outcome
     (completed/error), or None if the socket couldn't tell us anything
     within a reasonable window — in which case the caller should fall
     back to plain polling rather than trusting the socket for the whole
-    timeout budget (protects against dropped connections/missed events)."""
+    timeout budget (protects against dropped connections/missed events).
+
+    `ws_url`/`base_url`/`public_url` default to the env-var-configured
+    instance — see _fetch_history_result's docstring for why."""
     ws_client_id = str(uuid.uuid4())
-    uri = f"{COMFYUI_WS_URL}?clientId={ws_client_id}"
+    uri = f"{ws_url}?clientId={ws_client_id}"
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
 
@@ -379,11 +414,54 @@ async def _wait_via_websocket(prompt_id: str, timeout: float):
                 # ComfyUI signals "this whole prompt is done" by sending an
                 # "executing" event with node == None for the prompt_id.
                 if msg.get("type") == "executing" and data.get("node") is None:
-                    return await _fetch_history_result(prompt_id)
+                    return await _fetch_history_result(prompt_id, base_url=base_url, public_url=public_url)
     except Exception:
         # Any websocket-level failure (refused, dropped, etc.) -> let the
         # caller fall back to polling instead of raising.
         return None
+
+
+async def _wait_for_completion_impl(
+    prompt_id: str,
+    timeout: float = 300.0,
+    *,
+    base_url: str = COMFYUI_URL,
+    public_url: str = COMFYUI_PUBLIC_URL,
+    ws_url: str = COMFYUI_WS_URL,
+) -> dict:
+    """The actual implementation behind the /wait route below — kept
+    separate so base_url/public_url/ws_url overrides (providers/comfyui.py's
+    ComfyUIImageProvider is the only caller that ever passes one, when the
+    owner has pointed image generation at a different ComfyUI instance via
+    the model picker) never become accidentally-public query parameters on
+    the HTTP route itself. See _fetch_history_result's docstring for the
+    same default-to-env-var reasoning."""
+    # In case it already finished before this request even arrived.
+    existing = await _fetch_history_result(prompt_id, base_url=base_url, public_url=public_url)
+    if existing["status"] in ("completed", "error"):
+        return existing
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+
+    result = await _wait_via_websocket(prompt_id, timeout, ws_url=ws_url, base_url=base_url, public_url=public_url)
+    if result is not None:
+        return result
+
+    # Fallback: plain polling for whatever's left of the timeout budget.
+    while loop.time() < deadline:
+        await asyncio.sleep(5)
+        result = await _fetch_history_result(prompt_id, base_url=base_url, public_url=public_url)
+        if result["status"] in ("completed", "error"):
+            return result
+
+    return {
+        "status": "timeout",
+        "prompt_id": prompt_id,
+        "message": f"No completion after {timeout:.0f}s (websocket + polling fallback both exhausted). "
+                   f"Sent a cancel/interrupt request to ComfyUI to free up resources.",
+        "cancel_results": await _cancel_task_internal(prompt_id, base_url=base_url),
+    }
 
 
 @router.get("/wait/{prompt_id}")
@@ -395,43 +473,23 @@ async def wait_for_completion(prompt_id: str, timeout: float = 300.0):
     fall back to polling /history every 5s if the socket is unreachable,
     drops, or goes quiet for 30s. Either way we return one final result,
     so the caller (poll_history.py) makes exactly one HTTP request and
-    blocks on it instead of looping itself.
+    blocks on it instead of looping itself. Always targets the env-var-
+    configured ComfyUI instance — see _wait_for_completion_impl for the
+    internal-only override used when the owner has pointed image
+    generation at a different instance.
     """
-    # In case it already finished before this request even arrived.
-    existing = await _fetch_history_result(prompt_id)
-    if existing["status"] in ("completed", "error"):
-        return existing
-
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-
-    result = await _wait_via_websocket(prompt_id, timeout)
-    if result is not None:
-        return result
-
-    # Fallback: plain polling for whatever's left of the timeout budget.
-    while loop.time() < deadline:
-        await asyncio.sleep(5)
-        result = await _fetch_history_result(prompt_id)
-        if result["status"] in ("completed", "error"):
-            return result
-
-    return {
-        "status": "timeout",
-        "prompt_id": prompt_id,
-        "message": f"No completion after {timeout:.0f}s (websocket + polling fallback both exhausted). "
-                   f"Sent a cancel/interrupt request to ComfyUI to free up resources.",
-        "cancel_results": await _cancel_task_internal(prompt_id),
-    }
+    return await _wait_for_completion_impl(prompt_id, timeout)
 
 
-async def _cancel_task_internal(prompt_id: str) -> dict:
+async def _cancel_task_internal(prompt_id: str, *, base_url: str = COMFYUI_URL) -> dict:
     """Shared cancel logic: dequeue (if pending) and interrupt (if running).
-    Used both by the /cancel route and internally by /wait's timeout path."""
+    Used both by the /cancel route and internally by /wait's timeout path.
+    `base_url` defaults to the env-var-configured instance — see
+    _fetch_history_result's docstring for the same reasoning."""
     results: dict = {}
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            resp = await client.post(f"{COMFYUI_URL}/queue", json={"delete": [prompt_id]})
+            resp = await client.post(f"{base_url}/queue", json={"delete": [prompt_id]})
             results["queue_delete_status"] = resp.status_code
         except httpx.HTTPError as e:
             results["queue_delete_error"] = str(e)
@@ -444,14 +502,14 @@ async def _cancel_task_internal(prompt_id: str) -> dict:
         # happens to be running by then. So check first, and only
         # interrupt if prompt_id is actually the one currently executing.
         try:
-            queue_resp = await client.get(f"{COMFYUI_URL}/queue")
+            queue_resp = await client.get(f"{base_url}/queue")
             queue_resp.raise_for_status()
             queue_data = queue_resp.json()
             running_ids = {
                 entry[1] for entry in queue_data.get("queue_running", []) if len(entry) > 1
             }
             if prompt_id in running_ids:
-                resp = await client.post(f"{COMFYUI_URL}/interrupt")
+                resp = await client.post(f"{base_url}/interrupt")
                 results["interrupt_status"] = resp.status_code
             else:
                 results["interrupt_skipped"] = (

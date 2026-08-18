@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { FileText, Trash2, UploadCloud } from "lucide-react";
+import { FileText, RefreshCw, Trash2, UploadCloud } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -15,8 +15,10 @@ import {
   deleteDocument,
   ingestDocument,
   listDocuments,
+  reembedAllDocuments,
   type DocumentSummary,
   type DocumentStatus,
+  type ReembedAllResult,
 } from "@/lib/documents";
 
 const STATUS_BADGE: Record<DocumentStatus, { label: string; variant: "outline" | "secondary" | "default" | "destructive" }> = {
@@ -45,6 +47,9 @@ export function DocumentManager() {
   const [documents, setDocuments] = React.useState<DocumentSummary[] | null>(null);
   const [listError, setListError] = React.useState<string | null>(null);
   const [deletingId, setDeletingId] = React.useState<number | null>(null);
+  const [reembedStatus, setReembedStatus] = React.useState<"idle" | "loading" | "error">("idle");
+  const [reembedError, setReembedError] = React.useState<string | null>(null);
+  const [reembedResult, setReembedResult] = React.useState<ReembedAllResult | null>(null);
 
   const refresh = React.useCallback(() => {
     listDocuments()
@@ -87,10 +92,27 @@ export function DocumentManager() {
     }
   }
 
+  async function handleReembedAll() {
+    setReembedStatus("loading");
+    setReembedError(null);
+    setReembedResult(null);
+    try {
+      const result = await reembedAllDocuments();
+      setReembedResult(result);
+      setReembedStatus("idle");
+      refresh();
+    } catch (err) {
+      setReembedError(err instanceof ApiError ? err.message : "Re-embed failed — is the backend reachable?");
+      setReembedStatus("error");
+    }
+  }
+
+  const staleCount = documents?.filter((d) => d.needs_reembed).length ?? 0;
+
   return (
-    <div className="space-y-4 rounded-xl border p-4">
+    <div className="space-y-4 rounded-xl border bg-muted/40 p-4">
       <div className="space-y-1">
-        <h3 className="text-sm font-medium">Knowledge base documents</h3>
+        <h3 className="text-lg font-semibold">Knowledge base documents</h3>
         <p className="text-xs text-muted-foreground">
           Upload a PDF, DOCX, Markdown, or text file — it&apos;s parsed, chunked, and
           embedded into the RAG vector store. The public <code>/chat</code> chatbot
@@ -118,6 +140,35 @@ export function DocumentManager() {
       ) : null}
 
       <div className="space-y-2 border-t pt-4">
+        {staleCount > 0 ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed p-3">
+            <p className="text-xs text-muted-foreground">
+              {staleCount} document{staleCount === 1 ? "" : "s"} embedded under a different provider than
+              the one currently selected — re-embed to make {staleCount === 1 ? "it" : "them"} searchable
+              again.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleReembedAll}
+              disabled={reembedStatus === "loading"}
+            >
+              <RefreshCw className="size-4" />
+              {reembedStatus === "loading" ? "Re-embedding…" : "Re-embed all documents"}
+            </Button>
+          </div>
+        ) : null}
+        {reembedStatus === "error" && reembedError ? (
+          <ErrorMessage description={reembedError} onRetry={() => setReembedStatus("idle")} />
+        ) : null}
+        {reembedResult ? (
+          <p className="text-xs text-muted-foreground">
+            Re-embedded {reembedResult.succeeded}/{reembedResult.processed} document
+            {reembedResult.processed === 1 ? "" : "s"}
+            {reembedResult.failed.length > 0 ? ` — ${reembedResult.failed.length} failed` : ""}.
+          </p>
+        ) : null}
+
         {listError ? <ErrorMessage description={listError} onRetry={refresh} /> : null}
         {documents === null && !listError ? <LoadingSpinner label="Loading documents…" /> : null}
         {documents && documents.length === 0 ? (
@@ -141,6 +192,11 @@ export function DocumentManager() {
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
+              {doc.needs_reembed ? (
+                <Badge variant="outline" className="text-[10px]">
+                  Needs re-embed
+                </Badge>
+              ) : null}
               <Badge variant={STATUS_BADGE[doc.status].variant}>{STATUS_BADGE[doc.status].label}</Badge>
               <Button
                 variant="ghost"

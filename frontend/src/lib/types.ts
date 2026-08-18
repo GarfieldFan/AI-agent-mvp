@@ -54,5 +54,9 @@ export type ChatMessage = {
   /** RAG citations, when the reply was grounded in uploaded documents —
    * omitted (not just empty) for plain conversational replies. */
   sources?: RagSource[];
+  /** Set on a user message that carried a POST /api/chat/upload
+   * attachment (see lib/chat.ts's uploadChatAttachment) — local-only
+   * rendering, never sent back by the backend on the assistant's reply. */
+  attachmentUrl?: string;
   createdAt: string;
 };

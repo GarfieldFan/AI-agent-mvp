@@ -50,15 +50,27 @@ def default_chat_model(name: str | None = None) -> str:
     return get_chat_provider(name).model  # type: ignore[attr-defined]
 
 
-def get_embedding_provider(name: str | None = None) -> EmbeddingProvider:
+def get_embedding_provider(name: str | None = None, model: str | None = None) -> EmbeddingProvider:
     key = name or DEFAULT_EMBEDDING_PROVIDER
     try:
-        return _EMBEDDING_PROVIDERS[key]()
+        cls = _EMBEDDING_PROVIDERS[key]
     except KeyError:
         raise ValueError(
             f"Unknown or unsupported embedding provider {key!r}. "
             f"Valid: {sorted(_EMBEDDING_PROVIDERS)} (anthropic has no embeddings API)."
         )
+    return cls(model=model) if model else cls()
 
 
-__all__ = ["get_chat_provider", "get_embedding_provider", "ProviderNotConfigured"]
+def default_embedding_model(name: str | None = None) -> str:
+    """Same idea as default_chat_model, for the embedding side."""
+    return get_embedding_provider(name).model  # type: ignore[attr-defined]
+
+
+__all__ = [
+    "get_chat_provider",
+    "get_embedding_provider",
+    "default_chat_model",
+    "default_embedding_model",
+    "ProviderNotConfigured",
+]

@@ -71,9 +71,9 @@ export function ReportPanel() {
   const totalMessages = report?.points.reduce((sum, p) => sum + p.message_count, 0) ?? 0;
 
   return (
-    <div className="space-y-4 rounded-xl border p-4">
+    <div className="space-y-4 rounded-xl border bg-muted/40 p-4">
       <div className="space-y-1">
-        <h3 className="text-sm font-medium">Chat volume report</h3>
+        <h3 className="text-lg font-semibold">Chat volume report</h3>
         <p className="text-xs text-muted-foreground">
           New chat sessions and messages per day, from the same data the visitor-conversation log already captures.
         </p>

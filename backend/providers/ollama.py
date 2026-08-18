@@ -17,12 +17,22 @@ class OllamaChatProvider:
     def __init__(self, model: str | None = None):
         self.model = model or os.environ.get("OLLAMA_CHAT_MODEL", "gemma4:latest")
 
-    async def chat(self, messages: list[dict], *, system: str | None = None) -> str:
+    async def chat(
+        self, messages: list[dict], *, system: str | None = None, json_mode: bool = False
+    ) -> str:
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
-        async with httpx.AsyncClient(timeout=120) as client:
+        payload = {"model": self.model, "messages": full_messages, "stream": False}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        # 600s (was 120s) — vision-to-page-JSON generation (routed through
+        # this same method as of 2026-08-18) needs real headroom — see
+        # providers/custom.py's comment for the real timing data this
+        # bump is based on. A plain chat reply finishes long before this
+        # ceiling either way.
+        async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(
                 f"{OLLAMA_BASE_URL}/chat/completions",
-                json={"model": self.model, "messages": full_messages, "stream": False},
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()

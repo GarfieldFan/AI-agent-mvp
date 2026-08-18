@@ -2273,3 +2273,341 @@ kept separate, not unified" entries elsewhere in this file. This fix
 converts a guaranteed-total-failure case into a partial-recovery case
 when the *type* mislabeling is the only thing wrong; it doesn't and
 can't fix badly corrupted JSON syntax elsewhere in the same object.
+
+---
+
+### 2026-08-08 — chat-driven lead capture + optional caller identity: verified end-to-end, documented for the first time
+
+Picked up mid-session on "请接着之前完成用户auth" — the feature (a prior
+session's work: `apis/chat.py` resolving `get_current_user` to
+personalize replies and let a signed-in visitor's requests get logged
+under their account email without retyping it) had real, working code
+but **had never been verified live or written into `AGENTS.md`** — a
+documentation gap, not a code gap.
+
+Verified with real login + chat round-trips against the running stack
+(not just read the code): logged in as `user@example.com`, asked for a
+quote for a website redesign without ever typing an email in the
+message, and confirmed a `CrmEntry` was created using the account's
+email automatically (`_maybe_capture_lead`'s `known_email` fallback).
+Started a fresh session afterward and confirmed the assistant recognized
+the returning visitor and referenced the prior request — the
+`(Signed-in visitor: ...)` context block only appears once a visitor has
+at least one prior `CrmEntry`, so a first-time logged-in visitor is
+correctly treated the same as an anonymous one. Also confirmed
+`ChatSession.user_email` gets backfilled correctly via a direct DB query.
+
+Along the way, hit `qwen3.6:latest` as the configured chat model timing
+out (`providers/ollama.py`'s 120s `httpx` timeout, empty error message)
+during a routine test turn — unrelated to this feature, but the first
+concrete evidence in this project that qwen3.6 is unreliable as the
+*plain chat* model, not just slow. Temporarily switched the global model
+setting to `gemma4:latest` for testing, switched back after — this
+became a standing gotcha (see `AGENTS.md`'s "Known gotchas") once the
+attachment-analysis work below made multi-model-call turns routine.
+
+Test data (temp chat sessions, a test `CrmEntry`) cleaned up after
+verification; `AGENTS.md` gained its first real section for this feature
+("Chat lead capture & optional caller identity").
+
+---
+
+### 2026-08-08 — chat file attachment, first pass: public upload endpoint + storage
+
+New ask: let a visitor attach a photo/PDF in the public chat (for a
+claim/quote) without requiring login. Since `POST /api/chat` already has
+no RBAC gate at all, the new `POST /chat/upload` endpoint needed to be
+deliberately *more* paranoid than the admin-gated uploads it's modeled on
+(`apis/media.py`, `apis/documents.py`): a fixed extension allowlist
+(images + PDF, explicitly no `.svg`/`.html` — either can carry script if
+ever opened directly outside the app), an 8MB hard cap, and a random
+`uuid4` filename — never the client-supplied name, unlike
+`apis/documents.py`'s weaker `{uuid}_{original filename}` pattern (that
+one gets away with it only because it's admin-gated).
+
+Wired `ChatRequest.attachment_url` through `chat()`: appended a
+`[Attached file: <url>]` marker to both the persisted `ChatMessage` and
+the model-facing text, and taught `SYSTEM_PROMPT` what that marker means
+(acknowledge it, but be upfront that the model can't see its contents —
+this was still true at this point; vision analysis came in the next
+pass). Also widened `_maybe_capture_lead`'s gate so a present attachment
+alone counts as a lead signal, alongside an email-shaped message or a
+known account email.
+
+Verified end-to-end with a real upload → chat turn → `CrmEntry` with
+`attachment_url` set, plus explicit negative tests: a `.exe` upload
+rejected with a clear message, a 9MB upload rejected for size. Browser
+extension wasn't connected this session (a recurring gap — see the CTE
+entries above), so the new `chat-panel.tsx` composer UI (paperclip
+button, pending-attachment chip, image/file-chip rendering in
+`chat-message-bubble.tsx`) was verified via `tsc`/`eslint`
+plus confirming `/chat` compiles and renders 200 in the dev server logs,
+not a live click-through.
+
+---
+
+### 2026-08-08 — chat attachments, second pass: per-conversation storage + automatic vision/document analysis + owner deep-scan tool
+
+Follow-up ask, same day: organize uploads by conversation (not one flat
+directory), and have the AI actually *read* the attachment — extract
+name/phone/email/intent automatically so the chatbot stops asking for
+information already visible in an attached photo, while still letting
+the owner request a deeper, custom-instruction scan later (e.g. pulling
+a policy number off an insurance claim photo).
+
+Extracted the upload/analysis logic out of `apis/chat.py` into a new
+shared module, `backend/chat_attachments.py` — needed by both the
+automatic per-turn path (`apis/chat.py`) and the new owner-triggered
+scan endpoint (`apis/agent.py`), and better to have one place own the
+safe-path resolution than risk the two copies drifting. Storage layout
+changed from `CHAT_UPLOAD_DIR/<uuid4><ext>` to
+`CHAT_UPLOAD_DIR/<conversation_id>/<uuid4><ext>`, where
+`conversation_id` is the caller's account email if logged in, otherwise
+their client-generated `session_id` — verified both cases produce the
+expected folder structure via a direct upload + `ls` in the container.
+
+**Analysis**: reused `generate_landing_page`'s exact vision-call shape
+(OpenAI-compatible `/v1/chat/completions` against Ollama, an image
+content part) for photos; PDFs go through `ingest.parse_document` (the
+same parser RAG ingestion uses) into the plain chat provider instead,
+since no vision model here can read a PDF directly. Two callers, two
+failure postures by design: `extract_lead_info` (automatic, runs on
+every attached turn) swallows every failure — a visitor's reply must
+never be blocked by a flaky vision call — while `scan_with_instructions`
+(owner-triggered, an explicit ask) raises, since silently doing nothing
+would just look broken to an admin who asked for it.
+
+Verified with a real vision call end-to-end: uploaded a contentless
+1×1 test image (deliberately no readable info, to test graceful
+degradation) and confirmed the pipeline ran without error and the
+assistant correctly said it couldn't see the file's contents (no
+analysis facts were extracted, so `SYSTEM_PROMPT`'s "nothing extracted"
+branch fired). Then sent a claim message *with* an email but nothing
+else, confirmed the `CrmEntry` captured correctly with `category:
+"claim"`. Hit `qwen3.6` as the plain chat model timing out again on a
+3-model-call turn (vision + reply + lead-extraction all in one request)
+— confirmed this isn't a one-off from the earlier entry above, it's a
+real, repeatable ceiling; temporarily ran with `gemma4` for chat/
+lead-extraction and `qwen3.6` for vision only, which completed in ~70s
+instead of timing out at 120s.
+
+**Owner deep scan**: `POST /agent/crm/entries/{id}/scan` (admin/owner)
+lets the owner ask a freeform question about an already-captured entry's
+attachment, appending the answer to a new `CrmEntry.analysis_notes`
+column (timestamped, accumulating). Surfaced as owner-agent's first tool
+needing a path parameter (`scan_crm_attachment`, `{crm_id}` in its
+`ToolSpec.path`) — `owner-agent/tools.py`'s `execute_tool` gained a small
+generic `{param}`-substitution step rather than a one-off special case.
+Verified through the *real* agent loop, not just curled directly: typed
+"scan the attachment on CRM entry 10 and tell me what color it is,"
+watched the model pick the right tool, call it with `{"crm_id": 10,
+"instructions": "..."}`, and correctly report back the (correct, given
+the test image) "no primary colors, image is black" answer.
+
+**Security check, done deliberately, not an afterthought**: since
+`resolve_local_path` is the one place a client-supplied string
+(`ChatRequest.attachment_url`, never re-verified against what upload
+actually returned) turns into a real filesystem read, tried an explicit
+path-traversal payload (`.../uploads/../../../../etc/passwd`) against
+both the scan endpoint and a manually-crafted `CrmEntry.attachment_url`
+— rejected cleanly as "file not found," confirming the prefix-match +
+two-segment + `resolve()`-containment check actually holds under a real
+attempt, not just in theory.
+
+New `CrmEntry` columns (`contact_name`, `contact_phone`,
+`analysis_notes`) via two Alembic migrations, both applied and verified
+against the running DB. `CrmPanel` grew a name/phone display and a
+collapsed "Deep-scan notes" block. All test data (temp uploads, temp
+CRM entries) cleaned up after each verification pass.
+
+---
+
+### 2026-08-08 — CRM entry deletion, orphaned-upload cleanup, and public-endpoint rate limiting
+
+Follow-up to a self-review: asked "what's missing" after the attachment-
+analysis work above, flagged (among other things) that captured leads
+had no delete path short of a direct DB query, uploaded files that never
+became a lead just accumulated forever, and the public `/api/chat`/
+`/api/chat/upload`/`/api/auth/login` routes had zero abuse protection.
+The user picked these two to fix.
+
+**Deletion + cleanup**: `DELETE /agent/crm/entries/{id}` removes an
+entry and (best-effort) its attached file together — deleting the DB row
+while leaving the file to rot would just be a slower version of the
+orphan problem cleanup exists to solve. `chat_attachments.
+cleanup_orphaned_uploads` scans the whole upload tree; a file counts as
+"referenced" (and is left alone) if either a `CrmEntry.attachment_url`
+or a persisted `ChatMessage.content`'s `[Attached file: ...]` marker
+points at it — two DB queries total, not one per file — and only
+removes what's unreferenced *and* older than `older_than_hours` (default
+24h), so a slow typer's in-flight upload is never deleted mid-
+conversation. Verified three ways in one pass: an orphaned file survived
+a `dry_run` and got removed (including its now-empty conversation
+folder) on a real run; a file a real `CrmEntry` pointed at was correctly
+left alone by the same scan; deleting that `CrmEntry` afterward then did
+remove its file. Both capabilities also reachable as new owner-agent
+tools (`crm_delete_entry`, `cleanup_chat_uploads`) — the former needed
+`ToolSpec.method`'s `Literal` widened to include `DELETE` and
+`execute_tool` taught to treat a `204 No Content` response as
+`{"ok": true}` instead of failing to parse an empty body as JSON.
+Verified through the real agent loop: "delete CRM entry 12, it's spam"
+correctly resolved to `crm_delete_entry` and reported back.
+
+**Rate limiting**: new `backend/rate_limit.py`, deliberately in-memory/
+single-process rather than reaching for slowapi+Redis — this app runs as
+one uvicorn worker in one container, so there's no multi-process state
+to share, and standing up Redis for just this would be new infra this
+project otherwise avoids adding speculatively. Scoped narrowly to the
+three genuinely public, no-auth routes (`/api/chat`, `/api/chat/upload`,
+`/api/auth/login`) rather than the whole API, since every other route
+already sits behind `require_role`.
+
+**Real bug caught before it shipped**: initially wired
+`app.add_middleware(RateLimitMiddleware)` *after* the existing
+`CORSMiddleware` call in `main.py`. Traced Starlette's actual middleware-
+stack construction (`Router.build_middleware_stack` — `user_middleware`
+is built via `insert(0, ...)`, then wrapped in *reversed* order) rather
+than guessing, and confirmed that ordering makes the *most recently
+added* middleware the *outermost* layer. That meant `RateLimitMiddleware`
+would've ended up outside `CORSMiddleware`, so a 429 short-circuited by
+the rate limiter would skip CORS entirely and the browser would report
+an opaque CORS failure instead of a readable 429. Fixed by adding
+`RateLimitMiddleware` *before* `CORSMiddleware` in `main.py` instead.
+Verified live: tripped the login limiter with 11 rapid requests (10/15min
+limit), confirmed the 11th came back 429 with `Retry-After` *and*
+`access-control-allow-origin` present — the fix actually holds, not just
+reasoned through.
+
+Testing the login limiter live meant the author was locked out of their
+own test account for the remainder of the 15-minute window — recovered
+by restarting the `backend` container (in-memory state, so a restart is
+a legitimate, harmless reset, not a workaround).
+
+---
+
+### 2026-08-08 — security audit: JWT_SECRET running on its public default, Postgres exposed to `0.0.0.0`
+
+User asked "现在docker和backend安全吗" (is docker/backend secure now) —
+answered with an actual audit against the running config, not a generic
+answer: read `docker-compose.yml`, `backend/auth.py`,
+`backend/apis/auth.py`, all three Dockerfiles, and `requirements.txt`
+directly rather than reasoning from memory.
+
+Found the backend was **actually running** with `JWT_SECRET`'s insecure
+literal default (`dev-only-insecure-secret-change-me`) — confirmed via
+`docker compose exec backend printenv JWT_SECRET`, not assumed from the
+`.env.example` comment. Since that exact string is committed to this
+repo's own source, anyone who's read the code can forge a valid
+`role: owner` JWT and get full admin access with zero credentials —
+the single most severe, concrete (not hypothetical) finding. Separately,
+`docker-compose.yml` bound Postgres's `5432` to `0.0.0.0`, with
+hardcoded `my_user`/`my_password` credentials — a mapping the app itself
+never uses (backend/owner-agent reach Postgres over Docker's internal
+network), existing only to let a local DB client connect, and one that
+would let anyone on the same network connect directly and bypass every
+RBAC/JWT check in the app entirely.
+
+Also verified: no raw SQL string interpolation anywhere in `backend/`
+(SQLAlchemy ORM throughout, so SQL injection isn't a live concern); login
+returns a generic "Invalid email or password" regardless of whether the
+account exists (no enumeration via message content, though a timing
+side-channel exists — `verify_password`'s bcrypt call is skipped
+entirely when the user doesn't exist, so a nonexistent-email attempt
+returns measurably faster; noted as low-severity, not fixed); all three
+Dockerfiles run as root (no `USER` directive); `requirements.txt` pins
+no upper bounds.
+
+**Fixed, with the user's go-ahead**: generated a real random
+`JWT_SECRET` (`secrets.token_hex(32)`) into the local (gitignored) `.env`
+— `.env.example` deliberately keeps the insecure literal visible as a
+placeholder/warning, not something to actually run with. Rebound
+Postgres's port mapping to `127.0.0.1:5432:5432` in `docker-compose.yml`.
+Applied both via `docker compose up -d` (recreates `postgres-db`,
+`backend`, `owner-agent` — data untouched, same named `pgdata` volume);
+verified the new secret was actually live (`printenv` again) and that
+existing data survived (`SELECT count(*)` on `users`/`crm_entries`
+matched pre-recreate counts). Root-in-container and the unpinned
+dependencies were flagged but left unfixed — lower urgency, and the
+Dockerfile change needs more care (file-permission implications of
+adding a non-root `USER`).
+
+### 2026-08-09 — dashboard's agent console showed a raw 403 for a stale (JWT_SECRET-rotated) session instead of detecting and explaining it
+
+User reported (screenshot) `/dashboard` showing "Owner" in the header
+while every agent-console panel rendered a red `ErrorMessage` card
+verbatim from the backend: `Something went wrong / Requires one of
+roles: ['admin', 'owner']`. Root cause traced directly to the prior
+session's `JWT_SECRET` rotation (immediately above): the browser's
+`localStorage` still held a token signed with the *old* secret.
+`frontend/src/lib/auth.ts`'s `isTokenExpired()` only decodes the token's
+own `exp` claim client-side — it never verifies the signature — so the
+stale token still looked "not expired" and the header kept showing
+`owner@example.com` / Owner. `backend/apis/deps.py:44-52`, however, does
+verify the signature; a bad one makes `decode_access_token` return
+`None`, which `get_current_user` silently treats as the anonymous `user`
+role (by design, so the public chatbot still works logged-out) — so
+every `require_role(admin, owner)` route 403'd with that raw detail
+string, which every panel's `catch` block (`err instanceof ApiError ?
+err.message : ...`) piped straight into `ErrorMessage`'s `description`
+unchanged.
+
+User's ask was two-fold: (1) the frontend should detect this on its own
+on every page load, not just fail loudly when a panel happens to call
+the backend; (2) whatever the UI shows on a real permission problem
+should be plain language, never a raw backend exception string.
+
+**Fix** (`frontend/src/components/modules/agent-console-section.tsx`):
+added a verification effect that fires once per mount whenever the
+*cached* role claims `admin`/`owner` — it calls the already-existing but
+previously-unused-by-the-frontend `GET /api/auth/me`
+(`backend/apis/auth.py`, returns 200 + the real role for a token that
+verifies, 401 "Not authenticated" otherwise) before ever rendering a
+gated panel. A `verifying` boolean (seeded `true` at mount whenever the
+cached role isn't plain `user`, via `useState(() => role !== "user")`)
+gates rendering behind a `LoadingSpinner` ("Checking your session…")
+until that check resolves — so no panel ever fires its own
+privileged request against a token that's already known to be dead. On
+a confirmed-401 response specifically (not on a network/backend-down
+error — that's left alone, since a transient failure shouldn't log a
+real session out), it calls `clearAuth()` (already existed,
+`lib/auth.ts`) and flips a `sessionExpired` flag that swaps the existing
+locked `EmptyState`'s copy from "Admin/owner access required" (never
+logged in / genuinely wrong role) to "Your session has expired — log in
+again" (was logged in, token no longer verifies) — both plain-language,
+neither is backend-exception text. This only touches the one section
+that was actually reported broken; the same raw-`err.message`-into-
+`ErrorMessage` pattern still exists in every other panel's own
+load/mutate error paths (`DocumentManager`, `CrmPanel`, etc.) for
+non-RBAC failures (upload failed, delete failed, ...) — left as-is,
+those weren't the reported problem and a stale/invalid *own* login
+session was the only scenario a 403 with that literal detail string
+could actually happen from, everywhere else genuinely needs the backend
+detail on-screen (e.g. "Invalid email or password" is already plain
+language on its own).
+
+Hit one lint failure applying this: `react-hooks/set-state-in-effect`
+rejected an unconditional `setVerifying(true)` at the top of the effect
+body before the async call — the existing codebase idiom (confirmed by
+re-reading `DocumentManager`'s own fetch-on-mount effect) is to only
+call `setState` from inside a `.then`/`.catch`/`.finally` callback, never
+synchronously in the effect body itself, and to seed the "loading"-shaped
+initial value via `useState`'s lazy initializer instead. Rewrote to
+match; `npx eslint`/`npx tsc --noEmit` both clean afterward.
+
+**Verification gap**: same as every CTE-era finding in this file — the
+Chrome browser extension was not connected this session either
+(`tabs_context_mcp` returned "Browser extension is not connected"), so
+this was not clicked through live. Verified instead via direct backend
+calls: logged in for a real token (`POST /api/auth/login`,
+`owner@example.com`), confirmed `GET /api/auth/me` returns `200
+{"email":"owner@example.com","role":"owner"}` for it and a clean `401
+{"detail":"Not authenticated"}` for the same token with a character
+appended (simulates a bad signature, the same failure shape a rotated
+`JWT_SECRET` produces) — i.e. confirmed the exact signal the new
+frontend check depends on actually behaves as assumed. `tsc --noEmit`
+and `eslint` both ran clean against the running `frontend` container; the
+dev server's own hot-reload log showed no compile errors after the edit.
+Treat as needing a real click-through (open `/dashboard` with a
+deliberately stale token in `localStorage`, confirm the spinner then the
+friendly locked-state copy appear, never the raw 403 text) before
+considering this fully settled.

@@ -11,6 +11,11 @@ type ChatApiResponse = {
   sources: RagSource[];
 };
 
+type ChatUploadResponse = {
+  filename: string;
+  url: string;
+};
+
 const SESSION_STORAGE_KEY = "chat_session_id";
 
 /** Client-generated id (localStorage-persisted, survives page reloads)
@@ -42,10 +47,26 @@ function getChatSessionId(): string {
 export async function sendChatMessage(
   message: string,
   history: ChatApiTurn[] = [],
+  attachmentUrl?: string,
 ): Promise<{ reply: string; sources: RagSource[] }> {
   const response = await apiFetch<ChatApiResponse>("/api/chat", {
     method: "POST",
-    body: { message, history, session_id: getChatSessionId() },
+    body: { message, history, session_id: getChatSessionId(), attachment_url: attachmentUrl ?? null },
   });
   return { reply: response.reply, sources: response.sources };
+}
+
+/** Uploads one photo/PDF ahead of a chat turn (`POST /api/chat/upload`,
+ * same public/no-auth tier as `sendChatMessage` — see
+ * backend/apis/chat.py's "Chat file attachment" docstring section for the
+ * validation this endpoint applies since it has no RBAC gate at all).
+ * Returns the stored URL to pass into `sendChatMessage`. Sends the same
+ * `session_id` `sendChatMessage` does — the backend stores this file
+ * under a folder keyed by that id (or the caller's account email if
+ * logged in), see backend/chat_attachments.py. */
+export async function uploadChatAttachment(filename: string, contentBase64: string): Promise<ChatUploadResponse> {
+  return apiFetch<ChatUploadResponse>("/api/chat/upload", {
+    method: "POST",
+    body: { filename, content_base64: contentBase64, session_id: getChatSessionId() },
+  });
 }

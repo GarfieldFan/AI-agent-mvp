@@ -94,7 +94,7 @@ export function GeoPagePanel() {
   return (
     <div className="space-y-4 rounded-xl border p-4">
       <div className="space-y-1">
-        <h3 className="text-sm font-medium">SEO / GEO page</h3>
+        <h3 className="text-lg font-semibold">SEO / GEO page</h3>
         <p className="text-xs text-muted-foreground">
           A single auto-generated company-profile page built from every ready
           document in the knowledge base above — meant for search engines and

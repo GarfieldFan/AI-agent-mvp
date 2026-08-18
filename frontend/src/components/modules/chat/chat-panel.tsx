@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Send } from "lucide-react";
+import { Loader2, Paperclip, Send, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,9 +10,15 @@ import { ChatMessageBubble } from "@/components/modules/chat/chat-message-bubble
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { ApiError } from "@/lib/api";
-import { sendChatMessage, type ChatApiTurn } from "@/lib/chat";
+import { sendChatMessage, uploadChatAttachment, type ChatApiTurn } from "@/lib/chat";
+import { fileToBase64 } from "@/lib/file";
 import type { ChatMessage, ChatOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+// Kept in sync with backend/apis/chat.py's CHAT_UPLOAD_EXTENSIONS — the
+// backend re-validates independently, this is purely so the native file
+// picker doesn't even offer an unsupported type.
+const ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/webp,image/gif,application/pdf";
 
 // The intent-triage steps (0-3) below are a scripted local flow, not an LLM
 // call — see the project plan's chatbot module for the
@@ -76,6 +82,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   const [error, setError] = React.useState<string | null>(null);
   const bottomRef = React.useRef<HTMLDivElement>(null);
 
+  // Uploaded ahead of send (POST /api/chat/upload) — see lib/chat.ts's
+  // uploadChatAttachment. `uploading`/`uploadError` track that pre-send
+  // step; `pendingAttachment` itself is only ever set once the upload
+  // succeeded, ready to ride along on the next sendChatMessage call.
+  const [pendingAttachment, setPendingAttachment] = React.useState<{ file: File; url: string } | null>(null);
+  const [uploading, setUploading] = React.useState(false);
+  const [uploadError, setUploadError] = React.useState<string | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+
   React.useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, pending, error]);
@@ -124,17 +139,36 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     }
   }
 
+  async function handleAttachmentSelect(file: File | null) {
+    if (!file) return;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const base64 = await fileToBase64(file);
+      const { url } = await uploadChatAttachment(file.name, base64);
+      setPendingAttachment({ file, url });
+    } catch (err) {
+      setUploadError(err instanceof ApiError ? err.message : "Upload failed — try a smaller image or PDF.");
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
   async function handleSend(event: React.FormEvent) {
     event.preventDefault();
     const text = draft.trim();
-    if (!text || pending) return;
+    if ((!text && !pendingAttachment) || pending || uploading) return;
 
     const history: ChatApiTurn[] = messages
       .filter((message) => message.content)
       .map((message) => ({ role: message.role, content: message.content }));
 
-    pushMessage({ role: "user", content: text });
+    const attachmentUrl = pendingAttachment?.url;
+    pushMessage({ role: "user", content: text, attachmentUrl });
     setDraft("");
+    setPendingAttachment(null);
+    setUploadError(null);
     setError(null);
 
     if (step === 3) {
@@ -149,7 +183,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
 
     setPending(true);
     try {
-      const { reply, sources } = await sendChatMessage(text, history);
+      const { reply, sources } = await sendChatMessage(text, history, attachmentUrl);
       pushMessage({ role: "assistant", content: reply, sources: sources.length ? sources : undefined });
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Could not reach the chat backend.";
@@ -178,18 +212,59 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
         </div>
       </ScrollArea>
 
-      <form onSubmit={handleSend} className="flex shrink-0 items-center gap-2 border-t p-3">
-        <Input
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          placeholder="Type a message…"
-          className="flex-1"
-          disabled={pending}
-        />
-        <Button type="submit" size="icon" aria-label="Send message" disabled={!draft.trim() || pending}>
-          <Send className="size-4" />
-        </Button>
-      </form>
+      <div className="shrink-0 border-t">
+        {pendingAttachment ? (
+          <div className="flex items-center gap-2 px-3 pt-2 text-xs text-muted-foreground">
+            <Paperclip className="size-3 shrink-0" />
+            <span className="truncate">{pendingAttachment.file.name}</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Remove attachment"
+              onClick={() => setPendingAttachment(null)}
+            >
+              <X className="size-3" />
+            </Button>
+          </div>
+        ) : null}
+        {uploadError ? <p className="px-3 pt-2 text-xs text-destructive">{uploadError}</p> : null}
+
+        <form onSubmit={handleSend} className="flex items-center gap-2 p-3">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={ATTACHMENT_ACCEPT}
+            className="sr-only"
+            onChange={(event) => handleAttachmentSelect(event.target.files?.[0] ?? null)}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            aria-label="Attach a photo or PDF"
+            disabled={pending || uploading}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            {uploading ? <Loader2 className="size-4 animate-spin" /> : <Paperclip className="size-4" />}
+          </Button>
+          <Input
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="Type a message…"
+            className="flex-1"
+            disabled={pending}
+          />
+          <Button
+            type="submit"
+            size="icon"
+            aria-label="Send message"
+            disabled={(!draft.trim() && !pendingAttachment) || pending || uploading}
+          >
+            <Send className="size-4" />
+          </Button>
+        </form>
+      </div>
     </div>
   );
 }
