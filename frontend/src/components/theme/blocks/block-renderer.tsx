@@ -10,6 +10,8 @@ import { InsertGap } from "@/components/theme/cte/insert-gap";
 import { ButtonBlock } from "@/components/theme/blocks/button-block";
 import { ContainerBlock } from "@/components/theme/blocks/container-block";
 import { ImageBlock } from "@/components/theme/blocks/image-block";
+import { ProductCardBlock } from "@/components/theme/blocks/product-card-block";
+import { ProductListBlock } from "@/components/theme/blocks/product-list-block";
 import { TextContentBlock } from "@/components/theme/blocks/text-content-block";
 import type { Block, BlockWidth } from "@/lib/theme";
 
@@ -53,6 +55,10 @@ function renderBlock(block: Block, path: string, hideContainerBadge: boolean) {
       // branch, which is already adding an equivalent edit button to the
       // ArrayItemToolbar wrapping this block — see that call site.
       return <ContainerBlock {...block} path={path} hideOwnBadge={hideContainerBadge} />;
+    case "product-list":
+      return <ProductListBlock {...block} path={path} />;
+    case "product-card":
+      return <ProductCardBlock {...block} path={path} />;
     default:
       return null;
   }

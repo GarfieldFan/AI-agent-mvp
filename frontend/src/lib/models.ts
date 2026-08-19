@@ -73,6 +73,12 @@ export type ModelSettings = {
   image_comfyui_workflow?: string | null;
   image_comfyui_prompt_node?: string | null;
   image_comfyui_prompt_field?: string | null;
+  // Local resource coordination between chat/vision and ComfyUI
+  // (2026-08-19, see backend/resource_broker.py) — only meaningful
+  // alongside image_provider "comfyui" and a custom llama.cpp-shaped
+  // chat/vision endpoint. Off by default.
+  resource_coordination_enabled: boolean;
+  resource_coordination_headroom_mb: number;
 };
 
 export type CustomProviderTestResult = {

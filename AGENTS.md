@@ -67,7 +67,8 @@ ai-employee/
 │   ├── retrieval.py              RAG retrieval: embed -> pgvector search -> scored chunks (no router — called from apis/chat.py)
 │   ├── llm_json.py                lenient JSON extraction from raw LLM output, shared by agent.py/chat.py/chat_attachments.py
 │   ├── chat_attachments.py        public-chat file upload storage + vision/document analysis — see "Chat lead capture" below
-│   ├── rate_limit.py               per-IP rate limiting for the 3 fully public routes — see "Rate limiting" below
+│   ├── cart.py                     shared Product search/Order mutation logic (apis/chat.py + apis/products.py both use it) — see "Product catalog + ordering" below
+│   ├── rate_limit.py               per-IP rate limiting for the fully public routes — see "Rate limiting" below
 │   ├── providers/                AI provider abstraction (Ollama/OpenAI/Anthropic/Gemini) — see "AI provider is swappable" below
 │   ├── alembic/                 migrations — env.py wired to DATABASE_URL + models' metadata
 │   └── apis/
@@ -407,6 +408,67 @@ Every route here is admin/owner-gated. All of the following are **real**
   original env-var constants, so the existing routes (`/generate-image`,
   `/wait/{id}`, the manual test form) are unchanged when called without
   one.
+  - **Real bug fixed 2026-08-20**: `_wait_via_websocket` always connected
+    with a fresh, unrelated `client_id` instead of the one the job was
+    actually submitted with — ComfyUI only routes `executing`/`progress`
+    completion events to the websocket connection whose `clientId`
+    matches the *submission's* `client_id`, so this socket could never
+    receive a single event for the job it was waiting on. Every
+    generation was silently degrading to the 30s per-`recv` timeout
+    before falling back to the 5s polling loop below it, regardless of
+    how fast ComfyUI actually finished (found from a real report: an
+    image done in ~6s not showing up in the app for ~30s). Fixed by
+    threading the real submission `client_id` through
+    `_wait_for_completion_impl` down to `_wait_via_websocket`
+    (`providers/comfyui.py`'s `_generate` now passes `payload
+    ["client_id"]`) — the websocket fast path actually fires now.
+  - **Local resource coordination between chat/vision and ComfyUI**
+    (2026-08-19, `backend/resource_broker.py`) — opt-in
+    (`AppSettings.resource_coordination_enabled`, default off), built
+    after the user's own machine hit real memory pressure running both
+    at once (95% system RAM, and — confirmed via ComfyUI's own
+    `/system_stats` — ~84% VRAM used despite the GPU *compute* meter
+    reading only 5%, i.e. "GPU isn't busy" and "GPU has free memory" are
+    different things). Wires together primitives that already existed
+    but nothing was calling: llama-server's router mode exposes real
+    per-model load state (`GET /v1/models`, each entry's
+    `status.value`) and a working explicit-unload route confirmed this
+    session (`POST /models/unload {"model": "<name>"}`, NOT under
+    `/v1`) — `maybe_release_llm_memory` calls it right before a ComfyUI
+    generation, but *only* if ComfyUI's `/system_stats` reports free
+    RAM/VRAM below `AppSettings.resource_coordination_headroom_mb`
+    (default 4096) — unloading unconditionally would cost a real reload
+    delay on the next chat turn for no reason when memory wasn't
+    actually tight (measured up to 159s for a 27B model, see the
+    `providers/custom.py` timeout comment). `release_comfyui_memory`
+    always runs afterward (`ComfyUIImageProvider.generate()`'s
+    `finally`), calling ComfyUI's own `POST /free {"unload_models":
+    true, "free_memory": true}` — no threshold check needed there,
+    freeing ComfyUI's memory has no reload-latency downside. No
+    explicit "reload" call is needed on the give-back side either —
+    `--models-autoload` (llama-server's default) means the router
+    lazily reloads on the next request that needs it. Both functions
+    swallow every failure (wrong endpoint shape, unreachable, ...) —
+    this is an optimization, never allowed to break a real generation.
+    Deliberately scoped to just chat/vision-vs-ComfyUI for v1: the
+    standalone embedding `llama-server` (single-model, no router) has a
+    much smaller footprint and isn't touched. **A real visitor's
+    in-flight chat turn always wins** over an owner's poster generation
+    — `resource_broker.has_active_chat_requests()` (an in-process
+    counter held for the whole `/api/chat` handler, see `apis/chat.py`)
+    makes `maybe_release_llm_memory` refuse outright whenever a turn is
+    in flight, the owner's own explicit priority call once this first
+    shipped without it: protecting the customer-facing chatbot beats the
+    owner's own convenience. Verified live (a backgrounded `/api/chat`
+    call held the model loaded through a concurrent `generate_poster`
+    call even with the headroom forced impossibly high; the next
+    `generate_poster` after that turn finished correctly unloaded it).
+    Still not narrowed further: a visitor's *next* message arriving just
+    after an unload-and-reload cycle already started isn't protected —
+    closing that needs real request queueing, out of scope for now.
+    `ModelSettingsPanel`'s Image generation section (only when
+    `image_provider === "comfyui"`) has the on/off `Switch` + headroom
+    `Input`.
 - **`generate_geo_page`** — same schema-generation pipeline as
   `generate_landing_page`, but text input (concatenated RAG document
   content, not an image) via `resolve_chat_provider` — auto-saves to the
@@ -480,14 +542,156 @@ facts only.
 
 - **Lead capture**: this MVP has no separate contact form, so a visitor
   can book an appointment / request a quote / file a claim entirely
-  inside the chat. `_maybe_capture_lead` runs one fixed-shape
+  inside the chat. `_lead_extraction_call` runs one fixed-shape
   classification call (is this a real lead? which category? what email?
-  name? phone?) after the main reply is generated, gated so it only fires
-  on a turn that's email-shaped (`_LEAD_EMAIL_RE`), from a caller with a
-  known account email, or carrying an attachment (below) — not on every
-  ordinary turn. A positive result is a bounded `CrmEntry` insert. Every
+  name? phone?) — kicked off concurrently with order extraction
+  (2026-08-20, see "Product ordering" below), its result applied via
+  `_apply_lead_capture` after the main reply is generated — gated so it
+  only fires on a turn that's email-shaped (`_LEAD_EMAIL_RE`), from a
+  caller with a known account email, or carrying an attachment (below) —
+  not on every ordinary turn (unless intent schemas are configured, see
+  below). A positive result is a bounded `CrmEntry` insert. Every
   failure mode (provider unreachable, malformed JSON, bad email) is
-  swallowed — losing a lead is fine, breaking the chat reply isn't.
+  swallowed — losing
+  a lead is fine, breaking the chat reply isn't.
+- **Owner-configurable structured collection** (2026-08-19,
+  `IntentSchema`/`IntentField` in `models.py`, admin/owner CRUD at
+  `apis/intent_schemas.py`, UI at `IntentSchemaPanel`) — generalizes the
+  fixed `appointment`/`quote`/`claim`/`inquiry` category enum above into
+  something any vertical (insurance, real estate, a clinic, a restaurant,
+  a law firm, ...) defines for itself: an owner describes a "kind of
+  request" (a schema — key, label, description) and the structured fields
+  it needs collected (field key, label, type, required, a prompt hint),
+  and the public chatbot collects them conversationally across multiple
+  turns of the *same chat session* without re-asking for anything already
+  given. Built and verified end-to-end against one real vertical
+  (insurance: an `insurance_application` schema and an `insurance_claim`
+  schema) per an explicit user scoping decision — the mechanism itself is
+  not insurance-specific; adding another vertical is filling in the same
+  form again, not new code.
+  - `CrmEntry` gained three nullable columns: `intent_schema_id` (which
+    schema this entry is an instance of — null for entries captured the
+    old fixed-category way), `collected_fields` (JSONB, `{field_key:
+    value}`), `chat_session_id` (FK to `ChatSession.id` — the join key
+    that makes same-session lookup possible; `ChatSession` already
+    existed and is already resolved per turn, so this links two
+    already-existing things rather than inventing a new identity
+    concept).
+  - `_lead_extraction_system_prompt` builds its classification options
+    *from the owner's configured schemas* (each schema's key/label/
+    description becomes a category, each field becomes something the
+    model is told it can extract a value for) when any exist, falling
+    back to the original fixed four options byte-for-byte when the owner
+    hasn't configured any — confirmed via a real regression test this
+    session (a plain appointment-shaped message with zero schemas
+    configured produced the identical `category: "appointment"` capture
+    as before this feature existed).
+  - **Gate is deliberately loosened once any schema exists**: the narrow
+    `_LEAD_EMAIL_RE`-based gate above exists because most ordinary turns
+    aren't leads, but multi-turn structured collection (e.g. "what's your
+    policy number" with no email anywhere yet) needs to run on every turn
+    to work at all. Zero extra cost for an owner who hasn't touched this
+    feature; a real latency/cost tradeoff worth knowing for a
+    schema-heavy, chatty setup.
+  - **Same-session dedup, by record id, not cross-session by identity** —
+    an explicit user scoping decision. `_find_active_entry` looks up the
+    most recent `CrmEntry` matching `(chat_session_id, intent_schema_id)`;
+    if found, its `collected_fields` are folded into BOTH the extraction
+    prompt (`_lead_extraction_system_prompt`'s `progress_clause`, so the
+    model only returns newly-found field values instead of re-deriving
+    everything) and the main reply's own context
+    (`_in_progress_context_block`, mirroring `_build_visitor_context`'s
+    existing pattern — otherwise the classification call alone updating
+    `collected_fields` wouldn't stop the assistant's own reply text from
+    re-asking). A hit merges (`dict` update, never overwrites a known
+    value with a gap) into the SAME row; a miss inserts a new one. Verified
+    with a real 3-turn conversation (same `session_id` throughout): turn 1
+    gave only an email, turn 2 added a policy number, turn 3 added the
+    incident date/description — `GET /agent/crm/entries` showed exactly
+    **one** row throughout, its `collected_fields` accumulating each turn,
+    and the assistant's own replies never re-asked for something already
+    given, correctly recognizing completion on turn 3 instead of
+    continuing to ask questions.
+  - `CrmPanel` renders `collected_fields` as a small label→value list
+    per entry (labels resolved via a fetched schema list, not raw field
+    keys) when `intent_schema_id` is set; otherwise entries render exactly
+    as they did before this feature.
+  - Deliberately out of scope for this round (a real user scoping
+    decision, not an oversight): a **recommendation** feature ("suggest
+    the right policy/dish/product from embedded documents" — layers on
+    top of already-working RAG retrieval + chat, doesn't block proving
+    the collection mechanism); **URL-based auto-embed** (owner pastes a
+    law/regulation URL, gets fetched+chunked+embedded automatically — an
+    extension of `apis/documents.py`'s existing ingestion pipeline);
+    cross-session dedup by visitor identity; other verticals beyond the
+    insurance validation above. Schema *creation* stays dashboard-form-
+    only by the user's own explicit confirmation — see the next bullet
+    for what IS now owner-agent-driven (a deliberate split: defining
+    what to collect is a one-time setup task suited to a form; deciding
+    how to review/act on what's collected is exactly the kind of
+    judgment call suited to a conversational agent).
+- **Owner-agent-generated review queues** (2026-08-19, `IntentView` in
+  `models.py`, CRUD in `apis/intent_schemas.py`, UI at
+  `ReviewQueuePanel`) — the follow-on layer: rather than the owner
+  describing a review/approval workflow to a human (me) who'd hand-build
+  a rigid vertical-specific entity, the owner tells **owner-agent**
+  what to track in plain language ("I want to review insurance
+  applications people submit, approve or reject them") and it generates
+  the queue itself. New owner-agent tools `list_intent_schemas` (so the
+  model checks what actually exists before guessing a `schema_key`) and
+  `manage_review_queue` (`POST /agent/intent-views`, **upserts by
+  schema_key** — not a plain create — so a follow-up command adjusts
+  the same queue instead of creating a duplicate, since the model has no
+  reason to track a numeric view id across separate `/run` calls).
+  Confirmed directly with the user before building: owner-agent can't
+  pause mid-run for a real back-and-forth (one `/run` executes
+  autonomously to a turn limit and returns), so when the owner doesn't
+  specify what statuses to track, the tool's own description tells the
+  model to default to `["pending", "approved", "rejected"]` and state
+  the assumption plainly in its final answer — confirmed working exactly
+  as designed in a real run (see below). `CrmStatusUpdateRequest.status`
+  (`apis/agent.py`) widened from `Literal["new","contacted","closed"]`
+  to plain `str` — the DB column was already an unconstrained
+  `String(16)`, so this was purely an API-level constraint that would
+  have rejected a queue's own custom statuses. `ReviewQueuePanel` is a
+  **new top-level accordion group** ("Review queues"), deliberately
+  separate from "CRM & reporting" per the user's explicit ask — for each
+  `IntentView`, renders its schema's matching `CrmEntry` rows (client-
+  side filtered from the same `listCrmEntries()` `CrmPanel` already
+  uses, no new list-entries endpoint needed) with a `collected_fields`
+  breakdown, attachment link, and a status `Select` sourced from that
+  view's own `status_options` — wired to the now-loosened
+  `updateCrmEntryStatus`. Deliberately NOT a dashboard form for creating/
+  editing a queue's own definition (agent-driven only, per the confirmed
+  workflow) and NOT wired to any notification — email/SMS on status
+  change is explicitly deferred by the user ("模板晚点再做"), no
+  template system or sending infra built, no stub either.
+  - **A real regression was caught and fixed while verifying this**: the
+    non-root Dockerfile change from earlier today broke
+    `owner-agent/logging_.py`'s per-step JSONL write —
+    `logs/runs.jsonl` itself (not just the directory) was still
+    root-owned from before the switch to `appuser`, so appending to an
+    *existing* file 500'd with `PermissionError` even though a fresh
+    `touch` in the same directory had worked fine in the earlier
+    verification (creating a new file only needs the *directory* to be
+    writable; appending to an existing one needs write permission on
+    the *file itself* too — a real gap in that earlier check). Fixed
+    the same way as the `backend/storage/` case: `docker compose exec -u
+    root owner-agent chown -R appuser:appuser /app/logs`. Worth
+    remembering as a general rule, not just this one file: a bind-mounted
+    directory being writable by the new non-root user says nothing about
+    whether *pre-existing files already in it* are.
+  - Verified with a real owner-agent run, not a direct API call alone:
+    command "I want to review the insurance applications people submit
+    through the chatbot, and approve or reject them" → the model called
+    `list_intent_schemas` first (per its own tool description), correctly
+    picked `insurance_application` over `insurance_claim`, called
+    `manage_review_queue` with the default three statuses, and closed
+    with a final answer explicitly stating the default was used. Then a
+    real chat turn (name/DOB/desired policy type given all at once)
+    correctly populated `collected_fields` in one shot since nothing was
+    missing, and `PATCH .../status` with `"approved"` (would have 422'd
+    under the old `Literal`) succeeded.
 - **Optional caller identity**: `chat()` resolves `get_current_user`
   (`apis/deps.py`) — the same never-rejects dependency `require_role` is
   built on, used here purely for "who is this, if anyone." `frontend/
@@ -498,7 +702,7 @@ facts only.
   and, if any exist, prefixes the turn with a `(Signed-in visitor: ...)`
   block so the model recognizes a returning visitor instead of re-asking
   who they are — a first-time logged-in visitor (no prior rows) gets no
-  context block. `known_email` also backstops `_maybe_capture_lead`'s
+  context block. `known_email` also backstops `_apply_lead_capture`'s
   `contact_email` when the message itself never spells it out.
   `ChatSession.user_email` (nullable) is backfilled the same way, never
   cleared back to anonymous once known.
@@ -526,7 +730,7 @@ facts only.
   fresh attachment; swallows every failure. Folds into the main reply's
   context (`SYSTEM_PROMPT` treats an `(Automatic analysis of the attached
   file found: ...)` block as already-known fact) and into
-  `_maybe_capture_lead`'s `contact_name`/`contact_phone` fields,
+  `_apply_lead_capture`'s `contact_name`/`contact_phone` fields,
   backstopping the extraction model's own guess the same way
   `known_email` backstops `contact_email`.
 - **Owner-triggered deep scan**: `POST /agent/crm/entries/{id}/scan`
@@ -560,6 +764,335 @@ facts only.
   /agent/storage/cleanup-uploads` (`dry_run: true` previews without
   touching disk), the owner-agent's `cleanup_chat_uploads` tool, or
   `CrmPanel`'s "Clean up unused uploads" button.
+
+## Product catalog + ordering (`backend/apis/products.py`, `backend/cart.py`)
+
+Added 2026-08-19, extended into a full storefront layer the same day —
+a third, fully independent pipeline alongside RAG and lead capture, for
+a generic **product catalog** modeled on WooCommerce's product concept
+rather than anything restaurant- or retail-specific: a coffee-shop menu
+item, a physical good, a virtual/digital good, a bookable service,
+whatever the owner sells. Deliberately NOT built on top of
+`IntentSchema` — a product's line items (repeated item+quantity, price
+looked up from a real catalog) don't fit `IntentField`'s flat key-value
+shape, so `Product`/`Order`/`OrderItem` (`models.py`) are their own
+parallel tables, same "we build the framework, the owner fills in the
+vertical" posture applied to a genuinely different data shape. **No
+real payment/checkout exists anywhere in this app** — "paid"/"refunded"
+are internal status labels an owner tracks manually, never a real
+transaction; this system is CRM-adjacent order/bookkeeping tracking,
+not e-commerce checkout.
+
+- **`Product` is only ever written by the owner's own explicit action**
+  — either directly (`ProductPanel`'s dashboard form) or by Applying an
+  owner-agent-drafted proposal (`propose_products`) — never by
+  owner-agent directly. Same higher-stakes posture as `IntentSchema`
+  (see "Owner agent" below): a misread price directly affects what a
+  real customer is quoted. `price` uses a real `Numeric(10,2)` column
+  (this app's first money field), converted to a plain `float` at the
+  API boundary for simplicity. `image_url` is pure display data — never
+  read server-side (never fed to a vision model, unlike chat
+  attachments), expected to hold a URL the owner already got back from
+  the media library upload (`apis/media.py`) — this app never fetches
+  an owner-supplied external URL server-side (a real SSRF surface), a
+  deliberate call made with the user before building.
+- **`ProductFieldDefinition` + `Product.custom_fields`** (2026-08-19) —
+  mirrors `IntentSchema`/`IntentField` → `CrmEntry.collected_fields`
+  exactly: one flat, shared field-definition list (`text|number|date|
+  note|link`, no per-vertical grouping needed here, every product draws
+  from the same definitions) + a JSONB values dict per product. Exposed
+  both admin (`/agent/product-fields`) and **publicly**
+  (`/api/product-fields`, `apis/products.py`'s `public_router`) — a
+  field label like "Warranty" isn't sensitive, and `/products/[id]`
+  needs it to render `custom_fields` with real labels, the same
+  label→value pattern `ReviewQueuePanel` already uses for
+  `collected_fields`.
+- **`ProductRelation`** — one generic table for both "bundle" and
+  "upsell" (`relation_type`, free text, same posture as
+  `CrmEntry.category`) rather than two separate tables. A bundle prices
+  itself independently (its own `Product.price`) — this table only
+  records what's *inside* a bundle for display, never drives price
+  computation.
+- **`backend/cart.py`** — a new, deliberately plain top-level module
+  (not inside either router) holding `search_products`,
+  `find_active_order`, `apply_order_delta` — shared by `apis/chat.py`'s
+  LLM-driven order capture AND `apis/products.py`'s direct
+  `POST /cart/add` mutation. Necessary specifically to avoid a circular
+  import: `apis/chat.py` needs these functions, `apis/products.py`
+  needs these functions AND `apis/chat.py`'s `_get_or_create_session`
+  (to resolve a client `session_id` into a real `ChatSession` row) —
+  putting the shared logic inside either router file would make the two
+  import each other. Mirrors `chat_attachments.py`'s existing precedent
+  for cross-router shared logic living in a plain module.
+- **Deterministic product search (`cart.search_products`), not LLM
+  guessing — a real refactor of what shipped this same day.** The
+  original `_order_extraction_system_prompt` listed the WHOLE catalog
+  (id/name/price) in its prompt and asked the model to pick a
+  `product_id` itself — doesn't scale past a small menu, and a database
+  resolving a name is strictly more reliable than an LLM doing it. Now:
+  the extraction call only ever pulls out plain-language phrases
+  (`item_phrase`/`search_phrase`); every phrase is resolved against the
+  real catalog via `search_products` — `ILIKE`, **tokenized, not one
+  whole-phrase substring match**. Found and fixed from a real
+  extraction-call output during verification: the model extracted
+  "coffee drinks" for "what coffee drinks do you have," but no
+  product's text contains that exact phrase (only "coffee drink,"
+  singular) — a single `ILIKE '%coffee drinks%'` matched nothing at all
+  despite 6 real coffee products existing. Splitting the query into
+  words and matching if ANY word (2+ chars) appears is far more
+  forgiving of the LLM's exact phrasing not lining up with a product's
+  exact text.
+- **Result-count branching is pure code, never an LLM decision** — a
+  design principle the user stated directly and this implementation
+  holds to exactly: `apis/chat.py`'s `_resolve_order_turn` (fed
+  `_order_extraction_call`'s already-parsed result — split apart
+  2026-08-20, see below) resolves every phrase via `search_products` and
+  decides in Python: 1 match on an `item_phrase` → applies the delta;
+  0 matches → nothing (the reply's own prose handles telling the
+  visitor); **2+ matches → never guesses**, surfaced as candidates for
+  the visitor to pick from instead (verified: "I would like to order a
+  latte" against a catalog with both "Latte" and "Iced Latte" correctly
+  asked which one, created no order). A `search_phrase` (browsing
+  intent) resolves the same way: 1 → single card, 2–5 → a card list
+  (rendered as a Swiper on the frontend — `swiper` was already an
+  installed dependency, wired to the unused `CarouselSection`, this is
+  its first real use), `>5` → a `/search?q=...` link instead of inline
+  cards (verified with a real 6-match "coffee drinks" query).
+- **Runs BEFORE the main reply, not post-hoc like lead capture — a real,
+  necessary restructuring, not just a helper rewrite.** The original
+  design ran order capture strictly after the reply (best-effort, same
+  as lead capture) — fine for applying a DB write, but it meant a turn's
+  search/order results weren't known yet when the reply was written, so
+  the model was left to compute its own running total by adding numbers
+  from context (catalog price + prior total) — exactly the kind of LLM
+  arithmetic this app's own principles say never to trust, an
+  inconsistency that existed in the original ship and wasn't caught
+  until this refactor. Now `_resolve_order_turn` runs BEFORE the reply;
+  its output (`OrderTurnResult`) is folded into the reply's context via
+  `_order_turn_context_block` — including the REAL new total, computed
+  in Python — so the reply narrates exactly what the code already
+  decided, never invents a number. The actual DB write
+  (`apply_resolved_order_turn`) still happens after the reply and stays
+  best-effort/swallows failures, but no longer needs its own LLM call.
+  - **Order extraction and lead extraction now run concurrently, not
+    serially** (2026-08-20) — a real chat turn can trigger up to 3
+    sequential model calls (order extraction, the main reply, lead
+    extraction), and on a slow local model this measured ~50s for one
+    order-taking turn (see "Known gotchas" below). Split each of
+    `_resolve_order_turn`/`_maybe_capture_lead` into an LLM-call half
+    (`_order_extraction_call`/`_lead_extraction_call`, pure — no DB
+    writes) and a DB-apply half (`_resolve_order_turn` sync/
+    `_apply_lead_capture`), since order extraction's result is the only
+    one the main reply's context actually depends on — lead extraction
+    needs neither the order result nor the reply text. `chat()` now
+    kicks off both LLM calls via `asyncio.create_task` up front, awaits
+    only the order one before generating the reply (so the reply's
+    context still has the real order/total), and awaits the lead one
+    afterward (usually already finished by then — free). All DB writes
+    stay strictly sequential in the main coroutine (no concurrent
+    `Session` use, only the two network calls actually overlap). If the
+    main reply call fails, the already-in-flight lead-extraction task is
+    explicitly cancelled rather than left to finish unawaited. Verified
+    with two real chat turns (order + add-on) — identical behavior/DB
+    state to before, just faster (~34-42s warm vs. the prior ~50s+ for
+    the same 3-call turn).
+- **`ChatResponse` gained `products`/`search_link`** (2026-08-19) —
+  `_order_turn_response_fields` picks one, priority: an unresolved
+  ambiguity first (needs the visitor's input most), then a confirmed
+  order (so the visitor sees a card for what they just added — verified:
+  ordering a latte returns a `products` card for it, not just text),
+  then plain browse results, then the overflow link. `frontend/src/lib/
+  types.ts`'s `ChatMessage` gained matching `products`/`searchLink`
+  fields; `ChatMessageBubble` renders one card inline for 1 match, a
+  `Swiper` for 2–5, or a "See all results" button linking to `/search`.
+- **`OrderItem.unit_price_snapshot`/`item_name_snapshot` are captured
+  at add-time**, not read live off `Product` — a later menu price
+  change never retroactively alters an already-placed order, and the
+  line item stays human-readable even if the product is later
+  deleted/renamed (`product_id` is `ON DELETE SET NULL`, not a cascade,
+  same "keep the historical record readable" reasoning as
+  `CrmEntry.intent_schema_id`).
+- **`is_open` is a deliberate, separate boolean from `status`** — a real
+  design fork resolved with the user directly: `status` is free text
+  owner-agent can set to whatever labels the owner wants
+  (`set_order_status_options`, see "Owner agent" below), so the code
+  can't infer from it whether an order should still accept chat add-ons.
+  `cart.find_active_order` only ever looks up `is_open == True` rows to
+  append to; `OrderPanel`'s `Switch` is the one thing that actually
+  closes an order for further accumulation. Verified end-to-end: a
+  same-session order → closed via `PATCH /agent/orders/{id}` → a
+  follow-up "add one more" in that SAME chat session correctly created a
+  **new** `Order` instead of reopening the closed one.
+- **`POST /api/cart/add`** (`apis/products.py`'s `public_router`,
+  no auth, rate-limited like `/api/chat/upload`) — the deterministic,
+  non-LLM add-to-cart mutation shared by the `ProductList` Block, a
+  product's own detail page, and the chatbot's own product cards.
+  Resolves the caller's `session_id` via `apis/chat.py`'s
+  `_get_or_create_session` (same function `/api/chat` itself uses) then
+  calls `cart.find_active_order`/`cart.apply_order_delta` — **the exact
+  same functions the chat pipeline calls**, so there's one order-
+  mutation code path, not two that could drift apart. Verified
+  end-to-end: two `POST /cart/add` calls with the same `session_id`
+  correctly accumulated on the same `Order`; a `POST /cart/add` followed
+  by a chat turn in the SAME session correctly saw and added to that
+  same order (a visitor's cart never splits between "things clicked on
+  a page" and "things said in chat").
+- **Public storefront routes** (`apis/products.py`'s `public_router`,
+  mirrors `apis/pages.py`'s existing `admin_router`/`public_router`
+  split): `GET /api/products` (catalog, optional `?category=`),
+  `GET /api/products/{id}` (404 if missing/unavailable),
+  `GET /api/products/search?q=` (wraps `cart.search_products`),
+  `GET /api/product-fields`. **A real routing bug was caught and fixed
+  during verification**: `/products/search` was registered AFTER
+  `/products/{product_id}` — FastAPI matches routes in registration
+  order, so a request to `/products/search` was being swallowed by the
+  dynamic route as `product_id="search"` and 422ing ("search" isn't a
+  valid int). Fixed by moving the fixed literal path before the dynamic
+  one; a comment now flags this ordering requirement for any future
+  route added to this router.
+- **Frontend**: `ProductListBlock` is a new CTE-insertable Block type
+  (`backend/apis/agent.py`'s `Block` union, `frontend/src/lib/
+  block-registry.ts`) — deliberately excluded from `_VISION_SYSTEM_
+  PROMPT` (the vision model has no business inventing which products to
+  feature; owner-inserted only, matching `CarouselSection`'s existing
+  "built, not vision-generated" precedent). **A real Client/Server
+  Component boundary conflict was caught while building it**: the plan
+  called for an async Server Component fetching via `INTERNAL_API_URL`
+  (matching this project's own documented gotcha for Server Component
+  fetches) — but `BlockRenderer`, the recursive dispatcher that renders
+  every Block type including this one, is itself a Client Component
+  (needs the CTE editing interactivity), and a Client Component cannot
+  render an async Server Component as a child. Corrected to a Client
+  Component with `useEffect`-based fetching instead (`NEXT_PUBLIC_
+  API_URL`, resolved automatically by `apiFetch`) — a real design
+  correction made during implementation, not the original plan.
+  `/products/[id]` (a REAL Server Component page, no such conflict
+  since it's a top-level route, not a `BlockRenderer` child) and
+  `/search` are new, dedicated, stable, bookmarkable public routes —
+  deliberately NOT CTE blocks (people keep detail tabs open to compare
+  products, a real UX reason the user gave directly). A single shared
+  `ProductCard` component (image/name/price/Add to cart) is reused
+  across `ProductListBlock`, `/search` results, `/products/[id]`'s
+  bundle/upsell mini-cards, and the chatbot's own cards/swiper — one
+  place to get the shape right, not four.
+- **CTE product-promo blocks, `/cart`, `/checkout`** (2026-08-20) — three
+  owner requests off the back of real use: (1) a way to feature ONE
+  product outside a full `ProductListBlock` grid (a homepage strip, a
+  swiper slide), (2) `ProductListBlock` filtering to specific products,
+  not just a whole category, (3) an owner-composed block (arbitrary
+  Image/Text/Button children) that ends in a real add-to-cart action and
+  links through to a product page — plus the two system pages every
+  "Add to cart" control had quietly been building an `Order` for with
+  nowhere to actually review it.
+  - **`ProductCardBlock`** (`type: "product-card"`, `frontend/src/lib/
+    theme.ts`, mirrored in `backend/apis/agent.py`) — `ProductListBlock`'s
+    one-item counterpart: `product_id: number | null`, fetches and
+    renders via the same `ProductCard` component every other product
+    surface reuses. `null` (the freshly-inserted default) renders an
+    empty-state placeholder, never a broken fetch, until the owner picks
+    one in the CTE editor.
+  - **`ProductListBlock.product_ids`** — an explicit ordered allow-list
+    ("feature exactly these 3 products, in this order"), takes priority
+    over `category` when both are set (the two aren't meant to be
+    combined). `GET /api/products` gained a matching `ids` (comma-
+    separated) query param — reorders results to match the given id
+    order (SQL `IN` doesn't preserve it) and silently drops an id with no
+    matching *available* product. Also gave `ProductListBlock` a real
+    `Editable` wrapper for the first time — before this, an inserted
+    instance had no CTE UI to set its filter at all, only the unfiltered
+    `createDefault()`.
+  - **`ContainerBlock.link_product_id` + `ButtonBlock.action`/
+    `product_id`** — the "owner-composed product promo block" mechanism:
+    an owner freely arranges Image/Text/Button children inside a
+    Container (nothing new to learn — the same primitives every other
+    custom layout already uses), binds the whole container to one
+    product (`link_product_id`), and optionally gives one child button
+    `action: "add_to_cart"` instead of `action: "link"` (the original,
+    only behavior — unset renders exactly as before this field existed).
+    The container renders a **stretched-link overlay** (`Link
+    className="absolute inset-0 z-0"`, a positioned *sibling* of its
+    children, not a wrapper around them — the same well-established card
+    pattern Bootstrap calls `.stretched-link`) rather than literally
+    wrapping its content in an `<a>`, specifically so a nested
+    `action="add_to_cart"` `<button>` never ends up invalidly nested
+    inside an anchor. Per CSS paint order, that z-index:0 overlay paints
+    *above* ordinary static-positioned children (so clicking the image/
+    text correctly navigates to the product) but *below* anything with an
+    explicit higher z-index — every `ButtonBlock` instance (link or
+    add_to_cart) now renders `relative z-10` unconditionally so it always
+    stays clickable above any ancestor's product-link overlay, not just
+    when it happens to be the add-to-cart button.
+  - **`/cart` and `/checkout`** (`frontend/src/components/modules/
+    cart-page.tsx`/`checkout-page.tsx`, both Client Components — same
+    `getChatSessionId()`-reads-`localStorage` reasoning as
+    `ProductListBlock`) — real system pages, finally giving every
+    "Add to cart" control (`ProductCard`, `ProductDetail`, an owner's own
+    add-to-cart Block, the chatbot's own product cards) somewhere to
+    send a visitor. **No real payment anywhere in this app** (matches
+    this section's own "CRM-adjacent order tracking, not e-commerce
+    checkout" framing) — `/checkout`'s "Place order" records
+    contact_email/contact_name/pickup_time/note and flips `is_open` to
+    `False`, the exact same signal the owner's own `OrderPanel` toggle
+    already uses for "no more chat/cart add-ons," reused here for "the
+    visitor themselves is done adding to it." Three new public
+    `apis/products.py` routes power both pages, all reusing
+    `cart.find_active_order`/`apply_order_delta` (never a second,
+    divergent mutation path): `GET /cart` (session-scoped active order,
+    `null` — not a 404 — for an empty cart), `POST /cart/update`
+    (`quantity_delta`, can be negative — `/cart`'s +/- stepper and
+    Remove button both resolve to this one endpoint; decrementing/
+    removing stays allowed even if the product has since become
+    unavailable, only a positive delta is blocked for an unavailable/
+    missing product, mirroring `add_to_cart`'s own check), `POST
+    /cart/checkout` (400s on an empty/missing cart rather than creating
+    an empty `Order`). Verified end-to-end via direct API calls (empty
+    cart → add two products → decrement → remove → checkout → `GET
+    /cart` correctly returns `null` post-checkout since `is_open` is now
+    `False` → a second checkout attempt correctly 400s) and the new CTE
+    block shapes round-tripped through a real `POST .../pages/{slug}/
+    versions` save + public read (page content is stored as an
+    unvalidated `dict` — see `apis/pages.py`'s `SaveVersionRequest` — so
+    the backend Pydantic `Block` mirror only matters for
+    `generate_landing_page`'s own validation path, never for CTE-saved
+    content, but is kept in sync anyway per this file's own "keep both
+    in sync" rule). A small `ShoppingCart` icon link in `SiteHeader`
+    (no live item-count badge — that would cost a cart fetch on every
+    page load just for a header icon) is the one discoverability
+    addition; matches `/products/[id]`/`/search`'s own existing
+    precedent of staying out of `primaryNav`.
+- **v1 scope cuts, deliberate**: no product variant/attribute matrix
+  (WooCommerce's "variable product" — a "Latte Large" vs "Latte Small"
+  are two separate `Product` rows), no inventory/stock tracking, no
+  strict pickup-time parsing (`pickup_time` stays free text — "9am",
+  "in 5 minutes" — same posture as `IntentField`'s "date" type already
+  just storing whatever string the model extracted), no product `slug`
+  (`/products/[id]` stays numeric-id-based), no manual editor for
+  `order_status_options` (only `set_order_status_options` sets it, same
+  posture as `IntentView`'s `status_options`), `/search` re-runs its SQL
+  search live on every load rather than caching a result snapshot — a
+  deliberate call from the user: avoiding resource waste here means
+  never re-invoking an LLM on a page load, not persisting search
+  results, and a plain `ILIKE` search is cheap enough to just re-run.
+  **Known gap, not yet hit for real** (flagged 2026-08-20 while
+  discussing the storefront with the user): `/search` has no pagination
+  — `searchPublicProducts`'s default `limit=20` is a hard cap with no
+  "showing 20 of N" indicator or load-more affordance, so a query
+  matching more than 20 products silently drops everything past the
+  20th with no signal to the visitor that anything was cut off. Harmless
+  at this project's current catalog size (a handful of products); worth
+  a real "load more"/offset-based pagination pass, or at minimum a
+  "showing the first 20 — refine your search" message, once/if a real
+  catalog grows past that.
+- Verified end-to-end with real conversations across every branch: a
+  single order ("I'll come at 9am for a latte" → correct `Order` +
+  `OrderItem`, real price stated, a product card returned), a
+  same-session add-on ("add a croissant too" → same order, real
+  recomputed total $8.50 = $5.00 + $3.50, not LLM arithmetic), an
+  ambiguous order (2 matching products → disambiguation, no order
+  created), a 2-match browse ("anything with espresso?" → 2 cards), and
+  a 6-match browse ("what coffee drinks do you have?" → a `/search`
+  link, not inline cards) — plus the cart-add/chat cross-surface test
+  and the custom-fields/image/bundle round-trip described above.
 
 ## Rate limiting (`backend/rate_limit.py`)
 
@@ -650,7 +1183,15 @@ stacked/overlapping layout can't make one badge unreachable),
 `lib/cte.ts`'s path-based immutable updaters (`setByPath`/`appendByPath`/
 `insertByPath`/`removeByPath`/`moveByPath`, all dot-path addressed, e.g.
 `"1.items.2.image.url"`). `/editor` only edits *existing* saved content —
-generating new content is `PageGeneratorPanel`'s job.
+generating new content is `PageGeneratorPanel`'s job. For a page with no
+content at all yet, `PageManager`'s "New blank page" form (2026-08-19,
+`/dashboard`'s Saved pages list) saves an empty `sections: []` version
+to a new slug via the same `savePageVersion` `PageGeneratorPanel` already
+uses — the slug then shows up in `/editor`'s own datalist, ready to
+build up from nothing via its "+" insert gaps. Closes a real gap found
+by the user while testing: before this, there was no "start from
+scratch" path anywhere in the app at all — `/editor` only edits, and
+`PageGeneratorPanel` only generates from a design image/documents.
 
 **What it can do today** (built across many iterations — see `HISTORY.md`
 for the CTE parts 1-13 blow-by-blow if you need the "why" behind a
@@ -722,14 +1263,16 @@ before considering it fully settled.
 - **Phase 6 — Agent security layer**: **started, not complete**. The
   isolated worker now exists — `owner-agent/` (own container/port 8100,
   see "Architecture decisions" above and "Owner agent" below) — with a
-  real LLM tool-calling loop over a fixed 8-tool allowlist, its own
+  real LLM tool-calling loop over a fixed 11-tool allowlist, its own
   owner-only auth check, and action logging to stdout + a bind-mounted
-  `logs/runs.jsonl` (deliberately a durable file, not a queryable DB
-  table — a named MVP cut, not full Phase 6). The worker's "brain" model
+  `logs/runs.jsonl` (per-step, durable). The worker's "brain" model
   selection is now wired to the owner-facing model picker too
   (2026-08-18, see "Owner agent" below) — it was fixed via
-  `OWNER_AGENT_MODEL`/Ollama-only until then. **Still not done**: no
-  red-team pass, no queryable/DB-backed action-log history, no openclaw
+  `OWNER_AGENT_MODEL`/Ollama-only until then. **Now also has a queryable
+  DB-backed action-log** (2026-08-19, `backend/models.py`'s
+  `OwnerAgentRun`, alongside the JSONL file, not instead of it — see
+  "Owner agent" below) and `generate_landing_page` is now wired in as a
+  tool. **Still not done**: no red-team pass, no openclaw
   permission-boundary docs beyond the existing paragraph above.
 
 ### Owner agent (`owner-agent/`)
@@ -744,14 +1287,38 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 8 tools (`generate_poster`,
-  `crm_create_entry`, `crm_list_entries`, `crm_delete_entry`,
-  `generate_report`, `generate_geo_page`, `scan_crm_attachment`,
-  `cleanup_chat_uploads` — each a thin HTTP call onto an already-real
-  `backend/apis/agent.py` endpoint) or give a final answer. Up to 6 turns,
-  a 300s overall budget. The full step trace (tool, args, result,
-  ok/error) is returned to the frontend and rendered, not just the final
-  answer.
+  envelope: either call one of 16 tools (`generate_poster`,
+  `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
+  `crm_delete_entry`, `generate_report`, `generate_geo_page`,
+  `scan_crm_attachment`, `cleanup_chat_uploads`, `list_intent_schemas`,
+  `manage_review_queue`, `detect_business_type`, `propose_intent_schema`,
+  `list_products`, `propose_products`, `set_order_status_options` — each
+  a thin HTTP call onto an already-real `backend/apis/agent.py`/
+  `apis/intent_schemas.py`/`apis/products.py` endpoint) or give a final
+  answer. Up to 6 turns, a 300s overall budget. The full step trace
+  (tool, args, result, ok/error) is returned to the frontend and
+  rendered, not just the final answer.
+- **`generate_landing_page`** (2026-08-19) takes an already-uploaded
+  image's **URL**, not raw base64 — asking a text-generation model to
+  reproduce a whole image as base64 inside its own tool-call JSON is
+  neither reliable nor something it should be doing at all. The owner
+  uploads a design image via the dashboard's media library or CTE's
+  Upload tab first, gets a URL back, then tells owner-agent to use it.
+  New backend route `POST /agent/landing-page/generate-from-url`
+  (`apis/agent.py`) resolves that URL back to a local file via
+  `apis/media.py`'s `resolve_media_local_path` — same paranoid posture
+  as `chat_attachments.resolve_local_path` (exact prefix match, exactly
+  one path segment, a `resolve()`-based containment check before ever
+  touching disk) — then calls the same `_generate_landing_page_sections`
+  helper the original `generate_landing_page` route was refactored to
+  share, so both routes produce identical results. Deliberately doesn't
+  save/publish the result — the tool's own description tells the model
+  to have the owner review and save it themselves via the Page generator
+  panel. `ToolSpec` gained a per-tool `timeout` override (this tool sets
+  620s) since the shared `_TOOL_CALL_TIMEOUT` (200s, sized for poster
+  generation) would cut off a slow vision+JSON generation mid-call —
+  backend itself already budgets up to 600s for that single call (see
+  `providers/custom.py`'s timeout comment).
 - **Path-parameter tools**: `scan_crm_attachment` and `crm_delete_entry`
   are the first tools whose backend path has a placeholder
   (`{crm_id}`) — `owner-agent/tools.py`'s `execute_tool` substitutes
@@ -794,15 +1361,91 @@ this is the one place the model itself decides which action(s) to take.
 - **Isolation, concretely**: `owner-agent` has no DB connection, no
   filesystem access beyond its own code/logs, no shell, no
   arbitrary-URL-fetch tool — its only I/O is `backend`'s own REST surface
-  (both the 8 tools and, now, the brain call above), and it forwards the
-  caller's real bearer token on every one of those calls so `backend`'s
-  own `require_role` independently re-authorizes every action (defense in
-  depth: a compromised worker still can't do anything `backend` wouldn't
-  already allow that caller to do). Because no tool result ever contains
-  attacker-influenced *external* content re-entering the model's context
-  (every tool result is this app's own structured JSON), the classic
-  "fetched content reinterprets itself as an instruction" prompt-injection
-  vector doesn't apply to this design.
+  (the 9 tools, the brain call above, and now the action-log write
+  below), and it forwards the caller's real bearer token on every one of
+  those calls so `backend`'s own `require_role` independently
+  re-authorizes every action (defense in depth: a compromised worker
+  still can't do anything `backend` wouldn't already allow that caller to
+  do). Because no tool result ever contains attacker-influenced
+  *external* content re-entering the model's context (every tool result
+  is this app's own structured JSON), the classic "fetched content
+  reinterprets itself as an instruction" prompt-injection vector doesn't
+  apply to this design.
+- **Queryable action-log history** (2026-08-19) — `owner-agent/logging_.py`'s
+  per-step `logs/runs.jsonl` write stays exactly as it was (owner-agent
+  is still DB-less by design; that file is its only durable record if the
+  call below ever fails), but `main.py`'s `/run` handler now also calls
+  `POST /agent/chat-completion`'s sibling route, `POST
+  /agent/owner-agent/runs` (`apis/agent.py`), once per completed run —
+  persists `backend/models.py`'s new `OwnerAgentRun` row (command,
+  final_answer, stopped_reason, the full step trace as JSONB,
+  `owner_email` read off the same forwarded bearer token every tool call
+  already carries). Best-effort: a logging failure never fails the run
+  response the owner is actually waiting on. `GET
+  /agent/owner-agent/runs` (paginated via `limit`, most-recent-first) is
+  what makes this actually queryable — `OwnerAgentPanel` now renders a
+  collapsed "Recent runs" list underneath the live run UI
+  (`lib/owner-agent.ts`'s `listOwnerAgentRuns`), refreshed after every
+  new run completes.
+- **`detect_business_type`/`propose_intent_schema`** (2026-08-19) —
+  owner-agent can now draft a new/updated `IntentSchema`, but
+  deliberately can never write one itself, unlike `manage_review_queue`'s
+  apply-a-default-then-adjust pattern: a schema defines what data gets
+  collected from real future visitors, a real data-integrity concern a
+  review queue's `status_options` doesn't carry, per the owner's own
+  explicit framing when this was requested. `detect_business_type`
+  (`POST /agent/business-profile/detect`, `apis/intent_schemas.py`)
+  reuses `_gather_ready_document_text`/`resolve_chat_provider` (the
+  exact `generate_geo_page` pattern) to guess an industry label from
+  ingested documents, returning `detected_label: null` (not an error)
+  when there are none — but the *owner's own stated business always
+  wins*, a priority rule stated directly in the tool's own description
+  for the model to follow, not something enforced in code (same posture
+  as every other "the model decides, given the right inputs" design in
+  this app, e.g. `_lead_extraction_call`'s classification).
+  `propose_intent_schema` (`POST /agent/intent-schemas/propose`) runs
+  the exact same `_validate_fields` check `create`/`update_intent_schema`
+  already use, but never constructs or commits a row — it only echoes
+  back the validated draft plus `already_exists`/`existing_id` (looked
+  up the same way `create_intent_schema` already checks for a key
+  collision). `OwnerAgentPanel` (frontend) scans a completed run's steps
+  for a successful `propose_intent_schema` call and renders an editable
+  review card — `Select` for each field's type, `Switch` for `required`
+  (matching `IntentSchemaPanel`'s own choice of `Switch` over a separate
+  `Checkbox` primitive, intentionally) — with **Apply** (calls the
+  already-existing `createIntentSchema`/`updateIntentSchema`, sending
+  whatever the owner actually edited, not necessarily the raw proposal)
+  and **Discard** (clears it, no network call). Verified end-to-end with
+  a real command ("our uploaded docs are about real estate, but we're
+  actually a web design agency — propose a schema for project
+  inquiries...") — the model correctly deferred to the stated business
+  over the ingested real-estate documents, called `list_intent_schemas`
+  first, and its final answer stated a draft was ready to review rather
+  than claiming anything was created; `GET /agent/intent-schemas`
+  confirmed no row existed until a separate, explicit Apply-equivalent
+  call was made.
+- **`list_products`/`propose_products`/`set_order_status_options`**
+  (2026-08-19) — see "Product catalog + ordering" above for the full
+  design. `propose_products` follows the exact same propose-then-owner-
+  applies posture as `propose_intent_schema` (a batch of drafts, never
+  writes) — a misread price affects what a real customer is quoted, the
+  same class of mistake schemas already get this safety net for.
+  `set_order_status_options`, by contrast, applies directly like
+  `manage_review_queue` — a status-label list is cheap to adjust
+  afterward. **A real bug was caught and fixed verifying this**:
+  `owner-agent/tools.py`'s `execute_tool` only ever attached a JSON body
+  for `method == "POST"` — `set_order_status_options` uses `PUT` (and
+  `ToolSpec.method`'s `Literal` didn't even include `"PUT"` yet), so the
+  first real run sent an empty body and 422'd against the backend's own
+  required-field validation twice before the model correctly gave up and
+  reported the failure honestly instead of claiming success. Fixed by
+  widening the `Literal` to `PUT`/`PATCH` and attaching the JSON body for
+  all three write methods, verified with a second real run that
+  succeeded and persisted correctly (`GET /agent/order-status-options`
+  matched). Worth remembering: any *new* HTTP method introduced by a
+  future tool needs the same two-place check (`ToolSpec.method`'s
+  `Literal` AND `execute_tool`'s body-attachment condition), not just
+  one.
 - **Known gap surfaced building this**: `generate_report`'s date range has
   no server-side span cap (only `end_date >= start_date` is checked) — the
   frontend `ReportPanel`'s date-picker UX was an implicit, soft guardrail
@@ -839,6 +1482,50 @@ this is the one place the model itself decides which action(s) to take.
   shared bind-mounted `.next` directory; same fix applies. To verify a
   production build compiles without this risk: `docker compose run --rm
   frontend npm run build` in a one-off container.
+- **All three Dockerfiles run as a non-root user now (2026-08-19,
+  `appuser`/`node`, uid/gid 1000) — this broke on the first attempt in
+  two genuinely non-obvious ways, both real file-permission issues, not
+  hypothetical ones the original security-audit note was worried
+  about**:
+  1. `frontend`'s `.next` is `.dockerignore`'d (Next only ever creates it
+     at runtime) — `chown -R node:node /app` in the Dockerfile had
+     *nothing at that path to chown* at build time, so Docker seeded the
+     fresh anonymous volume for it as an empty, **root-owned** directory
+     regardless. Result: `next dev` crashed immediately with `EACCES:
+     permission denied, mkdir '/app/.next/dev'`. Fix: `mkdir -p
+     /app/.next` *before* the `chown` line, so there's actually
+     something there for both the chown and the volume-seed to act on.
+  2. `backend`'s `storage/documents`/`storage/media`/`storage/chat_uploads`
+     are bind-mounted from the host (`./backend:/app`) — the Dockerfile's
+     own build-time `chown` is entirely moot for anything under a bind
+     mount (the mount shadows the image's `/app` completely at container
+     start). These specific subdirectories already existed on disk,
+     created back when the container ran as root (mode `755`,
+     root-owned) — the new non-root `appuser` could read them but not
+     write, which `apis/documents.py`/`apis/media.py`/`chat_attachments.py`
+     need to do on every upload. This is a **one-time migration issue
+     for an existing checkout**, not an ongoing code problem (any
+     directory `appuser` creates itself from now on is naturally
+     appuser-owned) — fixed with a single `docker compose exec -u root
+     backend chown -R appuser:appuser /app/storage` after rebuilding.
+     `owner-agent`'s `logs/` dir didn't need this (already permissive
+     enough as-is) — don't assume every bind-mounted dir needs the same
+     treatment, check first (`ls -la`, or just try a real write and see).
+  Both verified with real writes, not just `whoami`/`id`: a real
+  `POST /agent/documents/ingest` (chunked, embedded, `status: "ready"`)
+  and a real `next dev` compile-and-serve of `/dashboard`/`/chat`
+  (`200`, not just process-alive) after the fixes, not before.
+- **`backend/alembic/versions/` is a fourth bind-mounted path that needed
+  the same one-time `chown` fix** (2026-08-19, found generating this
+  session's migration) — the directory itself was still root-owned from
+  before the non-root-user switch (unlike `storage/`'s issue, this was
+  the *directory's* own write bit, not pre-existing files in it), so
+  `alembic revision --autogenerate` failed with a `PermissionError`
+  trying to create the new migration file. Fixed the same way: `docker
+  compose exec -u root backend chown -R appuser:appuser
+  /app/alembic/versions`. Add this to the list of bind-mounted paths to
+  check first (alongside `storage/`) if a from-scratch checkout ever
+  hits a permission error running a fresh migration.
 - **Adding a new npm dependency needs `--build --renew-anon-volumes`
   together, not just one.** `node_modules` is an anonymous volume (so the
   container's Linux-native modules aren't shadowed by the host's
@@ -966,22 +1653,118 @@ package needed) grouped as AI & knowledge base / Content generation /
 CRM & reporting / Owner agent. Verified `generate_landing_page`
 end-to-end for the first time this session with a real (synthetic)
 mockup — see the qwen3.6-nesting bullet below for what this did and
-didn't confirm. Full narrative (the router-vs-dedicated-process
-embedding discovery, a PowerShell encoding crash in a launcher script,
-a `.next` dev-cache 404 hit mid-verification, the git commit) in
-`HISTORY.md`.
+didn't confirm. Later the same day: built owner-configurable structured
+collection (`IntentSchema`/`IntentField`, dashboard-form-only) and
+owner-agent-generated review queues (`IntentView`, `manage_review_queue`
+— apply-a-default-then-adjust-after, no owner confirmation needed since
+adjusting a queue's statuses is cheap). Then, closing the one piece
+those two arcs deliberately deferred: gave owner-agent
+`detect_business_type`/`propose_intent_schema` (see "Owner agent"
+below) so it can draft a *schema* change too, but — unlike review
+queues — never apply one itself; the owner reviews and explicitly
+Applies or Discards the draft in a new review card inside
+`OwnerAgentPanel` (real `Select`/`Switch` controls, not free text),
+built specifically because a schema controls what data gets collected
+from real future visitors, a higher-stakes, harder-to-reverse change
+than a queue's status list. Verified end-to-end with the user's own
+example scenario (documents about one business, owner stating a
+different one) — the model correctly deferred to the owner's stated
+business over the ingested documents' content. Then, extending further
+on the user's own request ("我们延伸看看"): a generic **product
+catalog + ordering** system (`Product`/`Order`/`OrderItem`, `apis/
+products.py`, see "Product catalog + ordering" above) — modeled on
+WooCommerce's product concept rather than restaurant-specific, after
+the user explicitly reframed an initial "can the chatbot take coffee
+orders" question into "we build the framework, owner-agent handles the
+vertical details." Two design forks the user resolved directly: order
+accumulation ("加单") gated by an explicit `is_open` toggle rather than
+inferring from owner-agent-generated status text, and product creation
+following the same propose-then-owner-applies flow just built for
+`IntentSchema` rather than `manage_review_queue`'s apply-directly
+pattern, since a misread price affects a real customer's quote. Verified
+end-to-end with a real multi-turn conversation ("I'll come at 9am for a
+latte" → correct order + real price; "add a croissant too" → same order,
+correct recomputed total $8.50) and the `is_open` gating edge case (a
+closed order correctly forces a new one on the next chat turn rather
+than reopening). Caught and fixed a real bug during verification:
+`owner-agent/tools.py`'s `execute_tool` never attached a JSON body for
+non-POST write methods, silently breaking the new `PUT`-based
+`set_order_status_options` tool — see "Owner agent" above. Then,
+extending further still on the user's own steer: a full **storefront
+layer** over that catalog — product images (reusing the media library,
+never fetching an owner-supplied URL server-side), owner-defined custom
+fields (`ProductFieldDefinition`, mirrors `IntentField` exactly),
+bundle/upsell relations (one generic `ProductRelation` table), a
+`ProductList` CTE block, dedicated `/products/[id]`/`/search` public
+pages, a deterministic non-LLM `POST /cart/add`, and product cards/
+Swiper in the chatbot itself — see "Product catalog + ordering" above
+for the full design, including a genuine mid-session refactor of the
+order-extraction pipeline (SQL search replacing "list the whole catalog
+and ask the LLM to pick an ID," result-count branching moved fully into
+code) and three real bugs caught and fixed during verification: a
+tokenized-vs-whole-phrase `ILIKE` search miss, a FastAPI route-ordering
+bug (`/products/search` swallowed by `/products/{id}`), and a Client/
+Server Component boundary conflict that forced `ProductListBlock` to
+fetch client-side instead of the originally planned server-side fetch.
+Verified end-to-end across every count-branch (0/1/2-5/>5 matches),
+the ambiguous-order-doesn't-guess case, and cart/chat cross-surface
+unification (adding via `POST /cart/add` then via a chat turn in the
+same session correctly landed on the same `Order`). Full narrative (the
+router-vs-dedicated-process embedding discovery, a PowerShell encoding
+crash in a launcher script, a `.next` dev-cache 404 hit mid-
+verification, the git commit) in `HISTORY.md`.
+
+**2026-08-20**: a debugging + latency session, then one more storefront
+extension pass. Fixed two real, previously-undetected bugs the user
+reported symptoms of directly: ComfyUI generations always taking ~30s
+to appear regardless of how fast the actual generation finished (the
+websocket wait listened with the wrong `client_id` — see "Agent console
+capabilities" above), and a single order-taking chat turn taking close
+to a minute on a slow local model (three sequential LLM calls where two
+were actually independent — order extraction and lead extraction now
+run concurrently, see "Product ordering" above). Also closed a real gap
+found while reviewing the dashboard: `ProductPanel`'s create/edit form
+had no way to set a product's `image_url` at all despite the field
+existing end-to-end everywhere else (type, backend, `ProductCard`,
+`ProductDetail`) — added a Photo field reusing the existing
+`ImageFieldEditor` (URL/upload/generate/library tabs). Then, off the
+user's own follow-up ("some products need to be featured/advertised
+separately, and I want the block system to support that"): a single
+`ProductCardBlock` (one featured product, ProductListBlock's one-item
+counterpart), `ProductListBlock.product_ids` (an explicit ordered
+allow-list filter, alongside the existing `category` filter which
+finally got real CTE editing UI — it existed on the schema before this
+but had no way to actually set it after inserting), and the
+"owner-composed product promo block" mechanism (`ContainerBlock.
+link_product_id` + `ButtonBlock.action`/`product_id` — see "Product
+catalog + ordering" above for the full stretched-link-overlay design).
+Finally, built the two missing system pages every "Add to cart" control
+had been quietly accumulating an `Order` for with nowhere to send a
+visitor: `/cart` (view/adjust/remove) and `/checkout` (contact details +
+"Place order," no real payment — just closes the order). Verified via
+`tsc`/`eslint`/a real production build (`next build`, catching any RSC
+boundary issues `tsc`/`eslint` wouldn't) and direct backend API calls
+end-to-end (build a cart, decrement, remove, checkout, confirm a
+second checkout attempt on the now-closed order correctly 400s) plus a
+real save/read round-trip of the new block shapes through
+`POST .../pages/{slug}/versions`. The Chrome extension still didn't
+connect this session either — every check above was `curl`/build-tool
+based, not a live click-through.
 - **A real in-browser click-through of everything in this project** —
   still the single biggest verification gap, unresolved across every
   session so far including this one (the Chrome extension never
   connected). Everything, CTE through today's dashboard/CRM/attachment
   UI, was verified via `tsc`/`eslint`/curl/backend checks and dev-server
   logs, never a live click-through by this session's own tools.
-- **Two real, unfixed findings from this session's security audit**: all
-  three Dockerfiles run as root (no `USER` directive — a real fix needs
-  care around file-permission implications, not just adding the line);
-  `requirements.txt` pins no upper bounds (not reproducible, could
-  silently pull a future breaking/vulnerable version). Lower urgency than
-  the two fixed items above, but real.
+- **Both real findings from an earlier session's security audit are now
+  fixed** (2026-08-19): all three Dockerfiles (`backend`, `frontend`,
+  `owner-agent`) run as a non-root user (`appuser`/the image's built-in
+  `node` user, uid/gid 1000) instead of root; `backend/requirements.txt`
+  and `owner-agent/requirements.txt` are pinned to exact versions
+  (`==`, captured via `pip freeze` from a working container) instead of
+  open-ended `>=`. See "Known gotchas" below for the real file-permission
+  issues this surfaced and how they were fixed — non-trivial, exactly the
+  care this was originally flagged as needing.
 - A `/dashboard` viewer for the chat sessions/messages already being
   persisted (session list + per-session transcript) — deliberately
   deferred out of the original persistence work to keep that change
@@ -995,11 +1778,34 @@ a `.next` dev-cache 404 hit mid-verification, the git commit) in
   everything CTE supports editing at the nested-container level was
   still hand-authored via curl, never generated by the model on its own.
 - Phase 6 (agent security layer) — `owner-agent/` now has a real
-  tool-calling loop over 8 tools; still open: a red-team pass, a
-  queryable/DB-backed action-log (currently a JSONL file), wiring
-  `generate_landing_page` in as a tool (excluded so far — needs an image
-  upload, doesn't fit a text-command tool as-is).
+  tool-calling loop over 16 tools, a queryable DB-backed action-log
+  (2026-08-19, alongside the JSONL file, see "Owner agent" above),
+  `generate_landing_page` is wired in as a tool, and both schema
+  changes and product-catalog changes now go through an explicit
+  propose-then-owner-applies flow rather than being written directly;
+  still open: a red-team pass, openclaw permission-boundary docs beyond
+  the existing paragraph.
 - Smaller unstarted items: chat streaming, real LLM-driven intent
   recognition, GSAP/ScrollTrigger, Swiper carousel content.
+- Local resource coordination (`resource_broker.py`, above) is
+  deliberately v1-scoped: the standalone embedding server isn't part of
+  it yet (fix would be a one-line `--sleep-idle-seconds` in
+  `llama-embed.ps1`, not broker logic), and there's no live memory-usage
+  dashboard. The concurrency gap flagged when this first landed — a
+  public chat visitor mid-turn at the exact moment an owner triggers a
+  poster generation — is now handled for the case that actually
+  mattered: `resource_broker.has_active_chat_requests()` (an in-process
+  counter, held for a whole `/api/chat` turn — see `apis/chat.py`)
+  makes `maybe_release_llm_memory` refuse outright while a real visitor
+  turn is in flight, on the owner's own explicit priority call (protect
+  the customer-facing chatbot over the owner's own poster-gen
+  convenience). Verified for real: a backgrounded `/api/chat` call kept
+  the model loaded through a concurrent `generate_poster` call even with
+  the headroom threshold forced impossibly high, then the very next
+  `generate_poster` (chat turn finished, counter back to 0) correctly
+  unloaded it. Still not narrowed further: a visitor's *next* message
+  arriving just after an unload-and-reload cycle already started isn't
+  protected — closing that needs real request queueing, judged
+  out of scope for now.
 
 Ask the user which, if anything, to pick back up.

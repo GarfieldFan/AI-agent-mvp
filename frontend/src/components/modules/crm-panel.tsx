@@ -22,6 +22,7 @@ import {
   type CrmEntry,
   type CrmStatus,
 } from "@/lib/crm";
+import { listIntentSchemas, type IntentSchema } from "@/lib/intent-schemas";
 
 // Fixed display order + labels for the known categories apis/chat.py's
 // automatic capture and this panel's manual form both use. Anything else
@@ -75,6 +76,17 @@ export function CrmPanel() {
   const [listError, setListError] = React.useState<string | null>(null);
   const [statusErrorByEntry, setStatusErrorByEntry] = React.useState<Record<string, string>>({});
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  // Owner-configured schemas (2026-08-19) — fetched purely to resolve
+  // collected_fields' raw keys into real labels below; failure here just
+  // means field keys render unresolved, never breaks the entry list.
+  const [schemas, setSchemas] = React.useState<IntentSchema[]>([]);
+  const fieldLabelsBySchema = React.useMemo(() => {
+    const map = new Map<number, Record<string, string>>();
+    for (const schema of schemas) {
+      map.set(schema.id, Object.fromEntries(schema.fields.map((f) => [f.field_key, f.label])));
+    }
+    return map;
+  }, [schemas]);
 
   const [cleanupStatus, setCleanupStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [cleanupError, setCleanupError] = React.useState<string | null>(null);
@@ -91,6 +103,9 @@ export function CrmPanel() {
 
   React.useEffect(() => {
     refresh();
+    listIntentSchemas()
+      .then(setSchemas)
+      .catch(() => setSchemas([]));
   }, [refresh]);
 
   async function handlePush() {
@@ -279,6 +294,18 @@ export function CrmPanel() {
                     </div>
                   </div>
                   <p className="text-sm text-muted-foreground">{entry.summary}</p>
+                  {entry.intent_schema_id && Object.keys(entry.collected_fields).length > 0 ? (
+                    <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 rounded-md bg-muted/50 p-2 text-xs">
+                      {Object.entries(entry.collected_fields).map(([key, value]) => (
+                        <React.Fragment key={key}>
+                          <dt className="font-medium text-muted-foreground">
+                            {fieldLabelsBySchema.get(entry.intent_schema_id!)?.[key] ?? key}
+                          </dt>
+                          <dd className="truncate">{value}</dd>
+                        </React.Fragment>
+                      ))}
+                    </dl>
+                  ) : null}
                   {entry.attachment_url ? (
                     <a
                       href={entry.attachment_url}

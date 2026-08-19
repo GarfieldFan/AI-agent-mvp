@@ -1,3 +1,4 @@
+import Link from "next/link";
 import type { CSSProperties } from "react";
 
 import { cn } from "@/lib/utils";
@@ -94,6 +95,7 @@ export function ContainerBlock({
   min_height,
   width,
   full_bleed,
+  link_product_id,
   path,
   children,
   hideOwnBadge,
@@ -138,6 +140,7 @@ export function ContainerBlock({
         min_height,
         width,
         full_bleed,
+        link_product_id,
         children,
       }}
       className={cn(
@@ -155,6 +158,25 @@ export function ContainerBlock({
         <div className="absolute inset-0 -z-10">
           <ThemeImageBox image={background_image} className="h-full w-full" />
         </div>
+      ) : null}
+      {link_product_id != null ? (
+        // A "stretched link" (the same well-established card pattern
+        // Bootstrap calls .stretched-link) — a positioned SIBLING covering
+        // the whole card, not a wrapper around its children. That's what
+        // lets a child ButtonBlock's own `action: "add_to_cart"` button
+        // sit above it (z-10, see button-block.tsx) and intercept its own
+        // clicks instead of triggering navigation, without ever producing
+        // invalid `<button>`-inside-`<a>` HTML. z-0 so it doesn't need any
+        // sibling to explicitly opt out — plain (non-button) content has
+        // no z-index of its own and stacks above a lower explicit z-index
+        // by DOM order regardless, so this is still visually "underneath"
+        // in the way that matters (nothing occludes the container's real
+        // content), it just intercepts the click.
+        <Link
+          href={`/products/${link_product_id}`}
+          aria-label="View product"
+          className="absolute inset-0 z-0"
+        />
       ) : null}
       <BlockRenderer blocks={children} arrayPath={`${path}.children`} sizeForRow={layout === "row"} />
     </Editable>

@@ -107,6 +107,35 @@ def save_media_bytes(raw_bytes: bytes, prefix: str, suffix: str = ".png") -> str
     return f"{BACKEND_PUBLIC_URL}/api/media/uploads/{stored_name}"
 
 
+def resolve_media_local_path(url: str) -> Path | None:
+    """Maps a MEDIA_UPLOAD_DIR-served URL back to the local file it came
+    from — mirrors chat_attachments.py's resolve_local_path (same
+    paranoid posture: exact prefix match, exactly one path segment, a
+    resolve()-based containment check before ever touching disk), for
+    the one case a client-supplied media URL turns into an actual
+    filesystem read: owner-agent's generate_landing_page_from_url tool,
+    which needs real bytes to send to the vision model. Deliberately
+    doesn't resolve COMFYUI_OUTPUT_DIR URLs (ComfyUI-generated images
+    aren't design mockups a landing page would ever be generated from —
+    only this module's own uploads are). Returns None (never raises) for
+    anything that doesn't check out."""
+    prefix = f"{BACKEND_PUBLIC_URL}/api/media/uploads/"
+    if not url.startswith(prefix):
+        return None
+
+    name = url[len(prefix) :]
+    if not name or "/" in name or name in (".", ".."):
+        return None
+
+    candidate = (MEDIA_UPLOAD_DIR / name).resolve()
+    try:
+        candidate.relative_to(MEDIA_UPLOAD_DIR.resolve())
+    except ValueError:
+        return None
+
+    return candidate if candidate.is_file() else None
+
+
 @router.post("/agent/media/upload", response_model=UploadMediaResponse)
 def upload_media(req: UploadMediaRequest) -> UploadMediaResponse:
     content_b64 = req.content_base64

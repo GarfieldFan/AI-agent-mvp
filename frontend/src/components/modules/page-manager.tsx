@@ -2,9 +2,10 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ChevronDown, ChevronUp, History, RotateCcw, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronUp, History, Plus, RotateCcw, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { EmptyState } from "@/components/common/empty-state";
@@ -14,9 +15,11 @@ import {
   listPages,
   listPageVersions,
   restorePageVersion,
+  savePageVersion,
   type PageSummary,
   type PageVersionSummary,
 } from "@/lib/pages";
+import { slugify } from "@/lib/slug";
 
 function viewHrefFor(slug: string) {
   return slug === "home" ? "/" : `/p/${encodeURIComponent(slug)}`;
@@ -91,6 +94,19 @@ export function PageManager() {
   const [expandedSlug, setExpandedSlug] = React.useState<string | null>(null);
   const [deletingSlug, setDeletingSlug] = React.useState<string | null>(null);
 
+  // "New blank page" (2026-08-19) — the CTE editor (/editor) deliberately
+  // only edits *existing* saved content (see CteEditorPanel's own doc
+  // comment), and PageGeneratorPanel only ever produces content from a
+  // design image/documents — there was genuinely no "start from nothing"
+  // path anywhere in the app until this. Saves an empty `sections: []`
+  // version to a new slug via the same savePageVersion PageGeneratorPanel
+  // already uses; the new slug then shows up in this list and in the CTE
+  // editor's own slug datalist (both driven by listPages), ready to
+  // load and build up from an empty canvas via its "+" insert gaps.
+  const [newSlugInput, setNewSlugInput] = React.useState("");
+  const [creating, setCreating] = React.useState(false);
+  const [createError, setCreateError] = React.useState<string | null>(null);
+
   const load = React.useCallback(() => {
     listPages()
       .then((loaded) => {
@@ -103,6 +119,22 @@ export function PageManager() {
   React.useEffect(() => {
     load();
   }, [load]);
+
+  async function handleCreateBlank() {
+    const slug = slugify(newSlugInput);
+    if (!slug) return;
+    setCreating(true);
+    setCreateError(null);
+    try {
+      await savePageVersion(slug, { sections: [] }, "Blank page");
+      setNewSlugInput("");
+      load();
+    } catch (err) {
+      setCreateError(err instanceof ApiError ? err.message : "Could not create the page.");
+    } finally {
+      setCreating(false);
+    }
+  }
 
   // Unlike Restore (always adds a new version, never destroys history),
   // deleting a page removes every version with no undo — a native
@@ -124,21 +156,54 @@ export function PageManager() {
     }
   }
 
+  const newPageForm = (
+    <div className="flex flex-wrap items-end gap-2 rounded-lg border border-dashed p-3">
+      <div className="space-y-1">
+        <label className="text-xs font-medium text-muted-foreground" htmlFor="new-page-slug">
+          New blank page
+        </label>
+        <Input
+          id="new-page-slug"
+          value={newSlugInput}
+          onChange={(event) => setNewSlugInput(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") handleCreateBlank();
+          }}
+          placeholder="slug, e.g. summer-promo"
+          className="w-56"
+        />
+      </div>
+      <Button size="sm" variant="outline" onClick={handleCreateBlank} disabled={!newSlugInput.trim() || creating}>
+        <Plus className="size-4" />
+        {creating ? "Creating…" : "Create"}
+      </Button>
+      {createError ? <p className="w-full text-xs text-destructive">{createError}</p> : null}
+      <p className="w-full text-xs text-muted-foreground">
+        Creates an empty page, ready to build up from scratch in the editor above via its &quot;+&quot; insert gaps.
+      </p>
+    </div>
+  );
+
   if (error) return <ErrorMessage description={error} onRetry={load} />;
   if (pages === null) return <LoadingSpinner label="Loading saved pages…" />;
 
   if (pages.length === 0) {
     return (
-      <EmptyState
-        icon={History}
-        title="No pages saved yet"
-        description="Generate a page above and save it to a slug — it'll show up here with its version history."
-      />
+      <div className="space-y-3">
+        {newPageForm}
+        <EmptyState
+          icon={History}
+          title="No pages saved yet"
+          description="Create a blank page above, or generate one above and save it to a slug — either way it'll show up here with its version history."
+        />
+      </div>
     );
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
+      {newPageForm}
+      <div className="space-y-2">
       {pages.map((page) => {
         const expanded = expandedSlug === page.slug;
         return (
@@ -176,6 +241,7 @@ export function PageManager() {
           </div>
         );
       })}
+      </div>
     </div>
   );
 }

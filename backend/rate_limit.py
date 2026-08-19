@@ -1,14 +1,17 @@
 """Per-IP request-rate limiting for this app's fully public, no-auth
 endpoints: `/api/chat`, `/api/chat/upload` (apis/chat.py — no `require_role`
-gate at all, see the root AGENTS.md's RBAC note) and `/api/auth/login`
-(the classic brute-force target, and every other route's own front door).
+gate at all, see the root AGENTS.md's RBAC note), `/api/auth/login`
+(the classic brute-force target, and every other route's own front door),
+and `/api/cart/add` (apis/products.py's public_router — a real mutation,
+2026-08-19).
 
 Everything else in this backend already sits behind `require_role` — a
 stolen/guessed JWT is a much bigger problem than a fast caller, and rate-
 limiting an authenticated admin/owner (e.g. the owner-agent's own chain of
 backend calls) would get in the way of legitimate use for no real security
-benefit. So this stays scoped to the three routes above, not a blanket
-global limiter.
+benefit. So this stays scoped to the routes above, not a blanket global
+limiter — the public product read/search routes are plain SELECTs, same
+posture as the already-unlimited `GET /pages/{slug}`, so they get no rule.
 
 In-memory, single-process, sliding-window-by-trimming (not a token
 bucket) — deliberately the simplest thing that works, not slowapi/Redis:
@@ -57,6 +60,10 @@ RULES: dict[tuple[str, str], RateLimitRule] = {
     # fat-fingered their password twice, not enough to meaningfully guess
     # one of the 3 seeded demo passwords.
     ("POST", "/api/auth/login"): RateLimitRule(window_seconds=900, max_requests=10),
+    # A real public mutation (2026-08-19, apis/products.py's add_to_cart)
+    # — same tier as /api/chat/upload, not the read-only product/search
+    # routes (no rule needed there, same posture as GET /pages/{slug}).
+    ("POST", "/api/cart/add"): RateLimitRule(window_seconds=300, max_requests=30),
 }
 
 # (method, path, ip) -> recent request timestamps (monotonic clock, so a

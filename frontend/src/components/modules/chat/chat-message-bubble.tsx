@@ -1,7 +1,12 @@
+import Link from "next/link";
 import { Paperclip } from "lucide-react";
+import { Swiper, SwiperSlide } from "swiper/react";
+import "swiper/css";
 
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { ChatControlRenderer } from "@/components/modules/chat/chat-control-renderer";
+import { ProductCard } from "@/components/modules/product-card";
 import { SourceCitationList } from "@/components/common/source-citation";
 import type { ChatMessage } from "@/lib/types";
 
@@ -61,6 +66,25 @@ export function ChatMessageBubble({ message, onControlSubmit }: ChatMessageBubbl
         ) : null}
         {!isUser && message.control ? (
           <ChatControlRenderer control={message.control} onSubmit={onControlSubmit} />
+        ) : null}
+        {!isUser && message.products?.length === 1 ? (
+          <div className="mt-2">
+            <ProductCard product={message.products[0]} />
+          </div>
+        ) : null}
+        {!isUser && message.products && message.products.length > 1 ? (
+          <Swiper spaceBetween={12} slidesPerView="auto" className="mt-2 w-full max-w-full">
+            {message.products.map((product) => (
+              <SwiperSlide key={product.id} className="w-56!">
+                <ProductCard product={product} />
+              </SwiperSlide>
+            ))}
+          </Swiper>
+        ) : null}
+        {!isUser && message.searchLink ? (
+          <Button size="sm" variant="outline" className="mt-2" nativeButton={false} render={<Link href={message.searchLink} />}>
+            See all results
+          </Button>
         ) : null}
       </div>
     </div>

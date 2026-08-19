@@ -1,5 +1,5 @@
 import { apiFetch } from "@/lib/api";
-import type { RagSource } from "@/lib/types";
+import type { ChatProductCard, RagSource } from "@/lib/types";
 
 export type ChatApiTurn = {
   role: "user" | "assistant";
@@ -9,6 +9,8 @@ export type ChatApiTurn = {
 type ChatApiResponse = {
   reply: string;
   sources: RagSource[];
+  products: ChatProductCard[] | null;
+  search_link: string | null;
 };
 
 type ChatUploadResponse = {
@@ -25,8 +27,14 @@ const SESSION_STORAGE_KEY = "chat_session_id";
  * docstring and the root AGENTS.md. Not an auth mechanism: /api/chat has
  * none (see the RBAC architecture note there), this is purely a grouping
  * key for an anonymous, unauthenticated endpoint. Only ever called from a
- * client component's event handler, so `window` is always defined. */
-function getChatSessionId(): string {
+ * client component's event handler, so `window` is always defined.
+ *
+ * **Exported** (2026-08-19) so lib/cart.ts's addToCart can reuse the
+ * exact same id — a visitor's cart (backend/cart.py's Order lookup) has
+ * to resolve to the same ChatSession whether they click "Add to cart"
+ * on a page or talk in the chatbot, or the two would never see each
+ * other's items. */
+export function getChatSessionId(): string {
   let id = window.localStorage.getItem(SESSION_STORAGE_KEY);
   if (!id) {
     id = crypto.randomUUID();
@@ -48,12 +56,17 @@ export async function sendChatMessage(
   message: string,
   history: ChatApiTurn[] = [],
   attachmentUrl?: string,
-): Promise<{ reply: string; sources: RagSource[] }> {
+): Promise<{ reply: string; sources: RagSource[]; products: ChatProductCard[] | null; searchLink: string | null }> {
   const response = await apiFetch<ChatApiResponse>("/api/chat", {
     method: "POST",
     body: { message, history, session_id: getChatSessionId(), attachment_url: attachmentUrl ?? null },
   });
-  return { reply: response.reply, sources: response.sources };
+  return {
+    reply: response.reply,
+    sources: response.sources,
+    products: response.products,
+    searchLink: response.search_link,
+  };
 }
 
 /** Uploads one photo/PDF ahead of a chat turn (`POST /api/chat/upload`,

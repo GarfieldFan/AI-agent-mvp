@@ -22,11 +22,15 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { ColorField } from "@/components/theme/cte/color-field";
 import { ImageFieldEditor } from "@/components/theme/cte/image-field-editor";
+import { LoadingSpinner } from "@/components/common/loading-spinner";
 import type { CteSelection } from "@/lib/cte";
+import { listProducts, type Product } from "@/lib/products";
 import type {
   ButtonBlock as ButtonBlockValue,
   ContainerBlock as ContainerBlockValue,
   ImageBlock as ImageBlockValue,
+  ProductCardBlock as ProductCardBlockValue,
+  ProductListBlock as ProductListBlockValue,
   RichText,
   TextContentBlock as TextContentBlockValue,
   ThemeCta,
@@ -37,6 +41,80 @@ type FeatureItemValue = { title: string; description: string; image?: ThemeImage
 type CtaValue = ThemeCta;
 
 const UNSET = "__unset__";
+
+/** A single-product `<Select>`, shared by block-product-card, block-button
+ * (add_to_cart's product) and block-container (link_product_id) — 2026-08-20.
+ * `products: null` means "still loading" (see the catalog-fetch effect
+ * below); an owner's own admin-authed catalog (`listProducts`, not the
+ * public storefront read) since this whole popover only ever renders on
+ * the admin/owner-gated `/editor` page. */
+function ProductSelect({
+  label,
+  products,
+  value,
+  onChange,
+  allowNone,
+}: {
+  label: string;
+  products: Product[] | null;
+  value: number | null | undefined;
+  onChange: (id: number | null) => void;
+  allowNone?: boolean;
+}) {
+  return (
+    <div className="space-y-1">
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      <Select
+        value={value != null ? String(value) : UNSET}
+        onValueChange={(next) => onChange(next === UNSET ? null : Number(next))}
+      >
+        <SelectTrigger className="w-full">
+          <SelectValue placeholder={products === null ? "Loading…" : "Pick a product"} />
+        </SelectTrigger>
+        <SelectContent>
+          {allowNone || products === null || products.length === 0 ? (
+            <SelectItem value={UNSET}>None</SelectItem>
+          ) : null}
+          {(products ?? []).map((p) => (
+            <SelectItem key={p.id} value={String(p.id)}>
+              {p.name} (${p.price.toFixed(2)})
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+/** A scrollable checklist for ProductListBlock's `product_ids` allow-list
+ * (2026-08-20) — a `<Select>` only carries one value, so a multi-pick
+ * filter needs a different control; `Switch` rows match this project's
+ * existing "Switch instead of a separate Checkbox primitive" convention
+ * (see IntentSchemaPanel). */
+function ProductChecklist({
+  products,
+  selected,
+  onToggle,
+}: {
+  products: Product[] | null;
+  selected: number[];
+  onToggle: (id: number, checked: boolean) => void;
+}) {
+  if (products === null) return <LoadingSpinner label="Loading products…" />;
+  if (products.length === 0) {
+    return <p className="text-xs text-muted-foreground">No products in your catalog yet.</p>;
+  }
+  return (
+    <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border p-2">
+      {products.map((p) => (
+        <div key={p.id} className="flex items-center justify-between gap-2 py-1">
+          <span className="text-sm">{p.name}</span>
+          <Switch checked={selected.includes(p.id)} onCheckedChange={(checked) => onToggle(p.id, checked)} />
+        </div>
+      ))}
+    </div>
+  );
+}
 
 /** A labeled dropdown over a small fixed set of options, with an optional
  * "Default" entry that clears the field back to `undefined` — the same
@@ -223,6 +301,18 @@ const BORDER_WIDTH_OPTIONS = [
   { value: "thin" as const, label: "Thin" },
   { value: "thick" as const, label: "Thick" },
 ];
+// ProductListBlock's filter mode (2026-08-20) — not a schema field itself,
+// just this popover's own UI state for choosing which of category/
+// product_ids (mutually exclusive on the wire, see lib/theme.ts) is active.
+const PRODUCT_FILTER_OPTIONS = [
+  { value: "all" as const, label: "Every available product" },
+  { value: "category" as const, label: "One category" },
+  { value: "ids" as const, label: "Specific products" },
+];
+const BUTTON_ACTION_OPTIONS = [
+  { value: "link" as const, label: "Link to a page" },
+  { value: "add_to_cart" as const, label: "Add a product to cart" },
+];
 
 type CteEditorPopoverProps = {
   selection: CteSelection;
@@ -337,6 +427,11 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
   const [cBackgroundImage, setCBackgroundImage] = React.useState<ThemeImage | undefined>(
     containerValue?.background_image,
   );
+  // Added 2026-08-20 — see lib/theme.ts's ContainerBlock.link_product_id
+  // doc comment for the "owner-composed product promo block" design.
+  const [cLinkProductId, setCLinkProductId] = React.useState<number | null>(
+    containerValue?.link_product_id ?? null,
+  );
 
   // block-text draft
   const textBlockValue = fieldType === "block-text" ? (value as TextContentBlockValue) : null;
@@ -362,6 +457,50 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
   const [bbRounded, setBbRounded] = React.useState(buttonBlockValue?.rounded);
   const [bbSize, setBbSize] = React.useState(buttonBlockValue?.size ?? "lg");
   const [bbBorderWidth, setBbBorderWidth] = React.useState(buttonBlockValue?.border_width);
+  // Added 2026-08-20 — see lib/theme.ts's ButtonBlock.action doc comment.
+  const [bbAction, setBbAction] = React.useState(buttonBlockValue?.action ?? "link");
+  const [bbProductId, setBbProductId] = React.useState<number | null>(buttonBlockValue?.product_id ?? null);
+
+  // block-product-list draft (2026-08-20) — `plFilterMode` is this
+  // popover's own UI state, not a schema field: category/product_ids are
+  // mutually exclusive on the wire (see lib/theme.ts), so the form only
+  // ever writes one of them back, derived from whichever the stored value
+  // already had set.
+  const productListValue = fieldType === "block-product-list" ? (value as ProductListBlockValue) : null;
+  const [plFilterMode, setPlFilterMode] = React.useState<"all" | "category" | "ids">(
+    productListValue?.product_ids && productListValue.product_ids.length > 0
+      ? "ids"
+      : productListValue?.category
+        ? "category"
+        : "all",
+  );
+  const [plCategory, setPlCategory] = React.useState(productListValue?.category ?? "");
+  const [plProductIds, setPlProductIds] = React.useState<number[]>(productListValue?.product_ids ?? []);
+
+  // block-product-card draft (2026-08-20)
+  const productCardValue = fieldType === "block-product-card" ? (value as ProductCardBlockValue) : null;
+  const [pcProductId, setPcProductId] = React.useState<number | null>(productCardValue?.product_id ?? null);
+
+  // Shared product catalog, fetched once for every fieldType with a
+  // product picker (block-product-list, block-product-card,
+  // block-container's link picker, block-button's add-to-cart picker) —
+  // one fetch regardless of how many of this popover's own controls need
+  // it. Admin-authed (lib/products.ts's listProducts, not the public
+  // storefront read) since this whole popover only ever renders on the
+  // admin/owner-gated /editor page.
+  const needsCatalog =
+    fieldType === "block-product-list" ||
+    fieldType === "block-product-card" ||
+    fieldType === "block-container" ||
+    fieldType === "block-button";
+  const [catalog, setCatalog] = React.useState<Product[] | null>(null);
+  React.useEffect(() => {
+    if (!needsCatalog || catalog !== null) return;
+    listProducts()
+      .then(setCatalog)
+      .catch(() => setCatalog([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [needsCatalog]);
 
   // Pure — computes "the value this fieldType's form currently represents"
   // without calling onSave itself, so both the live-update effect (edit
@@ -418,6 +557,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         background_color: cBackgroundColor,
         border_color: cBorderColor,
         background_image: cBackgroundImage,
+        link_product_id: cLinkProductId,
       } satisfies ContainerBlockValue;
     } else if (fieldType === "block-text" && textBlockValue) {
       return {
@@ -446,7 +586,17 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         rounded: bbRounded,
         size: bbSize,
         border_width: bbBorderWidth,
+        action: bbAction,
+        product_id: bbProductId,
       } satisfies ButtonBlockValue;
+    } else if (fieldType === "block-product-list" && productListValue) {
+      return {
+        ...productListValue,
+        category: plFilterMode === "category" ? plCategory || null : null,
+        product_ids: plFilterMode === "ids" ? plProductIds : null,
+      } satisfies ProductListBlockValue;
+    } else if (fieldType === "block-product-card" && productCardValue) {
+      return { ...productCardValue, product_id: pcProductId } satisfies ProductCardBlockValue;
     }
     return undefined;
   }
@@ -507,6 +657,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
     cBackgroundColor,
     cBorderColor,
     cBackgroundImage,
+    cLinkProductId,
     tContent,
     tSize,
     tWeight,
@@ -523,6 +674,12 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
     bbRounded,
     bbSize,
     bbBorderWidth,
+    bbAction,
+    bbProductId,
+    plFilterMode,
+    plCategory,
+    plProductIds,
+    pcProductId,
   ]);
 
   // "create" mode's explicit Add button — the one case that still needs a
@@ -651,6 +808,13 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
               </div>
               <ColorField label="Background color" value={cBackgroundColor} onChange={setCBackgroundColor} />
               <ColorField label="Border color" value={cBorderColor} onChange={setCBorderColor} />
+              <ProductSelect
+                label="Link this whole block to a product (optional)"
+                products={catalog}
+                value={cLinkProductId}
+                onChange={setCLinkProductId}
+                allowNone
+              />
               {cBackgroundImage ? (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -711,8 +875,15 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
             <div className="space-y-3">
               <label className="text-xs font-medium text-muted-foreground">Button label</label>
               <Input value={bbLabel} onChange={(event) => setBbLabel(event.target.value)} autoFocus />
-              <label className="text-xs font-medium text-muted-foreground">Link (href)</label>
-              <Input value={bbHref} onChange={(event) => setBbHref(event.target.value)} placeholder="/chat" />
+              <EnumField label="Action" value={bbAction} options={BUTTON_ACTION_OPTIONS} onChange={(v) => v && setBbAction(v)} />
+              {bbAction === "add_to_cart" ? (
+                <ProductSelect label="Product to add" products={catalog} value={bbProductId} onChange={setBbProductId} />
+              ) : (
+                <>
+                  <label className="text-xs font-medium text-muted-foreground">Link (href)</label>
+                  <Input value={bbHref} onChange={(event) => setBbHref(event.target.value)} placeholder="/chat" />
+                </>
+              )}
               <ColorField label="Background color" value={bbBackgroundColor} onChange={setBbBackgroundColor} />
               <ColorField label="Text color" value={bbTextColor} onChange={setBbTextColor} />
               <ColorField label="Border color" value={bbBorderColor} onChange={setBbBorderColor} />
@@ -720,6 +891,41 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
               <EnumField label="Rounded corners" value={bbRounded} options={BUTTON_ROUNDED_OPTIONS} onChange={setBbRounded} allowUnset />
               <EnumField label="Size" value={bbSize} options={BUTTON_SIZE_OPTIONS} onChange={(v) => v && setBbSize(v)} />
             </div>
+          ) : null}
+
+          {fieldType === "block-product-list" ? (
+            <div className="space-y-3">
+              <EnumField
+                label="Which products to show"
+                value={plFilterMode}
+                options={PRODUCT_FILTER_OPTIONS}
+                onChange={(v) => v && setPlFilterMode(v)}
+              />
+              {plFilterMode === "category" ? (
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-muted-foreground">Category</label>
+                  <Input
+                    value={plCategory}
+                    onChange={(event) => setPlCategory(event.target.value)}
+                    placeholder="e.g. Coffee"
+                    autoFocus
+                  />
+                </div>
+              ) : null}
+              {plFilterMode === "ids" ? (
+                <ProductChecklist
+                  products={catalog}
+                  selected={plProductIds}
+                  onToggle={(id, checked) =>
+                    setPlProductIds((prev) => (checked ? [...prev, id] : prev.filter((existing) => existing !== id)))
+                  }
+                />
+              ) : null}
+            </div>
+          ) : null}
+
+          {fieldType === "block-product-card" ? (
+            <ProductSelect label="Product" products={catalog} value={pcProductId} onChange={setPcProductId} />
           ) : null}
         </div>
 

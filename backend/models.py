@@ -10,7 +10,7 @@ undoable.
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import BigInteger, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -170,10 +170,57 @@ class AppSettings(Base):
     image_comfyui_workflow: Mapped[str | None] = mapped_column(Text, nullable=True)
     image_comfyui_prompt_node: Mapped[str | None] = mapped_column(String(50), nullable=True)
     image_comfyui_prompt_field: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Local resource coordination between chat/vision and ComfyUI
+    # (2026-08-19, see resource_broker.py) — opt-in, off by default so
+    # this changes nothing for anyone not running local processes at all
+    # (cloud-only OpenAI/Anthropic setups have no local footprint to
+    # coordinate). headroom_mb is "only unload the chat/vision model if
+    # ComfyUI reports less free RAM/VRAM than this" — a real
+    # owner-configurable number, not a hardcoded heuristic, since
+    # unloading unnecessarily costs a real reload delay on the next chat
+    # turn (measured up to 159s for a 27B model this session).
+    resource_coordination_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    resource_coordination_headroom_mb: Mapped[int] = mapped_column(Integer, nullable=False, server_default="4096")
+    # Owner-agent-set (set_order_status_options tool, 2026-08-19) — the
+    # status labels OrderPanel's Select offers for an Order.status, same
+    # "null means use the in-code default" posture as chat_provider etc.
+    # above. Deliberately no manual dashboard editor for this in v1 —
+    # owner-agent is the only way to set it, matching how IntentView's
+    # status_options also has no manual editor, only manage_review_queue.
+    order_status_options: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=None)
     updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
+
+
+class OwnerAgentRun(Base):
+    """One completed owner-agent run (2026-08-19) — queryable history to
+    go alongside `owner-agent/logging_.py`'s per-step JSONL file, not a
+    replacement for it: the JSONL write stays (owner-agent is still
+    DB-less by design, see its own main.py docstring — that file is its
+    only durable record if this backend call itself fails), this table
+    is what makes runs actually queryable rather than "greppable if
+    you're on the host machine with a shell open." Written once per run
+    (not once per step, unlike the JSONL) via `POST
+    /agent/owner-agent/runs`, called by `owner-agent/main.py` right
+    after a run completes — best-effort, a logging failure never fails
+    the run response the owner is waiting on."""
+
+    __tablename__ = "owner_agent_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String(255))
+    command: Mapped[str] = mapped_column(Text)
+    final_answer: Mapped[str] = mapped_column(Text)
+    stopped_reason: Mapped[str] = mapped_column(String(50))
+    # The full step trace (tool/args/result per step) — same shape
+    # main.py's own RunResponse.steps already returns to the frontend,
+    # stored as-is rather than normalized into their own rows: nobody
+    # queries into individual steps yet, and this keeps one run == one
+    # row, trivial to page through.
+    steps: Mapped[list] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class ChatSession(Base):
@@ -281,7 +328,279 @@ class CrmEntry(Base):
     status: Mapped[str] = mapped_column(String(16), default="new", server_default="new")
     analysis_notes: Mapped[str | None] = mapped_column(Text, default=None)
     attachment_url: Mapped[str | None] = mapped_column(String(1000), default=None)
+    # Owner-configurable structured collection (2026-08-19, see
+    # IntentSchema/IntentField below) — all three nullable/defaulted so
+    # existing rows and owners who never configure a schema are
+    # completely unaffected. intent_schema_id identifies *what kind* of
+    # request this is (an owner-defined scenario, e.g. "insurance
+    # claim"); collected_fields holds the actual {field_key: value}
+    # data matching that schema's IntentFields; chat_session_id is the
+    # join key apis/chat.py uses to find and update THIS SAME record
+    # across multiple turns of one conversation instead of inserting a
+    # new partial row every time a visitor gives one more field.
+    intent_schema_id: Mapped[int | None] = mapped_column(
+        ForeignKey("intent_schemas.id", ondelete="SET NULL"), default=None
+    )
+    collected_fields: Mapped[dict] = mapped_column(JSONB, default=dict)
+    chat_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="SET NULL"), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class IntentSchema(Base):
+    """An owner-defined "kind of request" the public chatbot should
+    collect structured information for (2026-08-19) — e.g. "insurance
+    application" vs. "insurance claim," each needing different fields.
+    Generalizes CrmEntry's old fixed `category` enum
+    (appointment/quote/claim/inquiry, still the default when an owner
+    configures nothing here) into something any vertical can define for
+    itself: real estate, a clinic's appointment intake, a restaurant's
+    reservation form, a law firm's initial-consultation questionnaire,
+    ... — the mechanism is identical, only the fields differ, so adding
+    a new vertical is the owner filling in this table again, not new
+    code. See apis/chat.py's `_lead_extraction_system_prompt` for how
+    this actually drives collection during a conversation."""
+
+    __tablename__ = "intent_schemas"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), unique=True)
+    label: Mapped[str] = mapped_column(String(255))
+    # Tells the model *when* this schema applies — e.g. "the visitor
+    # wants to file or check on an existing insurance claim."
+    description: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    fields: Mapped[list["IntentField"]] = relationship(
+        back_populates="intent_schema",
+        order_by="IntentField.sort_order",
+        cascade="all, delete-orphan",
+    )
+
+
+class IntentField(Base):
+    """One field an IntentSchema requires — field_key is what
+    apis/chat.py's extraction prompt and CrmEntry.collected_fields both
+    key on; label/prompt_hint are what actually get shown to the model
+    (and, for label, the dashboard) so the field means something beyond
+    a raw identifier."""
+
+    __tablename__ = "intent_fields"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    intent_schema_id: Mapped[int] = mapped_column(ForeignKey("intent_schemas.id", ondelete="CASCADE"))
+    field_key: Mapped[str] = mapped_column(String(64))
+    label: Mapped[str] = mapped_column(String(255))
+    # text|email|phone|date|number|note — a fixed, small vocabulary
+    # (mirrors this project's other enum-not-free-text style knobs, e.g.
+    # BlockWidth in the page schema) rather than an open type string.
+    field_type: Mapped[str] = mapped_column(String(16), default="text")
+    required: Mapped[bool] = mapped_column(Boolean, default=True)
+    prompt_hint: Mapped[str | None] = mapped_column(Text, default=None)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    intent_schema: Mapped["IntentSchema"] = relationship(back_populates="fields")
+
+
+class IntentView(Base):
+    """An owner-agent-generated "review queue" over one IntentSchema's
+    captured entries (2026-08-19) — the follow-on to IntentSchema above.
+    Built specifically so the owner never has to describe a workflow to
+    *me*: they tell owner-agent something like "I want to review
+    insurance applications people submit, approve or reject them," and
+    owner-agent (via its `manage_review_queue` tool, see
+    owner-agent/tools.py) creates or updates this row itself — including
+    picking sensible default `status_options` when the owner didn't
+    specify any. One row per schema in practice (POST /agent/intent-views
+    upserts by schema_key rather than creating duplicates), not enforced
+    with a DB constraint — simpler than handling a conflict error path
+    for a case that shouldn't happen.
+
+    `status_options` is what makes `CrmEntry.status` genuinely owner-
+    defined per queue (e.g. pending/approved/rejected) instead of the
+    original fixed new/contacted/closed three — see apis/agent.py's
+    `CrmStatusUpdateRequest`, loosened from a `Literal` to a plain `str`
+    specifically for this. The frontend's `ReviewQueuePanel` is what
+    actually renders a queue's entries and lets an owner/admin change
+    status by clicking through them; this row only describes the queue
+    itself."""
+
+    __tablename__ = "intent_views"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    intent_schema_id: Mapped[int] = mapped_column(ForeignKey("intent_schemas.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text)
+    status_options: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    intent_schema: Mapped["IntentSchema"] = relationship()
+
+
+class Product(Base):
+    """A generic, owner-defined orderable thing (2026-08-19) — modeled on
+    WooCommerce's product concept rather than anything restaurant- or
+    retail-specific: a coffee-shop menu item, a physical good, a virtual/
+    digital good, a bookable service, whatever the owner sells. `category`
+    is free text (like CrmEntry.category/tags), not an enum — this table
+    is the same "we build the framework, the owner fills in the specific
+    vertical" posture as IntentSchema above, just for things that get
+    ordered with a quantity and a real price instead of collected as a
+    flat field set.
+
+    v1 scope cut, deliberate: no variant/attribute matrix (WooCommerce's
+    "variable product") — a "Latte Large" vs "Latte Small" are two
+    separate rows here, not one product with a size attribute. No
+    inventory/stock tracking either. Both deferred, not rejected.
+
+    Created either directly (admin/owner's own dashboard form, ProductPanel)
+    or via owner-agent's propose_products tool — but even then, only ever
+    written by the owner's own explicit Apply click (see
+    apis/products.py's propose_products docstring): a misread price
+    directly affects what a real customer is quoted, so this follows the
+    same propose-then-owner-applies posture as IntentSchema, not
+    IntentView's apply-directly-then-adjust one."""
+
+    __tablename__ = "products"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text, default=None)
+    price: Mapped[float] = mapped_column(Numeric(10, 2))
+    category: Mapped[str | None] = mapped_column(String(100), default=None)
+    available: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Pure display data (2026-08-19) — never read server-side (never fed
+    # to a vision model, unlike chat_attachments' own images), so it
+    # needs none of chat_attachments.resolve_local_path's paranoid local-
+    # path resolution. Expected to hold a URL the owner already got back
+    # from the media library upload (apis/media.py) — this app never
+    # fetches an owner-supplied external URL server-side (a real SSRF
+    # surface), so nothing here validates or re-hosts the URL, it's
+    # stored and rendered as-is.
+    image_url: Mapped[str | None] = mapped_column(String(1000), default=None)
+    # Owner-defined extra fields (2026-08-19) — mirrors CrmEntry.
+    # collected_fields exactly: ProductFieldDefinition below is the
+    # shared {field_key: label/type} definition list every product draws
+    # from, this column holds one product's actual {field_key: value}
+    # data.
+    custom_fields: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ProductFieldDefinition(Base):
+    """One owner-defined extra field available on every Product (2026-08-19)
+    — e.g. "SKU", "subscribe", a spec-sheet link. A single flat shared
+    list, unlike IntentSchema/IntentField: there's no per-vertical
+    grouping need here, every product draws from the same definitions.
+    Product.custom_fields holds the actual per-product values, keyed by
+    field_key."""
+
+    __tablename__ = "product_field_definitions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    field_key: Mapped[str] = mapped_column(String(64))
+    label: Mapped[str] = mapped_column(String(255))
+    # text|number|date|note|link — no email/phone (IntentField has those,
+    # products don't need them); link is new here, for things like a
+    # warranty page or spec sheet URL.
+    field_type: Mapped[str] = mapped_column(String(16), default="text")
+    required: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ProductRelation(Base):
+    """A directed relation from one Product to another (2026-08-19) — one
+    generic table for both "bundle" and "upsell" (relation_type, free
+    text, same posture as CrmEntry.category) rather than two separate
+    tables, since both are fundamentally "this product relates to that
+    one," just with different display intent. A bundle prices itself
+    independently (its own Product.price) — this table only records
+    *what's inside* a bundle for display/fulfillment, it never drives
+    price computation. `quantity` is only meaningful for relation_type
+    "bundle" (how many of the component are included); ignored for
+    "upsell"."""
+
+    __tablename__ = "product_relations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
+    related_product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
+    relation_type: Mapped[str] = mapped_column(String(32))
+    quantity: Mapped[int | None] = mapped_column(Integer, default=None)
+
+
+class Order(Base):
+    """A visitor's order against the Product catalog above — captured by
+    apis/chat.py's `_maybe_capture_order` (mirrors `_maybe_capture_lead`'s
+    shape) as the visitor talks, or viewed/managed by admin/owner via
+    OrderPanel. Unlike CrmEntry, contact_email/contact_name are both
+    nullable — an order doesn't need contact info to be useful, the owner
+    mainly needs to know what to prepare and when, identified well enough
+    by chat_session_id alone.
+
+    `is_open` (2026-08-19) is a deliberate, separate boolean from
+    `status` — the user's own explicit call: status is free text
+    owner-agent can set to whatever labels the owner wants
+    (received/preparing/ready/delivered/paid/refunded, or anything else
+    via set_order_status_options), so the code can't infer from it
+    whether this order should still accept chat add-ons ("加单").
+    `is_open` is the one hard signal for that, toggled explicitly by
+    admin/owner in OrderPanel (or defaults True until they close it) —
+    apis/chat.py's `_find_active_order` only ever looks up
+    `is_open == True` rows to append to.
+
+    `total_amount` is always recomputed server-side from real
+    OrderItem.subtotal values, never trusted from the model — the
+    extraction call only ever reports which products/quantities changed
+    this turn, real arithmetic happens in Python. `pickup_time` is kept
+    as free text ("9am", "in 5 minutes"), not strictly parsed — same
+    posture as IntentField's "date" type already just storing whatever
+    string the model extracted."""
+
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="SET NULL"), default=None
+    )
+    contact_email: Mapped[str | None] = mapped_column(String(255), default=None)
+    contact_name: Mapped[str | None] = mapped_column(String(255), default=None)
+    # Resolved against AppSettings.order_status_options at read time —
+    # null here just means "not yet set," not an error, same posture as
+    # AppSettings.chat_provider being nullable until the owner picks one.
+    status: Mapped[str | None] = mapped_column(String(32), default=None)
+    is_open: Mapped[bool] = mapped_column(Boolean, default=True)
+    pickup_time: Mapped[str | None] = mapped_column(String(255), default=None)
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    total_amount: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    items: Mapped[list["OrderItem"]] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+    )
+
+
+class OrderItem(Base):
+    """One line item on an Order — item_name_snapshot/unit_price_snapshot
+    are captured at add-time so a line item stays human-readable and its
+    original price stays intact even if the referenced Product is later
+    renamed, repriced, or deleted (ON DELETE SET NULL on product_id, not
+    a cascade — the same "keep the historical record readable" reasoning
+    as CrmEntry.intent_schema_id)."""
+
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"))
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), default=None)
+    item_name_snapshot: Mapped[str] = mapped_column(String(255))
+    unit_price_snapshot: Mapped[float] = mapped_column(Numeric(10, 2))
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    subtotal: Mapped[float] = mapped_column(Numeric(10, 2))
+
+    order: Mapped["Order"] = relationship(back_populates="items")
 
 
 class DocumentChunk(Base):

@@ -207,6 +207,12 @@ class ModelSettings(BaseModel):
     image_comfyui_workflow: str | None = None
     image_comfyui_prompt_node: str | None = None
     image_comfyui_prompt_field: str | None = None
+    # Local resource coordination (2026-08-19, see resource_broker.py) —
+    # only meaningful alongside image_provider == "comfyui" and a custom
+    # llama.cpp-shaped chat/vision endpoint; a no-op otherwise. Off by
+    # default (see AppSettings.resource_coordination_enabled).
+    resource_coordination_enabled: bool = False
+    resource_coordination_headroom_mb: int = 4096
 
 
 class CustomProviderTestRequest(BaseModel):
@@ -437,6 +443,8 @@ def _current_settings(db: Session) -> ModelSettings:
         image_comfyui_workflow=row.image_comfyui_workflow if row else None,
         image_comfyui_prompt_node=row.image_comfyui_prompt_node if row else None,
         image_comfyui_prompt_field=row.image_comfyui_prompt_field if row else None,
+        resource_coordination_enabled=row.resource_coordination_enabled if row else False,
+        resource_coordination_headroom_mb=row.resource_coordination_headroom_mb if row else 4096,
     )
 
 
@@ -814,6 +822,8 @@ async def update_settings(
     row.image_comfyui_workflow = req.image_comfyui_workflow
     row.image_comfyui_prompt_node = req.image_comfyui_prompt_node
     row.image_comfyui_prompt_field = req.image_comfyui_prompt_field
+    row.resource_coordination_enabled = req.resource_coordination_enabled
+    row.resource_coordination_headroom_mb = req.resource_coordination_headroom_mb or 4096
     row.updated_by = current.email
 
     if embedding_changed:

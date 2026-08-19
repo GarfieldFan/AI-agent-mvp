@@ -6,6 +6,8 @@ import { Eye, Save, Plug } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -325,6 +327,12 @@ export function ModelSettingsPanel() {
   const [imageComfyuiWorkflow, setImageComfyuiWorkflow] = React.useState("");
   const [imageComfyuiPromptNode, setImageComfyuiPromptNode] = React.useState("");
   const [imageComfyuiPromptField, setImageComfyuiPromptField] = React.useState("");
+
+  // Local resource coordination (2026-08-19, backend/resource_broker.py)
+  // — only meaningful alongside ComfyUI + a custom llama.cpp chat/vision
+  // endpoint, off by default.
+  const [resourceCoordinationEnabled, setResourceCoordinationEnabled] = React.useState(false);
+  const [resourceCoordinationHeadroomMb, setResourceCoordinationHeadroomMb] = React.useState("4096");
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
@@ -365,6 +373,8 @@ export function ModelSettingsPanel() {
         setImageComfyuiWorkflow(settings.image_comfyui_workflow ?? "");
         setImageComfyuiPromptNode(settings.image_comfyui_prompt_node ?? "");
         setImageComfyuiPromptField(settings.image_comfyui_prompt_field ?? "");
+        setResourceCoordinationEnabled(settings.resource_coordination_enabled);
+        setResourceCoordinationHeadroomMb(String(settings.resource_coordination_headroom_mb));
         setCustomBaseUrl(settings.custom_base_url ?? "");
         setHasSavedCustomKey(
           (settings.chat_provider === "custom" || settings.vision_provider === "custom") &&
@@ -418,6 +428,8 @@ export function ModelSettingsPanel() {
       image_comfyui_workflow: imageComfyuiWorkflow.trim() || null,
       image_comfyui_prompt_node: imageComfyuiPromptNode.trim() || null,
       image_comfyui_prompt_field: imageComfyuiPromptField.trim() || null,
+      resource_coordination_enabled: resourceCoordinationEnabled,
+      resource_coordination_headroom_mb: Number(resourceCoordinationHeadroomMb) || 4096,
     };
     if (chat_provider === "custom" || vision_provider === "custom") {
       payload.custom_base_url = customBaseUrl.trim();
@@ -667,6 +679,45 @@ export function ModelSettingsPanel() {
                   pasted above; leave the field name blank to use &quot;text&quot; (a typical
                   CLIPTextEncode).
                 </p>
+              </div>
+
+              <div className="space-y-2 rounded-lg border border-dashed p-3">
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="resource-coordination"
+                    checked={resourceCoordinationEnabled}
+                    onCheckedChange={setResourceCoordinationEnabled}
+                    disabled={saveStatus === "saving"}
+                  />
+                  <Label htmlFor="resource-coordination" className="text-sm">
+                    Free up chat/vision memory before generating
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  For memory-constrained local setups: before generating, checks ComfyUI&apos;s own free
+                  RAM/VRAM and — only if it&apos;s actually tight — unloads the chat/vision model from its
+                  llama.cpp endpoint first (it reloads automatically on your next chat message). Only
+                  applies when chat or vision is a custom llama.cpp-shaped endpoint.
+                </p>
+                {resourceCoordinationEnabled ? (
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="resource-coordination-headroom" className="text-xs text-muted-foreground">
+                      Free memory threshold (MB)
+                    </Label>
+                    <Input
+                      id="resource-coordination-headroom"
+                      type="number"
+                      min={0}
+                      value={resourceCoordinationHeadroomMb}
+                      onChange={(e) => {
+                        setResourceCoordinationHeadroomMb(e.target.value);
+                        setSaveStatus("idle");
+                      }}
+                      disabled={saveStatus === "saving"}
+                      className="w-32"
+                    />
+                  </div>
+                ) : null}
               </div>
             </>
           ) : null}

@@ -119,7 +119,9 @@ export type EditableFieldType =
   | "block-container"
   | "block-text"
   | "block-image"
-  | "block-button";
+  | "block-button"
+  | "block-product-list"
+  | "block-product-card";
 
 export type CteSelection = {
   path: string;

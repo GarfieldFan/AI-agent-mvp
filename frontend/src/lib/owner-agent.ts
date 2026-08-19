@@ -1,5 +1,5 @@
 import { getAuthToken } from "@/lib/auth";
-import { ApiError } from "@/lib/api";
+import { apiFetch, ApiError } from "@/lib/api";
 
 /** Base URL of the owner-agent service (see ../../docker-compose.yml) —
  * a separate container from the FastAPI backend (see root AGENTS.md's
@@ -27,10 +27,20 @@ export type OwnerAgentRunResult = {
   steps: OwnerAgentStep[];
 };
 
+export type OwnerAgentRunSummary = {
+  id: number;
+  owner_email: string;
+  command: string;
+  final_answer: string;
+  stopped_reason: string;
+  steps: OwnerAgentStep[];
+  created_at: string;
+};
+
 /** Owner only — see owner-agent/deps.py, stricter than every other
  * agent-console capability (admin OR owner). Runs a real LLM tool-calling
- * loop against a fixed allowlist of 5 backend actions (owner-agent/tools.py);
- * can take minutes if it calls generate_poster. */
+ * loop against a fixed allowlist of 9 backend actions (owner-agent/tools.py);
+ * can take minutes if it calls generate_poster or generate_landing_page. */
 export async function runOwnerAgentCommand(command: string): Promise<OwnerAgentRunResult> {
   const token = getAuthToken();
 
@@ -54,4 +64,12 @@ export async function runOwnerAgentCommand(command: string): Promise<OwnerAgentR
   }
 
   return (await response.json()) as OwnerAgentRunResult;
+}
+
+/** Queryable run history (2026-08-19, backend/models.py's
+ * OwnerAgentRun) — goes through the regular backend (lib/api.ts's
+ * apiFetch), not the owner-agent service directly, since this is
+ * backend's own table, not owner-agent's own state. Most-recent-first. */
+export function listOwnerAgentRuns(limit = 20) {
+  return apiFetch<OwnerAgentRunSummary[]>(`/api/agent/owner-agent/runs?limit=${limit}`);
 }

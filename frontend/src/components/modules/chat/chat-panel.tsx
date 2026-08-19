@@ -183,8 +183,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
 
     setPending(true);
     try {
-      const { reply, sources } = await sendChatMessage(text, history, attachmentUrl);
-      pushMessage({ role: "assistant", content: reply, sources: sources.length ? sources : undefined });
+      const { reply, sources, products, searchLink } = await sendChatMessage(text, history, attachmentUrl);
+      pushMessage({
+        role: "assistant",
+        content: reply,
+        sources: sources.length ? sources : undefined,
+        products: products ?? undefined,
+        searchLink: searchLink ?? undefined,
+      });
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Could not reach the chat backend.";
       setError(message);

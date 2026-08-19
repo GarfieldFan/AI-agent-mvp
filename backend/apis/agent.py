@@ -30,18 +30,19 @@ from typing import Annotated, Literal, Union
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 import chat_attachments
 from apis.api import TextOverlayRequest, add_text_overlay
-from apis.deps import Role, require_role
+from apis.deps import CurrentUser, Role, get_current_user, require_role
 from apis.model_settings import _list_image_providers, resolve_chat_provider, resolve_image_provider, resolve_vision_provider
 from apis.pages import _get_or_create_page
 from db import get_db
 from llm_json import parse_lenient_json
-from models import ChatMessage, ChatSession, CrmEntry, Document, PageVersion
+from models import ChatMessage, ChatSession, CrmEntry, Document, OwnerAgentRun, PageVersion
 from providers.base import ProviderNotConfigured
+from resource_broker import maybe_release_llm_memory
 
 router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
 
@@ -250,6 +251,14 @@ class ButtonBlock(BaseModel):
     size: Literal["sm", "default", "lg"] = "lg"
     border_width: Literal["thin", "thick"] | None = None
     width: BlockWidth = "auto"
+    # Added 2026-08-20 — see frontend/src/lib/theme.ts's matching field for
+    # the full "owner-composed product promo block" design. "link" (the
+    # default) is this field's original, only behavior — href navigates,
+    # unchanged. "add_to_cart" ignores href and calls the same
+    # POST /api/cart/add every other add-to-cart control uses, for
+    # product_id.
+    action: Literal["link", "add_to_cart"] = "link"
+    product_id: int | None = None
 
 
 class ContainerBlock(BaseModel):
@@ -290,6 +299,10 @@ class ContainerBlock(BaseModel):
     # every container without this field renders exactly as before it
     # existed.
     min_height: Literal["sm", "md", "lg", "xl", "screen"] | None = None
+    # Added 2026-08-20 — see frontend/src/lib/theme.ts's matching field for
+    # the full "stretched-link product promo" design. None/unset (every
+    # existing container) renders exactly as before this field existed.
+    link_product_id: int | None = None
     # Forward reference to `Block`, defined just below — Pydantic can't
     # resolve this until ContainerBlock.model_rebuild() runs after `Block`
     # actually exists (standard pattern for a self-referential discriminated
@@ -297,8 +310,31 @@ class ContainerBlock(BaseModel):
     children: list["Block"] = []
 
 
+class ProductListBlock(BaseModel):
+    type: Literal["product-list"] = "product-list"
+    # None = every available product; set to filter to one category
+    # (matches Product.category's own free-text values, e.g. "Coffee").
+    category: str | None = None
+    # Added 2026-08-20 — an explicit ordered allow-list, takes priority
+    # over `category` when both are set. See the matching frontend field's
+    # doc comment for the full "feature exactly these products" design.
+    product_ids: list[int] | None = None
+    width: BlockWidth = "auto"
+
+
+class ProductCardBlock(BaseModel):
+    """Added 2026-08-20 — a single product card (ProductListBlock's
+    one-item counterpart), for featuring ONE product somewhere a full grid
+    doesn't fit. Owner-inserted only via CTE, same posture as
+    ProductListBlock (never vision-generated)."""
+
+    type: Literal["product-card"] = "product-card"
+    product_id: int | None = None
+    width: BlockWidth = "auto"
+
+
 Block = Annotated[
-    Union[ImageBlock, TextContentBlock, ButtonBlock, ContainerBlock],
+    Union[ImageBlock, TextContentBlock, ButtonBlock, ContainerBlock, ProductListBlock, ProductCardBlock],
     Field(discriminator="type"),
 ]
 
@@ -672,9 +708,53 @@ async def generate_landing_page(
     req: GenerateLandingPageRequest, db: Session = Depends(get_db)
 ) -> GenerateLandingPageResponse:
     """Vision LLM: turn an uploaded design mockup into an ordered list of
-    page sections (see PageSection above), not raw markup.
+    page sections (see PageSection above), not raw markup. See
+    _generate_landing_page_sections for the actual implementation —
+    this route just strips an optional data-URI prefix first, same as
+    every other base64-image-accepting route in this codebase."""
+    image_b64 = req.design_image_base64
+    if image_b64.strip().lower().startswith("data:") and "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+    return await _generate_landing_page_sections(db, image_b64, req.notes)
 
-    Sends the image + a schema-describing prompt to whatever vision-
+
+class GenerateLandingPageFromUrlRequest(BaseModel):
+    image_url: str
+    notes: str = ""
+
+
+@router.post("/agent/landing-page/generate-from-url", response_model=GenerateLandingPageResponse)
+async def generate_landing_page_from_url(
+    req: GenerateLandingPageFromUrlRequest, db: Session = Depends(get_db)
+) -> GenerateLandingPageResponse:
+    """Same generation as generate_landing_page above, but takes an
+    already-uploaded image's URL instead of raw base64 — built
+    specifically for owner-agent's generate_landing_page tool (see
+    owner-agent/tools.py), since asking the model to reproduce a whole
+    image as base64 inside its own tool-call JSON is neither reliable
+    nor something a text-generation model should be doing at all. The
+    owner uploads a design image via the dashboard's media library (or
+    CTE's ImageFieldEditor "Upload" tab) first, gets a URL back, then
+    tells owner-agent to use it — resolve_media_local_path
+    (apis/media.py) does the same paranoid URL-to-local-file resolution
+    chat_attachments.resolve_local_path already does for chat
+    attachments before this ever touches disk."""
+    from apis.media import resolve_media_local_path
+
+    local_path = resolve_media_local_path(req.image_url)
+    if local_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="image_url must point at an image already uploaded to this app's own media library "
+            "(dashboard → Document manager/media, or CTE's Upload tab) — got a URL that doesn't resolve "
+            "to a real file there.",
+        )
+    image_b64 = base64.b64encode(local_path.read_bytes()).decode("ascii")
+    return await _generate_landing_page_sections(db, image_b64, req.notes)
+
+
+async def _generate_landing_page_sections(db: Session, image_b64: str, notes: str) -> GenerateLandingPageResponse:
+    """Sends the image + a schema-describing prompt to whatever vision-
     capable model the owner has selected (Ollama, a custom
     OpenAI-compatible endpoint, or a configured cloud provider — see
     resolve_vision_provider, apis/model_settings.py) via the shared
@@ -685,17 +765,13 @@ async def generate_landing_page(
     content — never to emit HTML/CSS — so the result renders through the
     same reusable components (frontend/src/components/theme/) as the
     hand-authored default template, safely and on-brand, with no
-    dangerouslySetInnerHTML.
-    """
+    dangerouslySetInnerHTML. `image_b64` must already have any data-URI
+    prefix stripped — both callers above handle that themselves."""
     vision = resolve_vision_provider(db)
 
-    image_b64 = req.design_image_base64
-    if image_b64.strip().lower().startswith("data:") and "," in image_b64:
-        image_b64 = image_b64.split(",", 1)[1]
-
     user_text = "Convert this landing page design into the section JSON described in your instructions."
-    if req.notes:
-        user_text += f" Additional notes from the site owner: {req.notes}"
+    if notes:
+        user_text += f" Additional notes from the site owner: {notes}"
 
     messages = [
         {
@@ -1004,6 +1080,10 @@ async def generate_poster(req: GeneratePosterRequest, db: Session = Depends(get_
         raise HTTPException(status_code=400, detail="prompt must not be empty")
 
     provider = resolve_image_provider(db)
+    if provider.name == "comfyui":
+        # Best-effort, opt-in (see resource_broker.py) — OpenAI/Gemini
+        # image-gen have no local footprint to coordinate around.
+        await maybe_release_llm_memory(db, provider.base_url)
     try:
         image_url, image_bytes = await provider.generate(req.prompt)
     except ProviderNotConfigured as e:
@@ -1058,6 +1138,11 @@ class CrmEntryResponse(BaseModel):
     attachment_url: str | None
     analysis_notes: str | None
     created_at: datetime
+    # Owner-configurable structured collection (2026-08-19) — see
+    # models.py's IntentSchema/CrmEntry docstrings. intent_schema_id is
+    # null for entries captured the old fixed-category way.
+    intent_schema_id: int | None
+    collected_fields: dict
 
 
 def _crm_entry_response(entry: CrmEntry) -> CrmEntryResponse:
@@ -1073,6 +1158,8 @@ def _crm_entry_response(entry: CrmEntry) -> CrmEntryResponse:
         attachment_url=entry.attachment_url,
         analysis_notes=entry.analysis_notes,
         created_at=entry.created_at,
+        intent_schema_id=entry.intent_schema_id,
+        collected_fields=entry.collected_fields,
     )
 
 
@@ -1133,7 +1220,16 @@ def delete_crm_entry(entry_id: int, db: Session = Depends(get_db)) -> None:
 
 
 class CrmStatusUpdateRequest(BaseModel):
-    status: Literal["new", "contacted", "closed"]
+    # Was Literal["new", "contacted", "closed"] — widened 2026-08-19
+    # alongside IntentView/`manage_review_queue` (see models.py's
+    # IntentView docstring): a queue's own `status_options` is now the
+    # real source of truth for what's valid for entries under its
+    # schema (e.g. "approved"/"pending"/"rejected"), enforced by the
+    # frontend's Select, not a closed server-side enum — CrmEntry.status
+    # was already a plain String(16) at the DB level, so this was purely
+    # an API-level constraint that would have rejected a real queue's
+    # own statuses.
+    status: str
 
 
 @router.patch("/agent/crm/entries/{entry_id}/status", response_model=CrmEntryResponse)
@@ -1350,3 +1446,78 @@ async def chat_completion(req: ChatCompletionRequest, db: Session = Depends(get_
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
     return ChatCompletionResponse(reply=reply)
+
+
+class LogOwnerAgentRunRequest(BaseModel):
+    command: str
+    final_answer: str
+    stopped_reason: str
+    # Same shape as main.py's own StepResponse (owner-agent), passed
+    # through as-is — see models.py's OwnerAgentRun.steps comment for why
+    # this isn't normalized into its own rows.
+    steps: list[dict] = []
+
+
+class OwnerAgentRunSummary(BaseModel):
+    id: int
+    owner_email: str
+    command: str
+    final_answer: str
+    stopped_reason: str
+    steps: list[dict]
+    created_at: datetime
+
+
+@router.post("/agent/owner-agent/runs", response_model=OwnerAgentRunSummary)
+def log_owner_agent_run(
+    req: LogOwnerAgentRunRequest,
+    db: Session = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+) -> OwnerAgentRunSummary:
+    """Persists one completed owner-agent run — called by owner-agent's
+    own main.py right after a run finishes (see models.py's
+    OwnerAgentRun docstring for why this exists alongside, not instead
+    of, owner-agent/logging_.py's per-step JSONL file). owner_email comes
+    from the same forwarded bearer token every owner-agent tool call
+    already carries, not a client-supplied field — this route sits
+    behind this router's own admin/owner gate, and owner-agent's deps.py
+    additionally requires owner specifically before it ever gets here."""
+    row = OwnerAgentRun(
+        owner_email=current.email or "unknown",
+        command=req.command,
+        final_answer=req.final_answer,
+        stopped_reason=req.stopped_reason,
+        steps=req.steps,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return OwnerAgentRunSummary(
+        id=row.id,
+        owner_email=row.owner_email,
+        command=row.command,
+        final_answer=row.final_answer,
+        stopped_reason=row.stopped_reason,
+        steps=row.steps,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/agent/owner-agent/runs", response_model=list[OwnerAgentRunSummary])
+def list_owner_agent_runs(db: Session = Depends(get_db), limit: int = 50) -> list[OwnerAgentRunSummary]:
+    """Most-recent-first — what makes owner-agent's history actually
+    queryable (the JSONL file is greppable from a shell on the host,
+    this is queryable from the dashboard/API without one)."""
+    rows = db.execute(select(OwnerAgentRun).order_by(OwnerAgentRun.created_at.desc()).limit(limit)).scalars().all()
+    return [
+        OwnerAgentRunSummary(
+            id=r.id,
+            owner_email=r.owner_email,
+            command=r.command,
+            final_answer=r.final_answer,
+            stopped_reason=r.stopped_reason,
+            steps=r.steps,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]

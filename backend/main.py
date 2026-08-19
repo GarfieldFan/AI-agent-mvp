@@ -13,11 +13,14 @@ from apis.api import router as image_router
 from apis.auth import router as auth_router
 from apis.chat import router as chat_router
 from apis.documents import router as documents_router
+from apis.intent_schemas import router as intent_schemas_router
 from apis.media import MEDIA_UPLOAD_DIR
 from apis.media import router as media_router
 from apis.model_settings import router as model_settings_router
 from apis.pages import admin_router as pages_admin_router
 from apis.pages import public_router as pages_public_router
+from apis.products import admin_router as products_admin_router
+from apis.products import public_router as products_public_router
 from chat_attachments import CHAT_UPLOAD_DIR
 from rate_limit import RateLimitMiddleware
 
@@ -53,6 +56,9 @@ app.include_router(pages_admin_router, prefix="/api")
 app.include_router(pages_public_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
+app.include_router(intent_schemas_router, prefix="/api")
+app.include_router(products_admin_router, prefix="/api")
+app.include_router(products_public_router, prefix="/api")
 app.include_router(model_settings_router, prefix="/api")
 app.include_router(media_router, prefix="/api")
 

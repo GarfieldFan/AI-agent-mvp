@@ -10,12 +10,16 @@ import { RoleBadge } from "@/components/common/role-badge";
 import { CrmPanel } from "@/components/modules/crm-panel";
 import { DocumentManager } from "@/components/modules/document-manager";
 import { GeoPagePanel } from "@/components/modules/geo-page-panel";
+import { IntentSchemaPanel } from "@/components/modules/intent-schema-panel";
 import { ModelSettingsPanel } from "@/components/modules/model-settings-panel";
+import { OrderPanel } from "@/components/modules/order-panel";
 import { OwnerAgentPanel } from "@/components/modules/owner-agent-panel";
 import { PageGeneratorPanel } from "@/components/modules/page-generator-panel";
 import { PageManager } from "@/components/modules/page-manager";
 import { PosterGeneratorPanel } from "@/components/modules/poster-generator-panel";
+import { ProductPanel } from "@/components/modules/product-panel";
 import { ReportPanel } from "@/components/modules/report-panel";
+import { ReviewQueuePanel } from "@/components/modules/review-queue-panel";
 import { ApiError, apiFetch } from "@/lib/api";
 import { clearAuth, useAuth } from "@/lib/auth";
 
@@ -127,8 +131,24 @@ export function AgentConsoleSection() {
           <AccordionItem value="crm-reporting">
             <AccordionTrigger>CRM & reporting</AccordionTrigger>
             <AccordionPanel>
+              <IntentSchemaPanel />
               <CrmPanel />
               <ReportPanel />
+            </AccordionPanel>
+          </AccordionItem>
+
+          <AccordionItem value="products-orders">
+            <AccordionTrigger>Products & orders</AccordionTrigger>
+            <AccordionPanel>
+              <ProductPanel />
+              <OrderPanel />
+            </AccordionPanel>
+          </AccordionItem>
+
+          <AccordionItem value="review-queues">
+            <AccordionTrigger>Review queues</AccordionTrigger>
+            <AccordionPanel>
+              <ReviewQueuePanel />
             </AccordionPanel>
           </AccordionItem>
 

@@ -43,6 +43,20 @@ export const BLOCK_REGISTRY: BlockTypeDef[] = [
     insertable: true,
     createDefault: () => ({ type: "container", layout: "row", gap: "md", children: [] }),
   },
+  {
+    type: "product-list",
+    label: "Product list",
+    description: "A grid of products from your catalog. Filter to one category, or pick specific products, after inserting.",
+    insertable: true,
+    createDefault: () => ({ type: "product-list" }),
+  },
+  {
+    type: "product-card",
+    label: "Product card",
+    description: "One featured product — pick which one after inserting. For spotlighting a single item (a homepage strip, a swiper slide) instead of a whole grid.",
+    insertable: true,
+    createDefault: () => ({ type: "product-card", product_id: null }),
+  },
 ];
 
 export const INSERTABLE_BLOCK_TYPES = BLOCK_REGISTRY.filter((def) => def.insertable);

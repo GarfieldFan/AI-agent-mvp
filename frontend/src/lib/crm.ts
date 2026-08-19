@@ -1,6 +1,12 @@
 import { apiFetch } from "@/lib/api";
 
-export type CrmStatus = "new" | "contacted" | "closed";
+// Was a fixed "new" | "contacted" | "closed" union — widened 2026-08-19
+// alongside IntentView/ReviewQueuePanel (see lib/intent-views.ts):
+// a review queue defines its own status vocabulary (e.g. "pending"/
+// "approved"/"rejected"), enforced by whichever Select is actually
+// rendering it, not a closed type here. The original three still work
+// fine as plain strings.
+export type CrmStatus = string;
 
 export type CrmEntry = {
   crm_id: string;
@@ -23,6 +29,12 @@ export type CrmEntry = {
    * the first scan. */
   analysis_notes: string | null;
   created_at: string;
+  /** Owner-configurable structured collection (2026-08-19, see
+   * lib/intent-schemas.ts) — null for entries captured the old
+   * fixed-category way. Pair with `listIntentSchemas()` to resolve
+   * `collected_fields`' keys into real labels. */
+  intent_schema_id: number | null;
+  collected_fields: Record<string, string>;
 };
 
 /** Admin/owner only — see backend/apis/agent.py. Stores the entry in this

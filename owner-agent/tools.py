@@ -4,8 +4,31 @@ already-real, already-RBAC-gated endpoints; nothing here reaches a
 filesystem, a shell, or an arbitrary URL. See agent_loop.py for how the
 model selects a tool; this module only defines what's selectable.
 
-generate_landing_page is deliberately excluded — it takes an image upload,
-which doesn't fit a text-command tool.
+generate_landing_page (2026-08-19) takes an already-uploaded image's URL,
+not raw base64 — asking the model to reproduce a whole image as base64
+inside its own tool-call JSON would be neither reliable nor something a
+text-generation model should be doing at all. The owner uploads a design
+image via the dashboard's media library first, gets a URL back, then
+tells owner-agent to use it; backend/apis/agent.py's
+generate_landing_page_from_url does the actual URL-to-local-file
+resolution (paranoid, mirrors chat_attachments.resolve_local_path) —
+this tool is still just a plain HTTP call like every other one here,
+image_url is a normal JSON string arg, no special-casing needed in
+execute_tool below.
+
+`list_intent_schemas`/`manage_review_queue` (2026-08-19) are the second
+half of the "owner-configurable structured collection" framework (see
+the root AGENTS.md and models.py's IntentSchema/IntentView docstrings)
+— an owner describes a review/approval workflow in plain language
+("I want to review insurance applications, approve or reject them") and
+the model creates or updates an `IntentView` itself, rather than the
+owner filling in another dashboard form. `manage_review_queue` upserts
+by `schema_key`, so a follow-up command ("actually call the statuses X
+instead") updates the same queue instead of creating a duplicate — this
+run can't pause mid-execution to ask the owner a clarifying question
+(see agent_loop.py's turn budget), so the tool's own description tells
+the model to apply a sensible default and state the assumption in its
+final answer instead.
 
 `path` may contain `{param}` placeholders (first used by
 scan_crm_attachment below) — execute_tool() substitutes them from `args`
@@ -13,6 +36,26 @@ before making the request, and strips those keys out of what's actually
 sent as the request body/query, so a tool's own description is the only
 place the model needs to see the distinction between "goes in the URL"
 and "goes in the body."
+
+`detect_business_type`/`propose_intent_schema` (2026-08-19) deliberately
+DON'T follow manage_review_queue's "apply a default, let the owner
+adjust afterward" pattern — propose_intent_schema only ever returns a
+draft (backend/apis/intent_schemas.py's propose_intent_schema never
+writes to the database), which the dashboard's OwnerAgentPanel renders
+as an editable review form the owner must explicitly Apply. A schema
+defines what data gets collected from real future visitors, a
+meaningfully higher-stakes and harder-to-reverse change than a review
+queue's status_options list, which is why this one pair gets a stricter
+confirm-before-apply flow instead.
+
+`propose_products` (2026-08-19, backend/apis/products.py) follows the
+exact same propose-then-owner-applies posture as propose_intent_schema,
+for the same reason applied to a different kind of mistake: a misread
+price directly affects what a real customer gets quoted, so owner-agent
+never writes a Product itself — see models.py's Product docstring.
+`set_order_status_options`, by contrast, stays apply-directly like
+manage_review_queue — a status-label list is cheap to adjust afterward,
+same reasoning that already applies to review queues.
 """
 
 import os
@@ -28,7 +71,11 @@ _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
 
 # Poster generation submits a ComfyUI job and waits for it — matches
 # apis/agent.py's own generate_poster, which budgets up to 180s for
-# wait_for_completion plus overlay compositing.
+# wait_for_completion plus overlay compositing. Per-tool override below
+# (ToolSpec.timeout) for tools that need more — landing-page generation
+# is vision + a full page's worth of structured JSON, backend already
+# budgets up to 600s for that single call (see providers/custom.py's
+# timeout comment), so the default here would cut it off mid-generation.
 _TOOL_CALL_TIMEOUT = 200.0
 
 
@@ -36,8 +83,14 @@ _TOOL_CALL_TIMEOUT = 200.0
 class ToolSpec:
     name: str
     description: str
-    method: Literal["GET", "POST", "DELETE"]
+    # PUT/PATCH added 2026-08-19 for set_order_status_options — found and
+    # fixed a real bug adding it: execute_tool() below only ever attached
+    # a JSON body for method == "POST", so a PUT tool call silently sent
+    # an empty body and 422'd against the backend's own required-field
+    # validation, discovered via a real owner-agent run, not a code read.
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
     path: str
+    timeout: float = _TOOL_CALL_TIMEOUT
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
@@ -110,6 +163,116 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="DELETE",
         path="/api/agent/crm/entries/{crm_id}",
     ),
+    "list_intent_schemas": ToolSpec(
+        name="list_intent_schemas",
+        description=(
+            "Returns every owner-configured intent schema (each has a key, label, description, and "
+            "the list of fields it collects) — use this BEFORE manage_review_queue to find the exact "
+            "schema_key that matches what the owner described, rather than guessing one. No arguments."
+        ),
+        method="GET",
+        path="/api/agent/intent-schemas",
+    ),
+    "manage_review_queue": ToolSpec(
+        name="manage_review_queue",
+        description=(
+            "Creates or updates a review queue for an intent schema's captured entries — use this when "
+            "the owner describes wanting to track, review, or approve/reject entries of some kind that "
+            "already has a matching intent schema (check with list_intent_schemas first; if nothing "
+            "matches, tell the owner to create that schema in the dashboard first instead of guessing). "
+            'Args: {"schema_key": "<an existing schema\'s key>", "name": "<short label for this queue>", '
+            '"description": "<what it\'s for>", "status_options": ["<status>", ...]}. If the owner didn\'t '
+            'say what statuses they want to track, default to ["pending", "approved", "rejected"] and say '
+            "so plainly in your final answer — don't ask a follow-up question, since this run can't pause "
+            "and wait for one; the owner can send another command to adjust the statuses afterward, which "
+            "updates this same queue in place rather than creating a second one. Never creates a new "
+            "intent schema itself — schemas are configured in the dashboard, not by this tool."
+        ),
+        method="POST",
+        path="/api/agent/intent-views",
+    ),
+    "detect_business_type": ToolSpec(
+        name="detect_business_type",
+        description=(
+            "Best-effort guess at what business/industry this SaaS instance is running, inferred "
+            "from currently-ingested documents. Use this only if the owner hasn't directly told you "
+            "what their business is — if they HAVE told you (even if it seems to contradict what the "
+            "documents are about), always trust what the owner said over this tool's result. No "
+            "arguments."
+        ),
+        method="GET",
+        path="/api/agent/business-profile/detect",
+    ),
+    "propose_intent_schema": ToolSpec(
+        name="propose_intent_schema",
+        description=(
+            "Drafts a new or updated intent schema for the owner to review — this NEVER creates or "
+            "changes a real schema itself, it only returns a draft. Call list_intent_schemas first to "
+            "check whether a schema with a matching key already exists, so your draft's key lines up "
+            'and the owner sees it as an update rather than a duplicate. Args: {"key": "<stable id, e.g. '
+            'insurance_claim>", "label": "<shown to the owner>", "description": "<when this schema '
+            'applies>", "fields": [{"field_key": "<id>", "label": "<shown to the owner>", "field_type": '
+            '"text|email|phone|date|number|note", "required": true, "prompt_hint": "<optional>"}]}. '
+            "After calling this, tell the owner in your final answer that a draft is ready to review "
+            "and apply themselves in the Owner agent panel — never claim the schema has already been "
+            "created or changed."
+        ),
+        method="POST",
+        path="/api/agent/intent-schemas/propose",
+    ),
+    "list_products": ToolSpec(
+        name="list_products",
+        description=(
+            "Returns every product in the owner's catalog (id, name, description, price, category, "
+            "available) — use this BEFORE propose_products to check what already exists, so you don't "
+            "re-propose something that's already there. No arguments."
+        ),
+        method="GET",
+        path="/api/agent/products",
+    ),
+    "propose_products": ToolSpec(
+        name="propose_products",
+        description=(
+            "Drafts one or more products for the owner to review — this NEVER creates or changes real "
+            "products itself, it only returns a draft. Call list_products first to avoid re-proposing "
+            'something that already exists. Args: {"products": [{"name": "<name>", "description": '
+            '"<optional>", "price": <number>, "category": "<optional, e.g. Coffee, Pastry, Digital '
+            'download>", "available": true}]}. Get prices right — a real customer will be quoted whatever '
+            "you propose once the owner applies it. After calling this, tell the owner a draft is ready "
+            "to review in the Owner agent panel — never claim any product has already been created."
+        ),
+        method="POST",
+        path="/api/agent/products/propose",
+    ),
+    "set_order_status_options": ToolSpec(
+        name="set_order_status_options",
+        description=(
+            "Sets the list of order status labels available in the dashboard's order-management view "
+            '(e.g. received/preparing/ready/delivered/paid/refunded). Args: {"status_options": '
+            '["<status>", ...]}. If the owner didn\'t specify statuses, default to '
+            '["received", "preparing", "ready", "delivered", "paid", "refunded"] and say so plainly in '
+            "your final answer — this applies immediately (unlike propose_products), since a status-"
+            "label list is cheap for the owner to adjust with a follow-up command."
+        ),
+        method="PUT",
+        path="/api/agent/order-status-options",
+    ),
+    "generate_landing_page": ToolSpec(
+        name="generate_landing_page",
+        description=(
+            "Turns an already-uploaded design image into a real page (vision LLM picks section types "
+            "and fills in content, never raw HTML). The owner must have already uploaded the design "
+            "image via the dashboard's media library or CTE's Upload tab — you need the URL that upload "
+            'returned; ask for it if the owner hasn\'t given you one. Args: {"image_url": "<url from the '
+            'media library>", "notes": "<optional tone/must-keep-copy notes>"}. This only returns the '
+            "generated sections — it does NOT save/publish them; tell the owner to review and save it "
+            "themselves via the Page generator panel if they want to keep it. Can take several minutes "
+            "for a large local vision model."
+        ),
+        method="POST",
+        path="/api/agent/landing-page/generate-from-url",
+        timeout=620.0,
+    ),
     "cleanup_chat_uploads": ToolSpec(
         name="cleanup_chat_uploads",
         description=(
@@ -146,11 +309,11 @@ async def execute_tool(spec: ToolSpec, args: dict, bearer_token: str) -> tuple[b
         path = path.replace(f"{{{param}}}", str(remaining_args.pop(param)))
 
     try:
-        async with httpx.AsyncClient(timeout=_TOOL_CALL_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=spec.timeout) as client:
             resp = await client.request(
                 spec.method,
                 f"{BACKEND_URL}{path}",
-                json=remaining_args if spec.method == "POST" else None,
+                json=remaining_args if spec.method in ("POST", "PUT", "PATCH") else None,
                 params=remaining_args if spec.method == "GET" else None,
                 headers={"Authorization": f"Bearer {bearer_token}"},
             )

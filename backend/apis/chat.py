@@ -29,14 +29,17 @@ the frontend on every call) is still what gives the model conversational
 context, independent of this logging.
 
 Lead capture added 2026-08-08 — this MVP has no separate contact form, so
-`_maybe_capture_lead` below lets a visitor book an appointment/request a
-quote/estimate/file a claim entirely inside this same chat, no login.
-This does NOT reopen the "no tools" boundary above: it's one fixed-shape
-classification call (is this a real lead? which category? what email?),
-never the model choosing among arbitrary actions, and its only possible
-side effect is a bounded `CrmEntry` insert — the same shape admin/owner
-already create by hand via `apis/agent.py`'s `create_crm_entry`, just
-triggered by the visitor's own words instead of a dashboard form.
+`_lead_extraction_call`/`_apply_lead_capture` below let a visitor book an
+appointment/request a quote/estimate/file a claim entirely inside this
+same chat, no login. (Split into those two functions 2026-08-20 — was
+one combined `_maybe_capture_lead` — see `chat()`'s "parallel
+extraction" comment for why.) This does NOT reopen the "no tools"
+boundary above: it's one fixed-shape classification call (is this a real
+lead? which category? what email?), never the model choosing among
+arbitrary actions, and its only possible side effect is a bounded
+`CrmEntry` insert — the same shape admin/owner already create by hand
+via `apis/agent.py`'s `create_crm_entry`, just triggered by the
+visitor's own words instead of a dashboard form.
 
 Optional caller identity added 2026-08-08 — `chat()` now resolves
 `get_current_user` (apis/deps.py), the exact same never-rejects dependency
@@ -48,7 +51,7 @@ logged in, `_build_visitor_context` looks up that email's own past
 `CrmEntry` rows (nothing new is collected — this only reads what the
 visitor already gave us, whether via this chatbot or the dashboard) so
 the model can recognize a returning visitor instead of re-asking who they
-are, and `_maybe_capture_lead` can log a new request under their known
+are, and `_apply_lead_capture` can log a new request under their known
 account email even if this particular message never spells the email
 out. Same non-tool boundary as lead capture above: reading one's own
 identity off an already-issued JWT isn't a privileged action.
@@ -72,29 +75,47 @@ the chat model *does* now read an attachment's actual content:
 name/phone/email/intent, best-effort, on every turn that carries a fresh
 attachment. The result is folded into both the main reply's context (so
 the assistant doesn't ask the visitor to retype what's already legible in
-their file) and `_maybe_capture_lead`'s `CrmEntry` fields
+their file) and `_apply_lead_capture`'s `CrmEntry` fields
 (`contact_name`/`contact_phone`, alongside the existing `contact_email`).
 Swallows every failure — an unreadable file or an unreachable provider
 degrades to "nothing extracted," never a broken chat reply.
+
+Order capture added 2026-08-19 — `_resolve_order_turn`/
+`apply_resolved_order_turn` below are a second, fully independent
+pipeline alongside lead capture, for the generic `Product` catalog (see
+models.py's `Product`/`Order`/
+`OrderItem` docstrings): a visitor can order against whatever products
+the owner has configured ("I'll come at 9am for a latte") entirely
+inside this same chat, with the same no-tools boundary — one fixed-shape
+classification call per turn (which products changed, by how much),
+never the model choosing arbitrary actions, and its only possible side
+effect is a bounded Order/OrderItem insert/update. The real total is
+always computed in Python from the catalog's actual prices, never
+trusted from the model.
 """
 
+import asyncio
 import base64
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import sqlalchemy.exc
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
 
 import chat_attachments
 from apis.deps import CurrentUser, get_current_user
 from apis.model_settings import resolve_chat_provider, resolve_embedding_provider
+from cart import apply_order_delta, find_active_order, search_products
 from db import get_db
 from llm_json import parse_lenient_json
-from models import ChatMessage, ChatSession, CrmEntry
+from models import ChatMessage, ChatSession, CrmEntry, IntentSchema, Order, Product
 from providers.base import ProviderNotConfigured
+from resource_broker import chat_request_finished, chat_request_started
 from retrieval import retrieve
 
 router = APIRouter()
@@ -160,14 +181,26 @@ SYSTEM_PROMPT = (
     "repeat their name/phone/email if it's listed there, just briefly "
     "confirm it's correct if relevant. If no such analysis line is "
     "present, be upfront that you can't view the file's contents yourself "
-    "and a team member will review it directly."
+    "and a team member will review it directly. If a message starts with "
+    "'(In-progress ', the site owner has configured a structured "
+    "information-collection flow for this kind of request — that block "
+    "tells you exactly what's already been collected and what's still "
+    "needed. Only ask about what's listed as still needed, one or two "
+    "items at a time, never re-ask about anything listed as already "
+    "collected; once nothing is missing, confirm the request is complete "
+    "instead of continuing to ask questions."
 )
 
-# Gates lead-capture extraction: only worth a second LLM call on a turn
-# that could plausibly finish a booking/quote/claim, i.e. one where the
-# visitor has actually typed something email-shaped. Without this,
-# _maybe_capture_lead would run (and cost a model call) on every single
-# ordinary chat turn, the overwhelming majority of which are never a lead.
+# Gates lead-capture extraction on a turn with NO configured intent
+# schemas — only worth a second LLM call on a turn that could plausibly
+# finish a booking/quote/claim, i.e. one where the visitor has actually
+# typed something email-shaped. Without this, _lead_extraction_call would
+# run (and cost a model call) on every single ordinary chat turn, the
+# overwhelming majority of which are never a lead. Once an owner
+# configures at least one IntentSchema (2026-08-19), this gate is
+# deliberately bypassed — see _lead_extraction_call's docstring for why a
+# multi-turn structured collection (e.g. "what's your policy number" with
+# no email anywhere yet) needs a looser gate to work at all.
 _LEAD_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 _LEAD_CATEGORIES = {"appointment", "quote", "claim", "inquiry"}
@@ -178,7 +211,62 @@ _LEAD_CATEGORIES = {"appointment", "quote", "claim", "inquiry"}
 _VISITOR_CONTEXT_ENTRY_LIMIT = 5
 
 
-def _lead_extraction_system_prompt(known_email: str | None, attachment_info: dict | None) -> str:
+def _load_intent_schemas(db: Session) -> list[IntentSchema]:
+    """Every owner-configured IntentSchema, fields preloaded — see
+    models.py's docstring. Empty list (the common case for a demo that
+    hasn't touched this feature) means every caller below falls back to
+    the original fixed 4-category behavior, byte-for-byte."""
+    return list(db.execute(select(IntentSchema).options(selectinload(IntentSchema.fields))).scalars().all())
+
+
+def _find_active_entry(db: Session, chat_session_id: int | None) -> CrmEntry | None:
+    """The most recent schema-linked CrmEntry for this chat session, if
+    any — what makes "don't re-ask for what you already have" possible.
+    Deliberately scoped to *this one session* (not cross-session by
+    email/identity — a real user-confirmed scope decision, see
+    AGENTS.md), and looked up by the record's own id/session link rather
+    than re-deriving anything from scratch."""
+    if chat_session_id is None:
+        return None
+    return db.execute(
+        select(CrmEntry)
+        .where(CrmEntry.chat_session_id == chat_session_id, CrmEntry.intent_schema_id.isnot(None))
+        .order_by(CrmEntry.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _known_and_missing(schema: IntentSchema, entry: CrmEntry | None) -> tuple[dict[str, str], list[str]]:
+    """(known field_key -> value, missing required field labels) for one
+    schema against one entry's collected_fields (or against nothing, if
+    entry is None — everything required is "missing")."""
+    collected = (entry.collected_fields if entry else {}) or {}
+    known = {f.field_key: collected[f.field_key] for f in schema.fields if collected.get(f.field_key)}
+    missing = [f.label for f in schema.fields if f.required and not collected.get(f.field_key)]
+    return known, missing
+
+
+def _in_progress_context_block(schema: IntentSchema, entry: CrmEntry) -> str:
+    """Folded into the MAIN reply's context (not just the extraction
+    call) — otherwise the classification call alone updating
+    collected_fields silently wouldn't stop the assistant's own reply
+    text from re-asking for something it already has."""
+    known, missing = _known_and_missing(schema, entry)
+    known_line = "; ".join(f"{k}: {v}" for k, v in known.items()) or "nothing yet"
+    missing_line = "; ".join(missing) if missing else "nothing — everything required is already collected"
+    return (
+        f"(In-progress {schema.label}: already collected — {known_line}. Still needed — {missing_line}. "
+        "Don't re-ask for anything already collected.)"
+    )
+
+
+def _lead_extraction_system_prompt(
+    known_email: str | None,
+    attachment_info: dict | None,
+    schemas: list[IntentSchema],
+    active_schema: IntentSchema | None,
+    active_entry: CrmEntry | None,
+) -> str:
     known_email_clause = (
         f"The visitor is signed in with account email {known_email} — if they're making a real "
         "request but never spell an email out in the conversation, use this account email as "
@@ -197,73 +285,169 @@ def _lead_extraction_system_prompt(known_email: str | None, attachment_info: dic
                 "prefer the conversation text if it disagrees with these, but don't return null for a "
                 "field this analysis already found.\n\n"
             )
+
+    if not schemas:
+        # Original fixed-4-category behavior — unchanged for an owner who
+        # hasn't configured any IntentSchema.
+        return (
+            "You read a visitor's conversation with a company website's chatbot and decide whether it "
+            "contains a real lead worth logging for the business to follow up on: a request to book an "
+            "appointment, get a price quote/estimate, or file/check an insurance claim, where the visitor "
+            "has also given a contact email (in the latest message, earlier in the conversation, or via the "
+            "signed-in/attachment facts below).\n\n"
+            f"{known_email_clause}"
+            f"{attachment_clause}"
+            "Respond with ONLY a single JSON object, no markdown fences, no commentary before or after it:\n"
+            '{"is_lead": true or false, "category": "appointment" or "quote" or "claim" or "inquiry" or null, '
+            '"contact_email": "<the email address, or null>", "contact_name": "<the visitor\'s name, or '
+            'null>", "contact_phone": "<a phone number, or null>", "summary": "<one concise sentence '
+            'describing what they want, for a human reviewing this later>"}\n\n'
+            "Set is_lead to false for small talk, general questions, or a real request that has no contact "
+            "email anywhere in the conversation, no signed-in account email, and no attachment-analysis email "
+            "above. Never invent a value that isn't actually present in the conversation text or given above."
+        )
+
+    # Owner-configured schema mode (2026-08-19) — the category list and
+    # the extractable field list both come from AppSettings-adjacent
+    # IntentSchema/IntentField rows instead of a fixed enum, so this
+    # generalizes to any vertical the owner has configured, not just the
+    # original appointment/quote/claim/inquiry set.
+    schema_lines = "\n".join(
+        f'- "{s.key}": {s.label} — {s.description}\n'
+        + "\n".join(
+            f'    - field_key "{f.field_key}" ({f.label}, {f.field_type}'
+            f'{", required" if f.required else ", optional"}'
+            f'){": " + f.prompt_hint if f.prompt_hint else ""}'
+            for f in s.fields
+        )
+        for s in schemas
+    )
+    progress_clause = ""
+    if active_schema is not None and active_entry is not None:
+        known, missing = _known_and_missing(active_schema, active_entry)
+        known_line = "; ".join(f"{k}: {v}" for k, v in known.items()) or "nothing yet"
+        missing_line = "; ".join(missing) if missing else "nothing"
+        progress_clause = (
+            f'This conversation already has an in-progress "{active_schema.key}" request — already '
+            f"collected: {known_line}. Still needed: {missing_line}. If this turn continues the SAME "
+            f'request, use schema_key "{active_schema.key}" again and only put NEWLY-found values in '
+            '"fields" (omit — do not null out — anything you don\'t have new information for this turn). '
+            "If the visitor is clearly starting something different, pick whichever schema_key actually "
+            "fits instead.\n\n"
+        )
+
     return (
         "You read a visitor's conversation with a company website's chatbot and decide whether it "
-        "contains a real lead worth logging for the business to follow up on: a request to book an "
-        "appointment, get a price quote/estimate, or file/check an insurance claim, where the visitor "
-        "has also given a contact email (in the latest message, earlier in the conversation, or via the "
-        "signed-in/attachment facts below).\n\n"
+        "contains a real request worth logging for the business to follow up on, and which of the "
+        "following kinds of request it is:\n"
+        f"{schema_lines}\n\n"
         f"{known_email_clause}"
         f"{attachment_clause}"
+        f"{progress_clause}"
         "Respond with ONLY a single JSON object, no markdown fences, no commentary before or after it:\n"
-        '{"is_lead": true or false, "category": "appointment" or "quote" or "claim" or "inquiry" or null, '
+        '{"is_lead": true or false, "schema_key": "<one of the keys above, or null>", '
         '"contact_email": "<the email address, or null>", "contact_name": "<the visitor\'s name, or '
         'null>", "contact_phone": "<a phone number, or null>", "summary": "<one concise sentence '
-        'describing what they want, for a human reviewing this later>"}\n\n'
-        "Set is_lead to false for small talk, general questions, or a real request that has no contact "
-        "email anywhere in the conversation, no signed-in account email, and no attachment-analysis email "
-        "above. Never invent a value that isn't actually present in the conversation text or given above."
+        'describing what they want, for a human reviewing this later>", '
+        '"fields": {"<field_key>": "<value>", ...}}\n\n'
+        "Only include a field_key in \"fields\" if you found an actual value for it in THIS "
+        "conversation (new or already given) — never invent one, never include a field_key that isn't "
+        "listed under the matched schema_key above. Set is_lead to false for small talk, general "
+        "questions, or a request that doesn't match any schema above and has no contact email anywhere "
+        "in the conversation, no signed-in account email, and no attachment-analysis email above."
     )
 
 
-async def _maybe_capture_lead(
-    db: Session,
+async def _lead_extraction_call(
     provider,
     history: list["ChatTurn"],
     message: str,
-    known_email: str | None = None,
-    attachment_url: str | None = None,
-    attachment_info: dict | None = None,
-) -> None:
-    """Best-effort structured lead capture — see this module's docstring
-    for why this doesn't reopen the public chat's "no tools" boundary.
-    `known_email` (a signed-in caller's own account email — see
-    get_current_user above) both widens the gate below (a logged-in
-    visitor doesn't need to retype an email that's already known) and
-    backstops a missing/invalid model-extracted email. `attachment_url`
-    (see POST /chat/upload) also widens the gate — a visitor attaching a
-    file is itself a strong signal this turn is a real request, not small
-    talk — and is stored on the captured entry unchanged. `attachment_info`
-    (chat_attachments.extract_lead_info's best-effort name/phone/email/
-    intent_summary, or None) both widens the gate further and backstops
-    the extraction model's own contact_name/contact_phone/contact_email
-    the same way known_email already backstops contact_email. Swallows
-    every failure (provider unreachable, malformed JSON, bad email, DB
-    error): losing a lead-capture attempt is fine, breaking the chat reply
-    the visitor is waiting on is not."""
-    if (
+    known_email: str | None,
+    attachment_url: str | None,
+    attachment_info: dict | None,
+    schemas: list[IntentSchema] | None,
+    active_schema: IntentSchema | None,
+    active_entry: CrmEntry | None,
+) -> dict | None:
+    """The LLM half of lead capture, split out from the combined
+    `_maybe_capture_lead` this used to be (2026-08-20) so `chat()` can
+    kick this off concurrently with `_order_extraction_call` instead of
+    paying both calls' latency serially — neither extraction call needs
+    the other's output, and neither needs the main reply's output either
+    (see `_apply_lead_capture` below, called after the reply using this
+    same parsed result). A real measured incident (order-taking chat turn
+    on a slow local 27B model: ~50s across 3 serial calls) motivated this
+    — see AGENTS.md's "Known gotchas". Returns None when the turn is
+    gated out (see the email/schema gate below) or the call/parse fails —
+    same swallow-and-degrade posture the combined function used to have,
+    just returning None instead of returning early from a `void` function.
+
+    `schemas`/`active_schema`/`active_entry` (2026-08-19, see
+    models.py's IntentSchema docstring) — when the owner has configured
+    at least one IntentSchema, this call runs on EVERY turn (see
+    _LEAD_EMAIL_RE's comment for why the narrow email-shaped gate below
+    is skipped in that case: multi-turn structured collection like "what's
+    your policy number" has no email anywhere until much later)."""
+    schemas = schemas or []
+    if not schemas and (
         not known_email
         and not attachment_url
         and not (attachment_info and any(attachment_info.values()))
         and not _LEAD_EMAIL_RE.search(message)
     ):
-        return
+        return None
 
     extraction_messages = [{"role": turn.role, "content": turn.content} for turn in history]
     extraction_messages.append({"role": "user", "content": message})
 
     try:
         raw = await provider.chat(
-            extraction_messages, system=_lead_extraction_system_prompt(known_email, attachment_info)
+            extraction_messages,
+            system=_lead_extraction_system_prompt(known_email, attachment_info, schemas, active_schema, active_entry),
         )
-        parsed = parse_lenient_json(raw)
+        return parse_lenient_json(raw)
+    except (httpx.HTTPError, ProviderNotConfigured, ValueError):
+        return None
 
+
+def _apply_lead_capture(
+    db: Session,
+    parsed: dict | None,
+    known_email: str | None = None,
+    attachment_url: str | None = None,
+    attachment_info: dict | None = None,
+    chat_session_id: int | None = None,
+    schemas: list[IntentSchema] | None = None,
+    active_schema: IntentSchema | None = None,
+    active_entry: CrmEntry | None = None,
+) -> None:
+    """The DB half of lead capture — takes `_lead_extraction_call`'s
+    already-parsed result (or None, when gated out or failed — a no-op)
+    and does the actual CrmEntry insert/merge. Split from that function
+    (2026-08-20) so the LLM call can run concurrently with order
+    extraction — see `_lead_extraction_call`'s docstring and `chat()`.
+    Swallows every DB-layer failure (bad email, commit error): losing a
+    lead-capture attempt is fine, breaking the chat reply the visitor is
+    waiting on is not.
+
+    A hit against `active_entry` (the same-session record `chat()`
+    already looked up) merges new field values into it — UPDATE, not
+    another INSERT — everything else is treated exactly like today: a
+    brand new CrmEntry."""
+    if parsed is None:
+        return
+    schemas = schemas or []
+    try:
         if not parsed.get("is_lead"):
             return
 
         contact_email = parsed.get("contact_email")
         if not isinstance(contact_email, str) or not _LEAD_EMAIL_RE.search(contact_email):
             contact_email = known_email or (attachment_info or {}).get("email")
+        if not contact_email and active_entry is not None:
+            # Continuing an already-identified record — this turn doesn't
+            # need to re-state the email for the merge below to proceed.
+            contact_email = active_entry.contact_email
         if not contact_email:
             return
 
@@ -275,13 +459,61 @@ async def _maybe_capture_lead(
         if not isinstance(contact_phone, str) or not contact_phone.strip():
             contact_phone = (attachment_info or {}).get("phone")
 
-        category = parsed.get("category")
-        if category not in _LEAD_CATEGORIES:
-            category = "inquiry"
-
         summary = parsed.get("summary")
         if not isinstance(summary, str) or not summary.strip():
             summary = message[:500]
+
+        matched_schema = None
+        if schemas:
+            schema_key = parsed.get("schema_key")
+            matched_schema = next((s for s in schemas if s.key == schema_key), None)
+
+        if matched_schema is not None:
+            raw_fields = parsed.get("fields")
+            valid_keys = {f.field_key for f in matched_schema.fields}
+            new_fields = {
+                k: v
+                for k, v in (raw_fields.items() if isinstance(raw_fields, dict) else [])
+                if k in valid_keys and v
+            }
+
+            if active_entry is not None and active_schema is not None and active_schema.id == matched_schema.id:
+                # Same (session, schema) as an already-open record — merge,
+                # never a second partial row for the same request.
+                active_entry.collected_fields = {**active_entry.collected_fields, **new_fields}
+                if contact_name and not active_entry.contact_name:
+                    active_entry.contact_name = contact_name.strip()
+                if contact_phone and not active_entry.contact_phone:
+                    active_entry.contact_phone = contact_phone.strip()
+                if attachment_url and not active_entry.attachment_url:
+                    active_entry.attachment_url = attachment_url
+                db.commit()
+            else:
+                db.add(
+                    CrmEntry(
+                        contact_email=contact_email.strip(),
+                        contact_name=contact_name.strip() if contact_name else None,
+                        contact_phone=contact_phone.strip() if contact_phone else None,
+                        summary=summary.strip(),
+                        category=matched_schema.key,
+                        tags=["source:chat"],
+                        attachment_url=attachment_url,
+                        intent_schema_id=matched_schema.id,
+                        collected_fields=new_fields,
+                        chat_session_id=chat_session_id,
+                    )
+                )
+                db.commit()
+            return
+
+        # No schema matched — either the owner hasn't configured any
+        # (schemas == []), or the model's classification didn't line up
+        # with a real one. Falls back to the original fixed-category
+        # capture rather than losing the lead over a classification
+        # quirk.
+        category = parsed.get("category") if not schemas else None
+        if category not in _LEAD_CATEGORIES:
+            category = "inquiry" if not schemas else None
 
         db.add(
             CrmEntry(
@@ -292,11 +524,318 @@ async def _maybe_capture_lead(
                 category=category,
                 tags=["source:chat"],
                 attachment_url=attachment_url,
+                chat_session_id=chat_session_id,
             )
         )
         db.commit()
-    except (httpx.HTTPError, ProviderNotConfigured, ValueError):
+    except (ValueError, sqlalchemy.exc.SQLAlchemyError):
         db.rollback()
+
+
+# --- Product ordering (2026-08-19, refactored) ---------------------------
+# Fully independent of the IntentSchema/CrmEntry lead-capture pipeline
+# above — see this module's docstring's "Order capture" section and
+# models.py's Product/Order/OrderItem/ProductRelation docstrings for why
+# this is a separate table set rather than a variant of IntentSchema.
+#
+# **Refactored** from the original version (which listed the WHOLE
+# catalog in the extraction prompt and asked the model to pick a
+# product_id itself — doesn't scale, and the model resolving names to
+# IDs is strictly worse than a real database doing it). Now: the
+# extraction call only ever pulls out plain-language phrases; every
+# phrase is resolved against the real catalog via cart.search_products
+# (deterministic SQL, no LLM). Also **runs BEFORE the main reply now**,
+# not post-hoc like lead capture — its output (search/order
+# results) has to be known before the reply is written, or the
+# assistant's own prose would have nothing real to narrate. The actual
+# DB write still happens after the reply (apply_resolved_order_turn,
+# below) and stays best-effort, but no longer needs its own LLM call —
+# extraction already happened before the reply.
+
+_SEARCH_DISPLAY_CAP = 5
+
+
+def _load_products(db: Session) -> list[Product]:
+    """Every available Product — empty list (the common case for an
+    owner who hasn't configured a catalog) means order resolution below
+    is skipped entirely, byte-for-byte unaffected, same non-regression
+    bar _load_intent_schemas already holds itself to."""
+    return list(db.execute(select(Product).where(Product.available.is_(True))).scalars().all())
+
+
+def _menu_context_block(products: list[Product]) -> str:
+    """Folded into the MAIN reply's context whenever any products exist
+    (not gated on relevance-guessing, same posture as RAG chunks/visitor
+    context) — so the assistant can answer "what do you have" / "how
+    much is a latte" from the real catalog, not just capture orders."""
+    lines = "\n".join(
+        f"- #{p.id} {p.name} — ${float(p.price):.2f}" + (f" ({p.category})" if p.category else "")
+        for p in products
+    )
+    return f"(Available products:\n{lines})"
+
+
+def _in_progress_order_block(order: Order) -> str:
+    """Folded into the MAIN reply's context — the order state as of the
+    START of this turn (before whatever _resolve_order_turn finds below
+    gets applied) — otherwise the assistant's own reply text would
+    forget what's already in the order from earlier turns."""
+    if not order.items:
+        item_lines = "nothing yet"
+    else:
+        item_lines = "; ".join(f"{i.quantity}x {i.item_name_snapshot} (${float(i.subtotal):.2f})" for i in order.items)
+    pickup = f" Pickup: {order.pickup_time}." if order.pickup_time else ""
+    return f"(Current order (before this turn) — {item_lines}. Running total so far: ${float(order.total_amount):.2f}.{pickup})"
+
+
+def _order_extraction_system_prompt(active_order: Order | None) -> str:
+    """No catalog listed here anymore — this call only extracts
+    plain-language phrases the visitor used; cart.search_products (real
+    SQL) resolves them against the actual catalog afterward."""
+    progress_clause = ""
+    if active_order is not None and active_order.items:
+        item_lines = "; ".join(f"{i.quantity}x {i.item_name_snapshot}" for i in active_order.items)
+        progress_clause = (
+            f"There is already an open order in this conversation — {item_lines}. If this turn adds, "
+            "removes, or changes quantities, report ONLY the delta for each affected item (e.g. +1 to "
+            "add one more, -1 to remove one) — do not restate items that aren't changing this turn.\n\n"
+        )
+
+    return (
+        "You read a visitor's conversation with a company chatbot and extract, in plain language, "
+        "anything about ordering or browsing the company's products. Do not try to match against any "
+        "specific catalog yourself — just extract what the visitor actually said; a separate step "
+        "resolves it against the real catalog.\n\n"
+        f"{progress_clause}"
+        "Respond with ONLY a single JSON object, no markdown fences, no commentary before or after it:\n"
+        '{"items": [{"item_phrase": "<plain product name/description the visitor mentioned, e.g. '
+        '\'latte\'>", "quantity_delta": <positive to add, negative to remove/reduce>}], "search_phrase": '
+        '"<plain text describing what the visitor is asking about, or null>", "pickup_time": "<what the '
+        'visitor said about timing, e.g. "9am" or "in 5 minutes", or null>", "note": "<any special '
+        'instructions, or null>"}\n\n'
+        "Set search_phrase whenever the visitor asks what you have, asks about a category (e.g. "
+        '"what coffee do you have"), or asks about specific products by name — even if you can already '
+        "answer from context — a short phrase describing what they're asking about (e.g. \"coffee\", "
+        '"latte") is enough; this lets the interface show product cards alongside your reply. Leave both '
+        '"items" and "search_phrase" empty/null only if this turn has nothing at all to do with the '
+        "company's products (small talk, unrelated questions)."
+    )
+
+
+@dataclass
+class _ResolvedOrderItem:
+    product: Product
+    quantity_delta: int
+
+
+@dataclass
+class OrderTurnResult:
+    """Everything _resolve_order_turn figured out — built entirely from
+    real data (a real extraction call's plain-language output, then real
+    SQL search results), consumed by both _order_turn_context_block
+    (what the main reply's prose gets told) and
+    apply_resolved_order_turn (what actually gets written to the DB
+    after the reply), so the two can never disagree with each other."""
+
+    resolved: list[_ResolvedOrderItem]
+    # An item phrase that matched 2+ products — never guessed, surfaced
+    # as candidates for the visitor to pick from instead.
+    ambiguous: list[Product]
+    search_phrase: str | None
+    search_results: list[Product]
+    search_overflow: bool
+    pickup_time: str | None
+    note: str | None
+
+
+_EMPTY_ORDER_TURN = OrderTurnResult([], [], None, [], False, None, None)
+
+
+async def _order_extraction_call(
+    provider,
+    history: list["ChatTurn"],
+    message: str,
+    active_order: Order | None,
+) -> dict | None:
+    """The LLM half of order-turn resolution, split out from
+    `_resolve_order_turn` (below) 2026-08-20 so `chat()` can kick this off
+    concurrently with `_lead_extraction_call` instead of paying both
+    calls' latency serially — see that function's docstring for the full
+    reasoning. Returns None on any failure (network, malformed JSON,
+    ...), same swallow-and-degrade posture the combined function used to
+    have."""
+    extraction_messages = [{"role": turn.role, "content": turn.content} for turn in history]
+    extraction_messages.append({"role": "user", "content": message})
+
+    try:
+        raw = await provider.chat(extraction_messages, system=_order_extraction_system_prompt(active_order))
+        return parse_lenient_json(raw)
+    except (httpx.HTTPError, ProviderNotConfigured, ValueError):
+        return None
+
+
+def _resolve_order_turn(db: Session, parsed: dict | None, active_order: Order | None) -> OrderTurnResult:
+    """The deterministic SQL half of order-turn resolution — takes
+    `_order_extraction_call`'s already-parsed result (or None, when that
+    call failed) and resolves it against the real catalog. Split from
+    that function (2026-08-20) so the LLM call can run concurrently with
+    lead-capture's own extraction call — see `_order_extraction_call`'s
+    docstring and `chat()`. No longer async: everything left here is
+    plain SQL (`search_products`), no I/O that needs awaiting. Runs
+    BEFORE the main reply (unlike lead capture, which is post-hoc) — its
+    result has to be known before the reply is written, so the assistant
+    has something real to narrate. Result-count branching (1 match / 2+
+    ambiguous / a search phrase's matches) happens entirely here, in
+    code — the caller never re-derives it, and the LLM never decides it.
+    Degrades to `_EMPTY_ORDER_TURN` when `parsed` is None — losing
+    order-aware context for one turn is fine, breaking the reply isn't."""
+    if parsed is None:
+        return _EMPTY_ORDER_TURN
+
+    resolved: list[_ResolvedOrderItem] = []
+    ambiguous: list[Product] = []
+
+    raw_items = parsed.get("items")
+    if isinstance(raw_items, list):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            phrase = raw_item.get("item_phrase")
+            if not isinstance(phrase, str) or not phrase.strip():
+                continue
+            try:
+                delta = int(raw_item.get("quantity_delta", 0))
+            except (TypeError, ValueError):
+                continue
+            if delta == 0:
+                continue
+            matches = search_products(db, phrase, limit=_SEARCH_DISPLAY_CAP + 1)
+            if len(matches) == 1:
+                resolved.append(_ResolvedOrderItem(product=matches[0], quantity_delta=delta))
+            elif len(matches) > 1:
+                ambiguous.extend(matches[:_SEARCH_DISPLAY_CAP])
+            # 0 matches: nothing resolved, nothing to show — the main
+            # reply's own prose (told nothing matched) handles this.
+
+    search_phrase = parsed.get("search_phrase")
+    search_phrase = search_phrase.strip() if isinstance(search_phrase, str) and search_phrase.strip() else None
+    search_results: list[Product] = []
+    search_overflow = False
+    if search_phrase and not ambiguous:
+        # An ambiguous order attempt already gives the visitor something
+        # concrete to pick from — don't also run a second, possibly
+        # different-looking search in the same turn.
+        matches = search_products(db, search_phrase, limit=_SEARCH_DISPLAY_CAP + 1)
+        search_overflow = len(matches) > _SEARCH_DISPLAY_CAP
+        search_results = matches[:_SEARCH_DISPLAY_CAP]
+
+    pickup_time = parsed.get("pickup_time")
+    pickup_time = pickup_time.strip() if isinstance(pickup_time, str) and pickup_time.strip() else None
+    note = parsed.get("note")
+    note = note.strip() if isinstance(note, str) and note.strip() else None
+
+    return OrderTurnResult(resolved, ambiguous, search_phrase, search_results, search_overflow, pickup_time, note)
+
+
+def _order_turn_context_block(active_order: Order | None, turn: OrderTurnResult) -> str | None:
+    """Built entirely from _resolve_order_turn's already-resolved, real
+    data — folded into the main reply's context so its prose narrates
+    exactly what the code already decided (including the REAL new total,
+    computed here in Python, never left for the model to add up itself)."""
+    parts: list[str] = []
+    if turn.resolved:
+        current_total = float(active_order.total_amount) if active_order else 0.0
+        delta_total = sum(float(item.product.price) * item.quantity_delta for item in turn.resolved)
+        lines = "; ".join(
+            f"{item.quantity_delta:+d} {item.product.name} (${float(item.product.price):.2f} each)"
+            for item in turn.resolved
+        )
+        parts.append(
+            f"(This turn's order change — {lines}. New running total after this turn: "
+            f"${current_total + delta_total:.2f}. State this real number if you mention the total — "
+            "never invent a different one.)"
+        )
+    if turn.ambiguous:
+        lines = "; ".join(f"{p.name} (${float(p.price):.2f})" for p in turn.ambiguous)
+        parts.append(
+            f"(More than one product matched what the visitor asked for — {lines}. Ask which one they "
+            "mean; don't add anything to the order yet.)"
+        )
+    if turn.search_results:
+        lines = "; ".join(f"{p.name} (${float(p.price):.2f})" for p in turn.search_results)
+        overflow = " (more than these matched — mention they can see the full list on the shop page)" if turn.search_overflow else ""
+        parts.append(f"(Products found for the visitor's question — {lines}{overflow}.)")
+    return "\n".join(parts) if parts else None
+
+
+def apply_resolved_order_turn(
+    db: Session,
+    chat_session_id: int | None,
+    known_email: str | None,
+    active_order: Order | None,
+    turn: OrderTurnResult,
+) -> None:
+    """Actually writes what _resolve_order_turn already figured out —
+    runs AFTER the main reply (best-effort, swallows failures, same
+    posture as _apply_lead_capture) but needs no LLM call of its own
+    anymore, since extraction already happened before the reply. Not
+    prefixed with an underscore — apis/products.py's public_router
+    doesn't call this directly (POST /cart/add applies its own delta via
+    cart.apply_order_delta instead, no LLM step involved at all there),
+    but keeping the name unprefixed matches this module's few other
+    cross-file-relevant helpers."""
+    if not turn.resolved and not turn.pickup_time and not turn.note:
+        return
+    try:
+        order = active_order
+        if order is None:
+            if not turn.resolved:
+                return  # nothing to create an order for
+            order = Order(chat_session_id=chat_session_id, contact_email=known_email, is_open=True)
+            db.add(order)
+            db.flush()  # populates order.id before apply_order_delta's OrderItem rows reference it
+
+        for item in turn.resolved:
+            apply_order_delta(db, order, item.product, item.quantity_delta)
+
+        if turn.pickup_time:
+            order.pickup_time = turn.pickup_time
+        if turn.note:
+            order.note = turn.note
+
+        db.commit()
+    except (ValueError, TypeError, sqlalchemy.exc.SQLAlchemyError):
+        db.rollback()
+
+
+class ProductCardOut(BaseModel):
+    id: int
+    name: str
+    price: float
+    image_url: str | None = None
+
+
+def _to_product_card(p: Product) -> ProductCardOut:
+    return ProductCardOut(id=p.id, name=p.name, price=float(p.price), image_url=p.image_url)
+
+
+def _order_turn_response_fields(turn: OrderTurnResult) -> tuple[list[ProductCardOut] | None, str | None]:
+    """Decides `ChatResponse.products`/`search_link` — pure count-based
+    code, never an LLM decision (see this section's module comment).
+    Priority: an unresolved ambiguity needs the visitor's input most
+    urgently, then a confirmed order (so the visitor sees what they just
+    added), then a plain browse/search result."""
+    if turn.ambiguous:
+        return [_to_product_card(p) for p in turn.ambiguous], None
+    if turn.resolved:
+        return [_to_product_card(item.product) for item in turn.resolved], None
+    if turn.search_overflow:
+        from urllib.parse import quote
+
+        return None, f"/search?q={quote(turn.search_phrase or '')}"
+    if turn.search_results:
+        return [_to_product_card(p) for p in turn.search_results], None
+    return None, None
 
 
 def _build_visitor_context(db: Session, email: str) -> str | None:
@@ -353,6 +892,14 @@ class ChatSource(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     sources: list[ChatSource] = []
+    # Set by _order_turn_response_fields (2026-08-19) — 1-5 product cards
+    # to render inline (a single card, or a Swiper of 2-5, frontend's
+    # call), for an order confirmation, a disambiguation prompt, or plain
+    # browse results. Mutually exclusive with search_link (set instead
+    # when a search matched more than the display cap — see the root
+    # AGENTS.md for the full "why" behind this refactor).
+    products: list["ProductCardOut"] | None = None
+    search_link: str | None = None
 
 
 class ChatUploadRequest(BaseModel):
@@ -477,87 +1024,190 @@ async def chat(
         )
         db.commit()
 
-    # Best-effort automatic extraction off a fresh attachment — see this
-    # module's docstring's "Automatic attachment analysis" section.
-    # extract_lead_info never raises (see chat_attachments.py), so nothing
-    # further needs to guard this call.
-    attachment_info: dict | None = None
-    if req.attachment_url:
-        local_path = chat_attachments.resolve_local_path(req.attachment_url)
-        if local_path is not None:
-            attachment_info = await chat_attachments.extract_lead_info(db, local_path)
-
+    # Held for the rest of this turn (every chat/vision router call below
+    # — attachment analysis, the main reply, lead-capture extraction) so
+    # resource_broker.maybe_release_llm_memory refuses to unload the
+    # model out from under a real visitor mid-conversation — see
+    # resource_broker.py's docstring for why this takes priority over an
+    # owner's poster generation.
+    chat_request_started()
     try:
-        embedder = resolve_embedding_provider(db)
-        chunks = await retrieve(db, req.message, embedder)
-    except ProviderNotConfigured:
-        chunks = []  # embeddings not configured — degrade to plain chat, don't break the chatbot over it
-    except httpx.HTTPError:
-        chunks = []  # e.g. embedding model not pulled — same degrade-gracefully treatment
-    except sqlalchemy.exc.DBAPIError:
-        # Defensive fallback: update_settings() clears document_chunks the
-        # instant the embedding provider/model changes specifically to
-        # prevent this, but a request racing that save could still catch
-        # a table briefly mid-transition — degrade the same way, not a 500.
-        chunks = []
+        # Best-effort automatic extraction off a fresh attachment — see this
+        # module's docstring's "Automatic attachment analysis" section.
+        # extract_lead_info never raises (see chat_attachments.py), so nothing
+        # further needs to guard this call.
+        attachment_info: dict | None = None
+        if req.attachment_url:
+            local_path = chat_attachments.resolve_local_path(req.attachment_url)
+            if local_path is not None:
+                attachment_info = await chat_attachments.extract_lead_info(db, local_path)
 
-    if chunks:
-        # Every retrieved chunk goes to the model, regardless of score —
-        # see MIN_CITATION_SCORE's comment for why gating this on score
-        # broke real cross-lingual questions. The system prompt already
-        # tells the model to use these "only if relevant"; that judgment
-        # call belongs to the model reading the actual content, not to a
-        # cosine-similarity number computed before it ever sees the text.
-        context_block = "\n\n".join(
-            f"[{i + 1}] (from {c.document_title}): {c.content}" for i, c in enumerate(chunks)
+        # Owner-configurable structured collection (2026-08-19, see
+        # models.py's IntentSchema docstring) — looked up once here and
+        # reused both for the main reply's context (below) and for
+        # lead capture (concurrently with order extraction, below), so this only queries the
+        # DB once per turn regardless of how many places need it.
+        chat_session_id = session.id if session is not None else None
+        intent_schemas = _load_intent_schemas(db)
+        active_entry = _find_active_entry(db, chat_session_id)
+        active_schema = (
+            next((s for s in intent_schemas if s.id == active_entry.intent_schema_id), None)
+            if active_entry is not None
+            else None
         )
-        user_content = f"Context (use only if relevant to the question):\n{context_block}\n\nQuestion: {req.message}"
-        # One citation chip per *document*, not per chunk — `chunks` is
-        # already ordered best-score-first (retrieve()'s query orders by
-        # distance ascending), so keeping the first chunk seen per
-        # document_id keeps its highest-scoring chunk. Without this, a
-        # single multi-chunk document matching on several chunks showed
-        # up as several identical-looking citation chips.
-        seen_document_ids: set[int] = set()
-        sources = []
-        for c in chunks:
-            if c.score < MIN_CITATION_SCORE or c.document_id in seen_document_ids:
-                continue
-            seen_document_ids.add(c.document_id)
-            sources.append(
-                ChatSource(
-                    document_id=c.document_id,
-                    chunk_id=c.chunk_id,
-                    document_title=c.document_title,
-                    excerpt=c.excerpt,
-                    score=c.score,
-                )
+
+        # Product ordering (2026-08-19, see this module's docstring's
+        # "Order capture" section) — same "look up once, reuse for both
+        # the reply's context and the post-reply capture call" shape as
+        # the intent-schema lookups above, fully independent of them.
+        products = _load_products(db)
+        active_order = find_active_order(db, chat_session_id)
+
+        try:
+            embedder = resolve_embedding_provider(db)
+            chunks = await retrieve(db, req.message, embedder)
+        except ProviderNotConfigured:
+            chunks = []  # embeddings not configured — degrade to plain chat, don't break the chatbot over it
+        except httpx.HTTPError:
+            chunks = []  # e.g. embedding model not pulled — same degrade-gracefully treatment
+        except sqlalchemy.exc.DBAPIError:
+            # Defensive fallback: update_settings() clears document_chunks the
+            # instant the embedding provider/model changes specifically to
+            # prevent this, but a request racing that save could still catch
+            # a table briefly mid-transition — degrade the same way, not a 500.
+            chunks = []
+
+        if chunks:
+            # Every retrieved chunk goes to the model, regardless of score —
+            # see MIN_CITATION_SCORE's comment for why gating this on score
+            # broke real cross-lingual questions. The system prompt already
+            # tells the model to use these "only if relevant"; that judgment
+            # call belongs to the model reading the actual content, not to a
+            # cosine-similarity number computed before it ever sees the text.
+            context_block = "\n\n".join(
+                f"[{i + 1}] (from {c.document_title}): {c.content}" for i, c in enumerate(chunks)
             )
+            user_content = (
+                f"Context (use only if relevant to the question):\n{context_block}\n\nQuestion: {req.message}"
+            )
+            # One citation chip per *document*, not per chunk — `chunks` is
+            # already ordered best-score-first (retrieve()'s query orders by
+            # distance ascending), so keeping the first chunk seen per
+            # document_id keeps its highest-scoring chunk. Without this, a
+            # single multi-chunk document matching on several chunks showed
+            # up as several identical-looking citation chips.
+            seen_document_ids: set[int] = set()
+            sources = []
+            for c in chunks:
+                if c.score < MIN_CITATION_SCORE or c.document_id in seen_document_ids:
+                    continue
+                seen_document_ids.add(c.document_id)
+                sources.append(
+                    ChatSource(
+                        document_id=c.document_id,
+                        chunk_id=c.chunk_id,
+                        document_title=c.document_title,
+                        excerpt=c.excerpt,
+                        score=c.score,
+                    )
+                )
 
-    if current.email:
-        visitor_context = _build_visitor_context(db, current.email)
-        if visitor_context:
-            user_content = f"{visitor_context}\n\n{user_content}"
+        if current.email:
+            visitor_context = _build_visitor_context(db, current.email)
+            if visitor_context:
+                user_content = f"{visitor_context}\n\n{user_content}"
 
-    user_content = f"{user_content}{_attachment_note(req.attachment_url)}{_attachment_info_note(attachment_info)}"
+        if active_schema is not None and active_entry is not None:
+            user_content = f"{_in_progress_context_block(active_schema, active_entry)}\n\n{user_content}"
 
-    messages = [{"role": turn.role, "content": turn.content} for turn in req.history]
-    messages.append({"role": "user", "content": user_content})
+        if products:
+            user_content = f"{_menu_context_block(products)}\n\n{user_content}"
+        if active_order is not None:
+            user_content = f"{_in_progress_order_block(active_order)}\n\n{user_content}"
 
-    try:
-        provider = resolve_chat_provider(db)
-        reply = await provider.chat(messages, system=SYSTEM_PROMPT)
-    except ProviderNotConfigured as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+        try:
+            provider = resolve_chat_provider(db)
+        except ProviderNotConfigured as e:
+            raise HTTPException(status_code=503, detail=str(e))
 
-    await _maybe_capture_lead(
-        db, provider, req.history, req.message, current.email, req.attachment_url, attachment_info
-    )
+        # Order extraction and lead extraction (2026-08-20) are both
+        # independent classification calls over the same conversation —
+        # neither needs the other's output, and neither needs the main
+        # reply's output either (lead capture is applied post-reply,
+        # below, but the call itself doesn't read `reply`). Kicking both
+        # off concurrently here, instead of one-after-another, cuts a
+        # real chunk of latency off a turn that triggers both (a slow
+        # local 27B model measured ~50s across 3 serial calls for one
+        # order-taking turn — see AGENTS.md's "Known gotchas"). Only the
+        # main reply itself still has to wait for order extraction to
+        # resolve (below), since its context needs the real
+        # order/total — see this module's "Product ordering" section.
+        order_extraction_task = (
+            asyncio.create_task(_order_extraction_call(provider, req.history, req.message, active_order))
+            if products
+            else None
+        )
+        lead_extraction_task = asyncio.create_task(
+            _lead_extraction_call(
+                provider,
+                req.history,
+                req.message,
+                current.email,
+                req.attachment_url,
+                attachment_info,
+                intent_schemas,
+                active_schema,
+                active_entry,
+            )
+        )
 
-    if session is not None:
-        db.add(ChatMessage(session_id=session.id, role="assistant", content=reply))
-        db.commit()
+        order_parsed = await order_extraction_task if order_extraction_task is not None else None
+        order_turn = _resolve_order_turn(db, order_parsed, active_order) if products else _EMPTY_ORDER_TURN
+        order_turn_block = _order_turn_context_block(active_order, order_turn)
+        if order_turn_block:
+            user_content = f"{order_turn_block}\n\n{user_content}"
 
-    return ChatResponse(reply=reply, sources=sources)
+        user_content = (
+            f"{user_content}{_attachment_note(req.attachment_url)}{_attachment_info_note(attachment_info)}"
+        )
+
+        messages = [{"role": turn.role, "content": turn.content} for turn in req.history]
+        messages.append({"role": "user", "content": user_content})
+
+        try:
+            reply = await provider.chat(messages, system=SYSTEM_PROMPT)
+        except ProviderNotConfigured as e:
+            # lead_extraction_task was already started concurrently above
+            # (see this section's comment) — if the main reply fails, it's
+            # about to be abandoned unawaited, so cancel it explicitly
+            # rather than leaving it running in the background for no
+            # caller to ever use the result of.
+            lead_extraction_task.cancel()
+            raise HTTPException(status_code=503, detail=str(e))
+        except httpx.HTTPError as e:
+            lead_extraction_task.cancel()
+            raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+
+        lead_parsed = await lead_extraction_task
+        _apply_lead_capture(
+            db,
+            lead_parsed,
+            current.email,
+            req.attachment_url,
+            attachment_info,
+            chat_session_id,
+            intent_schemas,
+            active_schema,
+            active_entry,
+        )
+
+        apply_resolved_order_turn(db, chat_session_id, current.email, active_order, order_turn)
+
+        if session is not None:
+            db.add(ChatMessage(session_id=session.id, role="assistant", content=reply))
+            db.commit()
+
+        response_products, search_link = _order_turn_response_fields(order_turn)
+        return ChatResponse(reply=reply, sources=sources, products=response_products, search_link=search_link)
+    finally:
+        chat_request_finished()

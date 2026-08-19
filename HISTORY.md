@@ -2779,6 +2779,257 @@ not connected" again. Every verification above went through
 curl/`tsc`/`eslint`/direct backend calls instead, same posture as every
 other UI change this project has shipped without a live click-through.
 
+### 2026-08-19 (continued) — local resource coordination between chat/vision and ComfyUI
+
+User's stated goal: build this as a real MVP capability ("这样这个mvp才
+会比较完善有卖点" — so this MVP would be more complete, have a selling
+point), not just personal convenience — should work on their own
+memory-constrained GPU machine and generalize to a visitor with no GPU
+at all.
+
+Before designing anything, spent the first part of this session
+gathering real facts rather than assuming. User's own screenshots: Task
+Manager showed system RAM at 95% (29.8/31.4GB) with 76% disk I/O
+(consistent with paging), while GPU *compute* utilization read only 5%
+— their own read of this was "GPU isn't stressed." Resource Monitor's
+top RAM consumer by Commit was `python.exe` at 48GB (confirmed by the
+user to be ComfyUI, launched via `python main.py`), but its Working Set
+was only 1.4GB — Commit and Working Set diverge a lot for a PyTorch
+process, so this alone didn't pin down the real physical-memory culprit.
+
+Queried the user's actual running services directly (all via curl) to
+find out what's really available, rather than guessing:
+- `llama-server.exe --help` (chat/vision router, port 8080) revealed
+  real, already-existing flags: `--models-max` (default 4, router
+  auto-evicts beyond this), `--models-autoload` (default enabled),
+  `--sleep-idle-seconds` (default -1/disabled).
+- `GET http://127.0.0.1:8080/v1/models` showed each model carries a live
+  `status.value` (`"loaded"`/`"unloaded"`) — the router already tracks
+  this.
+- Probed for an explicit unload endpoint by trying several plausible
+  paths; `POST /models/unload` (bare, not under `/v1`) returned a
+  *different* error shape (`"model is not found"`) than the definitely-
+  nonexistent paths (`"File Not Found"`), confirming the route was real.
+  Confirmed the exact payload shape by actually calling it —
+  `{"model": "Qwen3.8_Uncensored"}` → `{"success": true}` — a real,
+  live side effect on the user's running system (immediately verified
+  it flipped to `"unloaded"` via `/v1/models`; not destructive, just an
+  eviction the router reloads on its own next request).
+- `GET http://127.0.0.1:8188/system_stats` (ComfyUI) confirmed live
+  per-device `ram_free`/`vram_free` reporting. Its GPU device entry was
+  the real surprise: an RTX 5090 Laptop GPU with 25.65GB total VRAM, but
+  only 4.16GB free (~84% used) — directly contradicting the user's
+  "GPU isn't stressed" read, which was based on compute % (5%), not
+  memory occupancy. VRAM can be fully occupied by an idle, loaded model
+  while compute utilization sits near zero — worth surfacing back to
+  the user as a real correction to their mental model.
+- `POST http://127.0.0.1:8188/free` with a no-op body
+  (`{"unload_models": false, "free_memory": false}`) confirmed the route
+  exists (200) without actually freeing anything, before committing to
+  a design around it.
+
+This reconnaissance directly reshaped the design that got built. The
+original ask ("LLM and agent both need to step aside for SD, then get
+resources back") sounded like it needed a from-scratch scheduler; the
+actual gap turned out to be much narrower — llama.cpp and ComfyUI both
+already have real memory-release primitives, nothing was calling them at
+the right moments, and nothing was deciding *whether* to (unconditional
+unload-before-every-generation would cost a real reload delay on the
+next chat turn — this session's own earlier measurement was 159s cold
+for the user's 27B model).
+
+Built `backend/resource_broker.py` — `maybe_release_llm_memory(db,
+comfyui_base_url)` (checks ComfyUI's own free-memory numbers first, only
+unloads the chat/vision model if actually below a configurable headroom;
+`AppSettings.resource_coordination_headroom_mb`, default 4096MB) and
+`release_comfyui_memory(base_url)` (always called after a ComfyUI job,
+no threshold — freeing has no reload-latency downside). Wired into
+`generate_poster` (before) and `ComfyUIImageProvider.generate()`'s
+`finally` (after, so every caller benefits, not just `generate_poster`).
+Both swallow every failure — this is an optimization, never allowed to
+break a real generation. Gated behind `AppSettings.
+resource_coordination_enabled` (off by default) — zero cost for anyone
+not running local processes (cloud-only OpenAI/Anthropic setups).
+New migration adding both `AppSettings` columns.
+
+Verified end-to-end against the user's actual live setup, not mocked:
+(1) force-loaded the chat model via a real chat-completion call,
+confirmed `"loaded"` via `/v1/models`; (2) enabled coordination with a
+deliberately huge headroom (999999MB, guaranteed "tight"), called
+`generate_poster` (real 200, real new image), confirmed the model
+flipped back to `"unloaded"` and ComfyUI's `/system_stats` showed VRAM
+free jump from ~4GB to ~23GB after the job; (3) re-loaded the model,
+lowered headroom to a realistic 512MB (easily cleared by the now-freed
+memory), called `generate_poster` again, confirmed the model correctly
+*stayed loaded* — the skip-when-not-tight path working as designed,
+avoiding an unnecessary reload cost. Left the feature enabled at the
+resting default (4096MB) rather than reverting to disabled, since it's
+a real, tested improvement for the user's actual constrained setup.
+
+**Follow-up, same day**: user pushed back on the v1 scope cut ("true
+concurrent-request contention... isn't handled") the moment it was
+raised — their own framing: an interrupted visitor chat is a real UX
+problem for a product whose whole point is capturing leads through the
+chatbot, and they'd prioritize protecting that over the owner's own
+poster-generation convenience. Agreed and closed the gap: added
+`resource_broker.has_active_chat_requests()`, backed by a plain
+module-level counter (`chat_request_started`/`chat_request_finished`,
+same single-uvicorn-worker assumption `rate_limit.py`'s in-memory
+limiter already documents — no cross-process coordination needed).
+`apis/chat.py`'s whole `/api/chat` handler body (attachment analysis
+through the final `return`) now runs inside `try/finally` holding this
+counter for the entire turn, not just the main reply call, since one
+turn can trigger up to 3 chat/vision router calls.
+`maybe_release_llm_memory` now refuses outright whenever the counter is
+nonzero, before even checking the memory-pressure threshold.
+
+Verified with a real concurrency test, not just unit-level reasoning:
+force-loaded the model, launched a real `/api/chat` call in the
+background (a genuine multi-second local-LLM round trip), and — while it
+was still in flight — fired `generate_poster` with the headroom forced
+impossibly high (999999MB, guaranteed "tight"). The model stayed
+`"loaded"` through that call, confirming the guard actually held under a
+real overlapping request rather than just in isolated calls. Once the
+background chat's own response came back (confirmed a real 200 with
+actual reply content), immediately reran `generate_poster` with the same
+settings — this time the model correctly flipped to `"unloaded"`,
+confirming the counter cleanly returned to 0 and didn't get stuck. Left
+explicitly unclosed: a visitor's *next* message landing just after an
+unload-and-reload cycle has already started (the counter was 0 at the
+moment `maybe_release_llm_memory` checked, then a new turn arrives
+mid-reload) — narrowing that further needs real request queueing, sized
+as a separate, bigger piece of work if it's ever needed.
+
+### 2026-08-19 (continued) — owner-agent gets a queryable DB action-log and a generate_landing_page tool
+
+Picked up two items straight off the "still open" list from earlier this
+session: the JSONL-only action log, and `generate_landing_page` never
+having been wired into owner-agent's tool allowlist.
+
+**DB action-log**: added `OwnerAgentRun` (`backend/models.py`) — one row
+per completed run (command, final_answer, stopped_reason, the full step
+trace as JSONB, owner_email, created_at), new migration `f3c8d2a5e6b1`.
+Deliberately additive, not a replacement: `owner-agent/logging_.py`'s
+per-step `logs/runs.jsonl` write stays exactly as it was — owner-agent is
+still DB-less by design (see its own main.py docstring), so that file
+remains its only durable record if the new backend call ever fails.
+`main.py`'s `/run` handler now also calls a new `POST
+/agent/owner-agent/runs` once per completed run (best-effort — a logging
+failure never fails the response the owner is waiting on);
+`owner_email` comes off the same forwarded bearer token every tool call
+already carries, not a client-supplied field. `GET
+/agent/owner-agent/runs` (paginated via `limit`, newest-first) is what
+actually makes this queryable. `OwnerAgentPanel` renders the result as a
+collapsed "Recent runs" list under the live-run UI, refetched after every
+new run.
+
+**`generate_landing_page` as a tool**: the original exclusion reason
+("takes an image upload, doesn't fit a text-command tool") was real, but
+the actual fix turned out narrower than a redesign — asking a
+text-generation model to reproduce a whole image as base64 inside its own
+JSON tool-call args is neither reliable nor something it should ever be
+asked to do, so the tool takes a **URL** to an already-uploaded image
+instead. The owner uploads a design image via the dashboard's media
+library (or CTE's Upload tab, which already existed) first, gets a URL
+back, then references it in their command to owner-agent.
+
+Implementation: refactored `apis/agent.py`'s `generate_landing_page` route
+— extracted the actual vision-call/parse/validate logic into a shared
+`_generate_landing_page_sections(db, image_b64, notes)` helper — then
+added a sibling route, `POST /agent/landing-page/generate-from-url`,
+which resolves the given URL back to a real local file via a new
+`apis/media.py::resolve_media_local_path` (deliberately mirrors
+`chat_attachments.resolve_local_path`'s exact paranoid shape: exact
+prefix match, exactly one path segment, a `resolve()`-based containment
+check before ever touching disk — copied the pattern rather than
+inventing a new one), reads the bytes, base64-encodes, and calls the same
+shared helper. `owner-agent/tools.py` gained the `generate_landing_page`
+tool pointing at this new route — genuinely just another plain-JSON-args
+tool, no special-casing needed in `execute_tool`, since the model only
+ever has to produce a URL string and an optional notes string, never
+image bytes. Also gave `ToolSpec` a per-tool `timeout` field (this tool
+sets 620s) — the shared 200s default (sized for poster generation) would
+have cut off a slow vision+JSON generation mid-call, since backend itself
+already budgets up to 600s for that single call.
+
+Verified end-to-end, not just per-piece: uploaded a real PNG to the media
+library (`POST /agent/media/upload`), called
+`generate-from-url` directly first (200, real generated sections,
+isolating backend correctness before trusting the LLM to pick the right
+tool) — then ran the actual thing through `owner-agent`'s real `/run`
+with the natural-language command "Generate a landing page from this
+design image: <url>". The model correctly chose `generate_landing_page`
+(not any other tool), correctly extracted the URL into `args`, got back
+real generated sections, and — reading its own tool's description
+faithfully — closed with a final answer explicitly noting the result
+wasn't saved/published yet and telling the owner to review it in the Page
+generator panel. Confirmed the DB write actually happened too: `GET
+/agent/owner-agent/runs` returned exactly one row, correct owner email,
+correct step count (2: the tool call + the final answer), correct
+command text.
+
+### 2026-08-19 (continued) — Dockerfiles run as non-root, requirements.txt pinned
+
+Closed the last two items from the running security-audit list. Both
+looked mechanical going in; both surfaced a real bug on the first
+attempt, exactly the "needs care around file-permission implications"
+warning this was flagged with earlier in the project.
+
+**`requirements.txt` pinning**: straightforward — pulled exact currently-
+installed versions via `pip freeze` inside the running `backend`/
+`owner-agent` containers (not guessed upper bounds) and rewrote both
+files from `>=`/unconstrained to `==`. Rebuilt both images to confirm a
+fresh install with the pinned file still resolves cleanly.
+
+**Non-root Dockerfiles**: added `appuser` (uid/gid 1000) to `backend`/
+`owner-agent`'s `python:3.11-slim` images (`groupadd`/`useradd`, `chown
+-R` before `USER` switches) and switched `frontend` to `node:22-slim`'s
+already-built-in `node` user. Rebuilt all three, recreated containers.
+
+Two real breakages found immediately, neither hypothetical:
+
+1. **`frontend` crashed on first boot**: `next dev` threw `EACCES:
+   permission denied, mkdir '/app/.next/dev'`. Root cause: `.next` is
+   listed in `frontend/.dockerignore` (Next only ever creates it at
+   runtime, never present in the built image), so the Dockerfile's
+   `chown -R node:node /app` had nothing at that path to act on — when
+   Docker created the fresh anonymous volume for `/app/.next` (see
+   docker-compose.yml), it seeded it from the image with whatever was
+   there, which was nothing, so the volume came up as an empty,
+   root-owned directory by Docker's own default. Fixed by adding
+   `mkdir -p /app/.next` immediately before the `chown` line, giving both
+   the chown and the volume-seed something real to work with. Verified
+   via `docker compose run --rm --entrypoint sh frontend -c "ls -la
+   /app/.next"` before the fix (root-owned) and after
+   (`node`-owned), then a real `docker compose up -d --renew-anon-volumes
+   frontend` + `curl /dashboard` (200, no crash) to confirm.
+2. **`backend` couldn't write to any of its upload directories**:
+   `touch /app/storage/documents/.write_test` → `Permission denied`.
+   Root cause: unlike `frontend`'s anonymous volumes, `backend`'s entire
+   `/app` (including `storage/`) is a straight bind mount from the host
+   (`./backend:/app`) — the Dockerfile's build-time `mkdir`/`chown` are
+   completely moot here, since the bind mount shadows the image's `/app`
+   entirely at container start. The actual `documents`/`media`/
+   `chat_uploads` subdirectories already existed on disk from real
+   uploads earlier this project (mode `755`, root-owned — created back
+   when the container ran as root). A one-time `docker compose exec -u
+   root backend chown -R appuser:appuser /app/storage` fixed it; this is
+   a migration concern for *this existing checkout*, not an ongoing code
+   issue (anything `appuser` creates from now on is appuser-owned
+   automatically). `owner-agent`'s `./owner-agent/logs:/app/logs` bind
+   mount, by contrast, was already writable with no extra step needed —
+   confirms this needs checking per-directory, not assumed uniform across
+   every bind mount.
+
+Verified both fixes with real writes, not just `whoami`/`id`/`touch`: a
+genuine `POST /agent/documents/ingest` (chunked, embedded, ended up
+`status: "ready"`, deleted afterward — no leftover test data) through
+the now-non-root `backend`, and `next dev` actually serving `/dashboard`/
+`/chat` (`200`) through the now-non-root `frontend`. Also re-ran the
+full regression sweep after recreating all three containers — chat
+completion, owner-agent health, `/agent/settings`, both frontend
+routes — all green, nothing else broke from the rebuild.
+
 **Committed for the first time in a while** — `a2218be`, 62 files, the
 full accumulated backlog (this session's work plus the prior session's
 owner-agent/rate-limiting/chat-attachments/CRM work that had never been
@@ -2790,3 +3041,204 @@ empty 1-page placeholder PDF, not real content), a personal
 `Video Project (10mb).mp4`, and a 51MB `materials/` folder of local
 test/reference assets (sample PDFs, design screenshots, wix template
 dumps).
+
+### 2026-08-19 (continued) — owner-configurable structured data collection (intent schemas), validated against insurance
+
+User laid out a genuinely large vision: a framework (not an insurance-
+specific feature) where an owner defines what information the public
+chatbot needs to collect for a given kind of request, and the bot
+collects it conversationally without ever re-asking for something
+already given — generalizing across verticals (insurance, real estate, a
+clinic, a restaurant, a law firm, personal e-commerce, ...) purely by
+what the owner configures, not by writing new code per industry. Also
+touched on RAG-based recommendation ("suggest the right policy") and
+URL-based document auto-embed as part of the same bigger picture.
+
+Rather than immediately building the whole vision, walked through what
+already existed (RAG document embedding — real, already verified this
+session; the chat's automatic lead-capture classification — real, but a
+fixed 4-category enum with no way to define custom fields; no dedup or
+merge logic at all in `_maybe_capture_lead`, which today always inserts
+a brand-new `CrmEntry` even mid-conversation) versus what was genuinely
+new, then used `AskUserQuestion` to pin down three foundational decisions
+before designing anything: (1) owner defines collection rules via a
+**structured form** (field name/type/required/scenario), not free text
+for the model to interpret; (2) dedup is **scoped to the current chat
+session only**, not cross-session by visitor identity, but *within* that
+scope must look up an already-created record **by its own id** and
+compare against what's still missing, not re-derive from scratch each
+turn; (3) validate against **insurance** first (the vertical described in
+the most detail) before generalizing further. Recommendation and
+URL-based auto-embed were explicitly scoped OUT of this round — separate
+concerns layered on already-working RAG, not required to prove the
+collection mechanism itself.
+
+**Design**: two new tables, `IntentSchema` (key/label/description — an
+owner-defined "kind of request") and `IntentField` (field_key/label/
+field_type/required/prompt_hint/sort_order, cascade-deleted with its
+schema). `CrmEntry` gained three nullable columns:
+`intent_schema_id` (which schema this row is an instance of),
+`collected_fields` (JSONB, `{field_key: value}`), and `chat_session_id`
+(FK to the already-existing `ChatSession.id` — the join key that makes
+same-session lookup possible without inventing a new identity concept,
+since every `/api/chat` turn with a `session_id` already resolves/creates
+one). New admin/owner router `backend/apis/intent_schemas.py`
+(list/create/update-whole-schema/delete, mirrors `apis/documents.py`'s
+gating pattern) plus a new `IntentSchemaPanel` dashboard component
+(structured form: key/label/description + a repeatable field-row editor)
+added to the "CRM & reporting" accordion group above `CrmPanel`.
+
+**The real behavior change is in `apis/chat.py`**. Read `_maybe_capture_lead`
+and `_lead_extraction_system_prompt` in full before touching anything —
+confirmed the exact gap: today's flow always INSERTs, never looks up or
+updates. Rewrote both:
+- `_lead_extraction_system_prompt` now builds its classification options
+  *from the owner's configured schemas* (each schema's key/label/
+  description becomes a category, its fields become extractable targets)
+  when any exist, falling back to the original fixed
+  appointment/quote/claim/inquiry four byte-for-byte when the owner
+  hasn't configured any.
+- New `_find_active_entry(db, chat_session_id)` — the most recent
+  `CrmEntry` matching `(chat_session_id, intent_schema_id IS NOT NULL)`.
+  When found, its `collected_fields` feed BOTH the extraction prompt (so
+  the model only reports newly-found values, told explicitly not to
+  null out anything it doesn't have new info for) AND — this took a
+  second pass, the first draft only wired it into the extraction call —
+  the main reply's own context via a new `_in_progress_context_block`
+  (mirroring `_build_visitor_context`'s existing pattern), because the
+  classification call alone updating `collected_fields` silently
+  wouldn't stop the assistant's own conversational reply from re-asking
+  for something it already had. `SYSTEM_PROMPT` gained a clause teaching
+  the model what a `(In-progress ...)` context line means.
+- On a hit against the same `(session, schema)`, `_maybe_capture_lead`
+  now `dict`-merges new field values into the existing row and commits —
+  no second INSERT. On a miss, or when no schemas are configured at all,
+  behavior is unchanged: a fresh `CrmEntry`.
+- **A real, deliberate tradeoff, flagged rather than hidden**: the
+  original narrow gate (`_LEAD_EMAIL_RE`/known email/attachment — most
+  turns aren't leads, so most turns skip the extra LLM call) doesn't work
+  for multi-turn structured collection (e.g. "what's your policy number"
+  with no email anywhere yet) — extraction now runs on *every* turn once
+  the owner has configured at least one schema. Zero added cost for an
+  owner who hasn't touched the feature.
+- Also caught and fixed along the way: `CrmEntryResponse`
+  (`apis/agent.py`, backs `GET/POST /agent/crm/entries`) didn't expose
+  the two new columns at all — the API would have silently hidden
+  `collected_fields` from the dashboard even though the DB write was
+  correct, not discovered until checking why the CRM panel had nothing
+  to render.
+
+**Verified end-to-end against the real chat pipeline, not unit-level
+reasoning**: (1) regression — sent a plain appointment-shaped message
+with zero schemas configured, confirmed the exact same `category:
+"appointment"` capture as before this feature existed, one row, deleted
+after; (2) created two real schemas via the API
+(`insurance_claim`: policy_number/incident_date/incident_description;
+`insurance_application`: full_name/date_of_birth/desired_policy_type);
+(3) a real 3-turn `/api/chat` conversation (same `session_id`
+throughout) dribbling out a claim: turn 1 gave only an email (reply
+correctly asked for policy/incident details, not generic questions) →
+turn 2 gave the policy number (reply acknowledged it and asked only for
+the remaining two fields, did NOT re-ask for the email) → turn 3 gave
+the incident date/description (reply recognized everything was now
+collected and gave a clean confirmation summary instead of continuing to
+ask questions). `GET /agent/crm/entries` after each turn confirmed
+**exactly one row** throughout (same `crm_id`), `collected_fields`
+accumulating `policy_number` → `+incident_date` → `+incident_description`
+across the three calls, never a second partial row. Deleted the test
+entry afterward, kept the two schemas as a working example in the
+dashboard for the user to explore.
+
+### 2026-08-19 (continued) — owner-agent-generated review queues
+
+Immediate follow-on to the intent-schema work above. User confirmed the
+schema side (dashboard form) was sufficient as-is, then described the
+next layer in real detail: rather than a hand-built "Policy" entity with
+a fixed approval workflow, **owner-agent itself should generate the
+review/approval queue** from a plain-language request — "I want to
+generate a user list from CRM insurance applications, see who's
+interested, record it for me to approve" — figuring out the right
+statuses (defaulting sensibly, e.g. approved/rejected/pending, if the
+owner doesn't specify) and letting the owner/admin click through entries
+and change status. Explicit framing: "因为每一个owner的需求都不一样,
+所以我们主要做一个框架,让agent完成custom的部分" (every owner's needs
+differ, so build a framework and let the agent handle the custom part).
+
+Before designing, confirmed one real architectural constraint directly
+with the user rather than assuming: owner-agent's `/run` loop can't
+pause mid-execution for a genuine back-and-forth — it runs autonomously
+to a turn limit and returns one final answer (see agent_loop.py's
+existing turn-budget design). So "the agent asks the owner to confirm
+what's missing" (as the user originally described it) can't literally
+block and wait; confirmed the accepted shape instead: apply a sensible
+default, state the assumption plainly in the final answer, and the owner
+sends a follow-up command to adjust — no new human-in-the-loop pause/
+resume machinery needed. This also directly served the user's other
+stated goal ("不想给owner agent太大的工作量" — don't want to give
+owner-agent too much workload): a single deterministic upsert call is
+much simpler and more reliable for a tool-calling model than a genuinely
+interactive multi-turn negotiation would have been.
+
+**Design**: new `IntentView` model (`intent_schema_id`, `name`,
+`description`, `status_options: JSONB`) — one row per schema in
+practice, enforced by upsert-by-`schema_key` semantics in the API
+(`POST /agent/intent-views`) rather than a DB constraint, specifically
+so a follow-up owner-agent command adjusts the same queue instead of
+needing to track a numeric id across separate `/run` calls. New
+owner-agent tools: `list_intent_schemas` (so the model checks what
+schemas actually exist before guessing a `schema_key` — added
+specifically to prevent exactly the kind of mismatch a blind guess could
+produce) and `manage_review_queue` (the upsert call itself).
+`CrmStatusUpdateRequest.status` (`apis/agent.py`) widened from
+`Literal["new","contacted","closed"]` to plain `str` — the DB column was
+already an unconstrained `String(16)`, so the `Literal` was purely an
+API-level relic that would have rejected a queue's own custom statuses
+like `"approved"`. New frontend `ReviewQueuePanel`, its own top-level
+accordion group ("Review queues," not folded into "CRM & reporting" —
+the user explicitly asked for this to live somewhere distinct) —
+deliberately no dashboard form to create/edit a queue's own definition,
+since that's the one piece meant to stay agent-driven per the confirmed
+workflow. Email/SMS notification on status change is explicitly
+deferred by the user ("邮件应该有template,晚点再做这部分") — no
+template system, no sending infra, no stub/dead code for it either.
+
+**A real regression surfaced immediately on the first live test** — the
+very first `POST /run` for "I want to review insurance applications..."
+came back 500. Backend traceback pointed at `owner-agent/logging_.py`'s
+`log_step`: `PermissionError: [Errno 13] Permission denied:
+'logs/runs.jsonl'`. Root cause: the non-root Dockerfile switch earlier
+today only actually verified that a *fresh* file could be written into
+`/app/logs` (a `touch .write_test` succeeded, since creating a new file
+only needs the directory to be writable) — but `runs.jsonl` itself
+already existed on disk from before the switch to `appuser`, still owned
+by `root` with mode `644` (owner-write only). Appending to an *existing*
+file needs write permission on the file itself, not just the directory
+containing it — a real gap in the earlier verification, not something
+the earlier test was wrong about, just incomplete (it happened to test
+the empty/non-existent-file case, not the pre-existing-file case).
+Fixed identically to the `backend/storage/` case from earlier: `docker
+compose exec -u root owner-agent chown -R appuser:appuser /app/logs`,
+confirmed with a real `>>` append, then reverted the one-line test
+append so the log file stayed clean (removed via `head -n -1` rather
+than leaving junk in a real audit log).
+
+**Re-ran the exact same command after the fix — worked exactly as
+designed**: the model called `list_intent_schemas` first (unprompted
+beyond the tool's own description), correctly disambiguated
+`insurance_application` from `insurance_claim` based on the owner's
+wording, called `manage_review_queue` with the three default statuses
+since none were specified, and closed with a final answer explicitly
+naming the default and inviting a follow-up to change it — matching the
+confirmed design point-for-point. Verified the upsert semantics
+separately too (direct API calls, not just the agent path): called
+`POST /agent/intent-views` twice for the same `schema_key` with
+different `status_options`, confirmed one row throughout (same `id`,
+same `created_at`), not two. Then a real chat turn giving name/DOB/
+desired-policy-type all at once correctly populated all three
+`collected_fields` in a single shot (nothing left missing, so the
+model's reply moved on to other helpful questions instead of asking
+about fields it already had), and `PATCH .../status` with `"approved"`
+— which would have 422'd under the old `Literal` — succeeded cleanly.
+Deleted the test CRM entry afterward; kept the "Insurance Applications"
+review queue and both intent schemas as working examples in the
+dashboard.

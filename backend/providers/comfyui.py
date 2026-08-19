@@ -50,6 +50,7 @@ from apis.api import (
     _wait_for_completion_impl,
 )
 from providers.base import normalize_loopback_host
+from resource_broker import release_comfyui_memory
 
 
 class ComfyUIImageProvider:
@@ -108,6 +109,17 @@ class ComfyUIImageProvider:
         return {"prompt": workflow, "client_id": str(uuid.uuid4())}
 
     async def generate(self, prompt: str) -> tuple[str, bytes]:
+        try:
+            return await self._generate(prompt)
+        finally:
+            # Always attempted, success or failure, regardless of caller —
+            # see resource_broker.py's docstring for why this has no
+            # reload-latency downside the way unloading the chat model
+            # does (so no threshold check here, unlike
+            # maybe_release_llm_memory on the way in).
+            await release_comfyui_memory(self.base_url)
+
+    async def _generate(self, prompt: str) -> tuple[str, bytes]:
         if self.custom_workflow is not None:
             payload = self._build_custom_payload(prompt)
         else:
@@ -137,8 +149,16 @@ class ComfyUIImageProvider:
 
         # Budget minutes, not seconds — same as every other generation
         # workload in this codebase (see providers/*.py's chat timeouts).
+        # client_id MUST be the same one submitted in `payload` above, or
+        # ComfyUI never routes this prompt's completion event to our
+        # websocket — see _wait_via_websocket's docstring in apis/api.py.
         outcome = await _wait_for_completion_impl(
-            prompt_id, timeout=180.0, base_url=self.base_url, public_url=self.public_url, ws_url=self.ws_url
+            prompt_id,
+            timeout=180.0,
+            base_url=self.base_url,
+            public_url=self.public_url,
+            ws_url=self.ws_url,
+            client_id=payload["client_id"],
         )
         if outcome["status"] != "completed":
             raise HTTPException(status_code=502, detail=f"Image generation did not complete: {outcome}")

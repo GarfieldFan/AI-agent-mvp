@@ -17,6 +17,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Runs as a non-root user (2026-08-19 security-audit fix) — logs/ is
+# where logging_.py writes runs.jsonl (bind-mounted over at runtime, see
+# docker-compose.yml, but created here too for a fresh checkout). chown
+# must happen before USER switches.
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid appuser --create-home appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
 EXPOSE 8100
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8100", "--reload"]

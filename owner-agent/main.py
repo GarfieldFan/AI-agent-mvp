@@ -18,6 +18,7 @@ import os
 
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,6 +26,7 @@ from pydantic import BaseModel
 from agent_loop import RunResult, run_owner_agent
 from deps import require_owner
 from logging_ import log_step
+from tools import BACKEND_URL
 
 app = FastAPI()
 
@@ -67,6 +69,30 @@ class RunResponse(BaseModel):
     steps: list[StepResponse]
 
 
+async def _log_run_to_backend(command: str, result: RunResult, bearer_token: str) -> None:
+    """Best-effort — persists a queryable record of this run
+    (backend/models.py's OwnerAgentRun) alongside logging_.py's own
+    per-step JSONL write, which stays as the durable fallback this
+    service can always fall back on (owner-agent has no DB of its own
+    by design, see this module's docstring). Never raises: a logging
+    failure must never turn into a failed run response for the owner
+    who's actually waiting on the answer."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{BACKEND_URL}/api/agent/owner-agent/runs",
+                json={
+                    "command": command,
+                    "final_answer": result.final_answer,
+                    "stopped_reason": result.stopped_reason,
+                    "steps": [vars(s) for s in result.steps],
+                },
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+    except httpx.HTTPError:
+        pass
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(req: RunRequest, bearer_token: str = Depends(require_owner)) -> RunResponse:
     command = req.command.strip()
@@ -77,6 +103,7 @@ async def run(req: RunRequest, bearer_token: str = Depends(require_owner)) -> Ru
         log_step(command, step)
 
     result: RunResult = await run_owner_agent(command, bearer_token, on_step=on_step)
+    await _log_run_to_backend(command, result, bearer_token)
 
     return RunResponse(
         final_answer=result.final_answer,

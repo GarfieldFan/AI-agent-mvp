@@ -46,6 +46,13 @@ export type ChatControl = {
   options?: ChatOption[];
 };
 
+export type ChatProductCard = {
+  id: number;
+  name: string;
+  price: number;
+  image_url?: string | null;
+};
+
 export type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -58,5 +65,14 @@ export type ChatMessage = {
    * attachment (see lib/chat.ts's uploadChatAttachment) — local-only
    * rendering, never sent back by the backend on the assistant's reply. */
   attachmentUrl?: string;
+  /** 1-5 product cards from ChatResponse.products (2026-08-19,
+   * backend/apis/chat.py's `_order_turn_response_fields`) — an order
+   * confirmation, a disambiguation prompt, or plain browse results.
+   * Mutually exclusive with searchLink. */
+  products?: ChatProductCard[];
+  /** Set instead of `products` when a search/browse phrase matched more
+   * than the display cap — a link to /search?q=... instead of inline
+   * cards. */
+  searchLink?: string;
   createdAt: string;
 };

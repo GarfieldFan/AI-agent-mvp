@@ -1,31 +1,40 @@
-# 1. 使用轻量级且稳定的 Python 3.11 镜像
 FROM python:3.11-slim
 
-# 2. 设置工作目录
 WORKDIR /app
 
-# 3. 设置环境变量：防止 Python 产生 .pyc 编译文件，并开启无缓冲输出（实时看 log）
+# Prevent Python from writing .pyc files, and enable unbuffered stdout/
+# stderr so logs show up in real time.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 4. 安装基础系统依赖（如 PostgreSQL 链接和网络请求所需的基础库）
+# System deps needed to build psycopg2-binary and talk to Postgres.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 5. 先复制依赖文件（充分利用 Docker 缓存机制，加快后续重新 build 的速度）
+# Dependencies copied and installed before the rest of the source so this
+# layer stays cached across source-only changes.
 COPY requirements.txt .
-
-# 6. 安装 Python 依赖包
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 7. 复制你的 FastAPI 后端所有源码到容器内
 COPY . .
 
-# 8. 暴露 FastAPI 运行的 8000 端口
+# Runs as a non-root user (2026-08-19 security-audit fix) rather than
+# root, the image's default. storage/ is where apis/documents.py and
+# apis/media.py write uploads — created here (in addition to whatever
+# the ./backend bind mount already has, see docker-compose.yml) so a
+# fresh checkout without it yet still works. chown must happen before
+# USER switches — a non-root process can't chown files it doesn't
+# already own.
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid appuser --create-home appuser \
+    && mkdir -p /app/storage/documents /app/storage/media \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
 EXPOSE 8000
 
-# 9. 启动命令：使用 uvicorn 运行主程序（假设你的主入口是 main.py 里的 app）
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

@@ -1,6 +1,7 @@
 import Link from "next/link";
-import { Sparkles } from "lucide-react";
+import { ShoppingCart, Sparkles } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { Container } from "@/components/layout/container";
 import { NavLink } from "@/components/layout/nav-link";
 import { MobileNav } from "@/components/layout/mobile-nav";
@@ -24,6 +25,12 @@ export function SiteHeader() {
         </nav>
 
         <div className="flex items-center gap-2">
+          {/* No live item-count badge — that would need a cart fetch on
+              every page load just for a header icon; /cart itself always
+              shows the real count. */}
+          <Button variant="ghost" size="icon" aria-label="Cart" nativeButton={false} render={<Link href="/cart" />}>
+            <ShoppingCart className="size-4" />
+          </Button>
           <AuthStatus />
           <ModeToggle />
           <div className="md:hidden">

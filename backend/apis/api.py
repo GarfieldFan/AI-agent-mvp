@@ -362,6 +362,7 @@ async def _wait_via_websocket(
     ws_url: str = COMFYUI_WS_URL,
     base_url: str = COMFYUI_URL,
     public_url: str = COMFYUI_PUBLIC_URL,
+    client_id: Optional[str] = None,
 ):
     """Try to catch ComfyUI's completion event over its native websocket
     instead of polling. Returns a result dict on a definitive outcome
@@ -370,9 +371,27 @@ async def _wait_via_websocket(
     back to plain polling rather than trusting the socket for the whole
     timeout budget (protects against dropped connections/missed events).
 
+    `client_id` MUST be the same client_id that was submitted alongside
+    the /prompt request that produced `prompt_id`, or this will never see
+    a single event for it: ComfyUI's server routes "executing"/"progress"/
+    "executed" messages only to the websocket connection whose clientId
+    matches the submission's client_id (it does not broadcast them to
+    every connected socket). Connecting with a fresh, unrelated client_id
+    (the old behavior here) means this call always burns its full
+    per-recv timeout waiting for events that can never arrive, silently
+    degrading every wait into "however long the polling fallback below
+    takes to next notice the job already finished" — found from a real
+    report of ComfyUI finishing in ~6s but the image not showing up in
+    the app for ~30s (exactly this function's 30s per-recv cap). If
+    `client_id` isn't supplied (e.g. a caller that never had it, like the
+    plain /wait/{prompt_id} route below), we still generate a throwaway
+    one so the connection succeeds, but it degrades to the same always-
+    times-out behavior as before — the fix requires the caller to have
+    and pass the real submission client_id.
+
     `ws_url`/`base_url`/`public_url` default to the env-var-configured
     instance — see _fetch_history_result's docstring for why."""
-    ws_client_id = str(uuid.uuid4())
+    ws_client_id = client_id or str(uuid.uuid4())
     uri = f"{ws_url}?clientId={ws_client_id}"
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -428,6 +447,7 @@ async def _wait_for_completion_impl(
     base_url: str = COMFYUI_URL,
     public_url: str = COMFYUI_PUBLIC_URL,
     ws_url: str = COMFYUI_WS_URL,
+    client_id: Optional[str] = None,
 ) -> dict:
     """The actual implementation behind the /wait route below — kept
     separate so base_url/public_url/ws_url overrides (providers/comfyui.py's
@@ -435,7 +455,11 @@ async def _wait_for_completion_impl(
     owner has pointed image generation at a different ComfyUI instance via
     the model picker) never become accidentally-public query parameters on
     the HTTP route itself. See _fetch_history_result's docstring for the
-    same default-to-env-var reasoning."""
+    same default-to-env-var reasoning.
+
+    `client_id` should be the same client_id used to submit prompt_id to
+    ComfyUI's /prompt — see _wait_via_websocket's docstring for why this
+    is required for the websocket fast path to ever fire."""
     # In case it already finished before this request even arrived.
     existing = await _fetch_history_result(prompt_id, base_url=base_url, public_url=public_url)
     if existing["status"] in ("completed", "error"):
@@ -444,7 +468,9 @@ async def _wait_for_completion_impl(
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
 
-    result = await _wait_via_websocket(prompt_id, timeout, ws_url=ws_url, base_url=base_url, public_url=public_url)
+    result = await _wait_via_websocket(
+        prompt_id, timeout, ws_url=ws_url, base_url=base_url, public_url=public_url, client_id=client_id
+    )
     if result is not None:
         return result
 
@@ -465,7 +491,7 @@ async def _wait_for_completion_impl(
 
 
 @router.get("/wait/{prompt_id}")
-async def wait_for_completion(prompt_id: str, timeout: float = 300.0):
+async def wait_for_completion(prompt_id: str, timeout: float = 300.0, client_id: Optional[str] = None):
     """Block server-side until prompt_id finishes (or times out).
 
     Replaces client-side polling with a single call: we listen on
@@ -477,8 +503,15 @@ async def wait_for_completion(prompt_id: str, timeout: float = 300.0):
     configured ComfyUI instance — see _wait_for_completion_impl for the
     internal-only override used when the owner has pointed image
     generation at a different instance.
+
+    `client_id` should be the same client_id the caller submitted
+    alongside /prompt (returned as `client_id` in /generate-image's
+    response) — without it, the websocket fast path can never receive
+    this prompt's completion event (see _wait_via_websocket's docstring)
+    and every call silently degrades to the ~30s polling fallback even
+    when ComfyUI finished almost immediately.
     """
-    return await _wait_for_completion_impl(prompt_id, timeout)
+    return await _wait_for_completion_impl(prompt_id, timeout, client_id=client_id)
 
 
 async def _cancel_task_internal(prompt_id: str, *, base_url: str = COMFYUI_URL) -> dict:

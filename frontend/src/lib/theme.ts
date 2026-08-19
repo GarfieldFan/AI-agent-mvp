@@ -272,6 +272,19 @@ export type ButtonBlock = {
    * "thick" is a heavier 2px border for designs with a bolder outline. */
   border_width?: "thin" | "thick";
   width?: BlockWidth;
+  /** Added 2026-08-20 — lets an owner-composed block (Image/Text/Button
+   * children inside a Container, see the root AGENTS.md's "Product
+   * catalog + ordering" section for the full design) end in a real
+   * add-to-cart action instead of only ever being a link. Unset (or
+   * `"link"`) is this field's original, only behavior — `href` navigates,
+   * unchanged. `"add_to_cart"` ignores `href` entirely and instead calls
+   * the same deterministic `POST /api/cart/add` (lib/cart.ts) every other
+   * add-to-cart control in this app already uses, for `product_id`. */
+  action?: "link" | "add_to_cart";
+  /** Only meaningful when `action === "add_to_cart"`. `null`/unset before
+   * the owner picks one in the CTE editor — the button renders disabled
+   * rather than silently adding nothing. */
+  product_id?: number | null;
 };
 
 export type ContainerBlock = {
@@ -329,10 +342,66 @@ export type ContainerBlock = {
    * when unset, so every container without this field renders exactly as
    * before it existed. */
   min_height?: "sm" | "md" | "lg" | "xl" | "screen";
+  /** Added 2026-08-20 — binds this whole container to one Product,
+   * rendering a full-cover "stretched link" to `/products/{id}` behind
+   * its children (a well-established card pattern: the link is a
+   * positioned sibling covering the card, not a wrapper around the
+   * content, so it never produces invalid `<button>`-inside-`<a>` HTML
+   * even when a child `ButtonBlock` sets `action: "add_to_cart"` — that
+   * button renders above the overlay via z-index and intercepts its own
+   * clicks instead of triggering navigation). Lets an owner freely
+   * compose Image/Text/Button children (see the root AGENTS.md's
+   * "Product catalog + ordering" section) into a self-designed "product
+   * promo" block — a homepage feature strip, a swiper slide — without a
+   * dedicated, separately-designed component for it. `null`/unset
+   * (every existing container) renders exactly as before this field
+   * existed — a plain, non-linking container. */
+  link_product_id?: number | null;
   children: Block[];
 };
 
-export type Block = ImageBlock | TextContentBlock | ButtonBlock | ContainerBlock;
+/** Added 2026-08-19 — a grid of product cards from the owner's Product
+ * catalog (lib/products.ts), owner-inserted only via CTE (never
+ * vision-generated — see backend/apis/agent.py's ProductListBlock
+ * docstring). `category` null shows every available product; set it to
+ * filter to one (matches Product.category's free-text values).
+ *
+ * `product_ids` (2026-08-20) is a second, more specific filter — an
+ * explicit ordered allow-list ("feature exactly these 3 products, in
+ * this order," e.g. a homepage "bestsellers" strip) instead of "every
+ * product in a category." Takes priority over `category` when both are
+ * set — the two aren't meant to be combined, `product_ids` already names
+ * exactly what should show. `null`/empty keeps the original
+ * category-or-everything behavior unchanged. */
+export type ProductListBlock = {
+  type: "product-list";
+  category?: string | null;
+  product_ids?: number[] | null;
+  width?: BlockWidth;
+};
+
+/** Added 2026-08-20 — a single product card, for featuring ONE product
+ * somewhere a full grid doesn't fit (a homepage hero strip, a swiper
+ * slide, a promo row) — the ProductList Block above is a grid, this is
+ * its one-item counterpart. Owner-inserted only via CTE, same posture as
+ * ProductListBlock (never vision-generated — a vision model has no way
+ * to know which of the owner's real products a design mockup's "featured
+ * product" placeholder is supposed to be). `product_id: null` (the
+ * freshly-inserted default, before the owner picks one in the CTE
+ * editor) renders an empty-state placeholder, never a broken fetch. */
+export type ProductCardBlock = {
+  type: "product-card";
+  product_id: number | null;
+  width?: BlockWidth;
+};
+
+export type Block =
+  | ImageBlock
+  | TextContentBlock
+  | ButtonBlock
+  | ContainerBlock
+  | ProductListBlock
+  | ProductCardBlock;
 
 export type PageSection =
   | HeroSection
