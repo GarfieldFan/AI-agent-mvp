@@ -2,11 +2,15 @@
 
 A resume/portfolio project: a small business website that ships with its
 own AI employee. A public visitor gets a RAG-grounded chatbot that can
-capture leads from a conversation (with file attachments); an
-admin/owner gets a design-to-page generator, a poster generator, a
-click-to-edit page builder, a CRM, chat-volume reporting, and a
-natural-language **owner agent** that can actually call tools on the
-owner's behalf — all gated behind real role-based access control.
+capture leads or file a structured request from a conversation (with
+file attachments), browse and order from a real product catalog, and
+manage their own cart/checkout — no separate contact form or storefront
+UI needed. An admin/owner gets a design-to-page generator, a poster
+generator, a click-to-edit page builder, a CRM with owner-defined
+structured intake forms and agent-generated review queues, chat-volume
+reporting, and a natural-language **owner agent** that can actually call
+tools on the owner's behalf — all gated behind real role-based access
+control.
 
 This is a local-first demo (`docker compose up`), not a deployed
 product. The interesting parts are architectural: every AI capability
@@ -64,7 +68,20 @@ container, own port), not another router bolted onto the public
   visible source citations when it draws on a real document. Can accept
   a file attachment (photo/PDF) mid-conversation, auto-analyzes it, and
   captures a structured CRM lead (category, contact info) when the
-  conversation looks like a real appointment/quote/claim request.
+  conversation looks like a real appointment/quote/claim request — or,
+  for a request the owner has defined a custom intake form for (an
+  insurance claim, a project inquiry, ...), collects exactly those
+  fields conversationally across multiple turns without re-asking for
+  anything already given.
+- **Product catalog + ordering** — a visitor can browse, ask the chatbot
+  what's available, add to cart, and check out (no payment collection —
+  this tracks orders, not a checkout processor) entirely through chat or
+  the storefront pages (`/search`, `/products/[id]`, `/cart`,
+  `/checkout`). Product search/cart resolution is deterministic SQL, not
+  an LLM guessing a product ID out of a prompt-stuffed catalog. Supports
+  per-line customization notes and a dine-in "kitchen ticket" workflow
+  (staff mark a line served; a served line locks against further changes
+  from the customer's own cart).
 - **Design → landing page** — upload a screenshot of a design, a vision
   LLM turns it into a real page built from a typed JSON section schema
   (never raw HTML), rendered through the site's own React components.
@@ -79,15 +96,19 @@ container, own port), not another router bolted onto the public
   ComfyUI by default (with an owner-configurable checkpoint, or an
   entirely custom pasted ComfyUI workflow for a different SD setup), or
   a cloud provider (DALL·E, Imagen) instead.
-- **CRM + chat-volume reporting** — captured leads (category/status,
-  contact info, attached files, owner-triggered deep-scan notes) and a
-  chart of chat sessions/messages over time, both backed by data this
-  project actually persists.
+- **CRM + review queues + chat-volume reporting** — captured leads
+  (category/status, contact info, attached files, owner-triggered
+  deep-scan notes), owner-defined structured intake forms for anything
+  beyond the built-in categories, agent-generated review queues to
+  triage them, and a chart of chat sessions/messages over time — all
+  backed by data this project actually persists and paginates.
 - **Owner agent** (owner-role only) — type a natural-language command
   ("generate a poster of X and log it as a CRM entry"), and a real LLM
-  tool-calling loop decides which of a fixed 8-tool allowlist to call,
+  tool-calling loop decides which of a fixed 16-tool allowlist to call,
   in what order, chaining results turn-to-turn. Every step (tool, args,
-  result) is shown, not just the final answer.
+  result) is shown, not just the final answer. A higher-stakes change
+  (a new intake schema, a batch of catalog products) is always drafted
+  for the owner to review and explicitly apply, never written directly.
 
 ## Why it's architecturally interesting
 
@@ -109,7 +130,7 @@ container, own port), not another router bolted onto the public
   port, its own independent JWT check requiring the `owner` role
   specifically (stricter than the console's admin-or-owner gate), no
   database connection, no filesystem access, no arbitrary-URL fetch
-  tool. Its only I/O is a fixed 8-tool allowlist of HTTP calls onto the
+  tool. Its only I/O is a fixed 16-tool allowlist of HTTP calls onto the
   main backend's own REST API, forwarding the caller's real bearer token
   on every call so the backend's own RBAC independently re-authorizes
   every action — a compromised or misbehaving agent loop still can't do
@@ -118,6 +139,17 @@ container, own port), not another router bolted onto the public
   vision LLM can only choose from and fill in a fixed set of section/
   block types; it can't inject arbitrary markup or drift from the site's
   design system.
+- **The agent proposes, the owner applies — for anything a mistake would
+  actually cost.** `owner-agent` can draft a new intake schema or a
+  batch of catalog products, but never writes either directly; a review
+  queue's status labels, by contrast, apply immediately, since adjusting
+  them later is cheap. The line between "propose" and "apply-directly"
+  tracks real reversibility, not a blanket policy.
+- **Deterministic code decides what an LLM shouldn't have to.** Product
+  search/cart resolution, review-queue/CRM filtering and pagination, and
+  order totals are all plain SQL/Python — an LLM only ever extracts
+  intent from free text, never computes a total or picks a database row
+  out of a catalog stuffed into its own prompt.
 
 ## Tech stack
 
@@ -169,10 +201,13 @@ This repo keeps two tiers of documentation, both written for whoever
 
 This is explicitly an MVP built to demonstrate specific engineering
 judgment, not a finished product. Known, deliberate gaps: no real cloud
-deployment (local Docker only, by design), chat is a single non-streaming
-call, the chatbot's step-by-step intake flow is scripted rather than
-LLM-driven, `owner-agent` hasn't been through a red-team pass and its
-action log is a local JSONL file rather than a queryable store, and no
-in-browser click-through testing has been done (every change is verified
-via type-checking, linting, and direct backend calls instead — see
-`AGENTS.md`).
+deployment (local Docker only, by design), no real payment processor (an
+order is tracked, never charged), no multi-tenancy (one deployment is
+one business, not a hosted SaaS serving many owners), chat is a single
+non-streaming call (a visibility-gated short-polling loop stands in for
+push updates on the admin dashboard instead of a websocket, given the
+single-worker deployment), the chatbot's step-by-step intake flow is
+scripted rather than LLM-driven, `owner-agent` hasn't been through a
+red-team pass, and no in-browser click-through testing has been done
+(every change is verified via type-checking, linting, automated tests,
+and direct backend calls instead — see `AGENTS.md`).
