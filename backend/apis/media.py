@@ -66,10 +66,24 @@ def _list_dir(directory: Path, source: str, url_for: Callable[[str], str]) -> li
     return items
 
 
-@router.get("/agent/media", response_model=list[MediaItem])
-def list_media() -> list[MediaItem]:
+class MediaListResponse(BaseModel):
+    items: list[MediaItem]
+    total: int
+
+
+@router.get("/agent/media", response_model=MediaListResponse)
+def list_media(limit: int = 24, offset: int = 0) -> MediaListResponse:
     """Merged, newest-first listing of both image sources — see this
-    module's docstring for why they're two directories, not one."""
+    module's docstring for why they're two directories, not one.
+
+    Paginated (2026-08-20, was a plain unbounded list — real UI pain in
+    `ImageFieldEditor`'s Library tab once enough posters/uploads pile up,
+    see the root AGENTS.md). There's no database row to `LIMIT`/`OFFSET`
+    at the SQL level here — this scans both directories, sorts the merged
+    result by mtime, then slices in Python. Fine at this app's scale (a
+    filesystem `iterdir()` over a few hundred/thousand files is still
+    fast); a directory large enough for that to matter would need a real
+    index, not a bigger page size, and isn't what this fix is for."""
     comfy_items = _list_dir(
         COMFYUI_OUTPUT_DIR,
         "comfyui",
@@ -80,7 +94,8 @@ def list_media() -> list[MediaItem]:
         "upload",
         lambda name: f"{BACKEND_PUBLIC_URL}/api/media/uploads/{name}",
     )
-    return sorted(comfy_items + upload_items, key=lambda item: item.created_at, reverse=True)
+    all_items = sorted(comfy_items + upload_items, key=lambda item: item.created_at, reverse=True)
+    return MediaListResponse(items=all_items[offset : offset + limit], total=len(all_items))
 
 
 class UploadMediaRequest(BaseModel):

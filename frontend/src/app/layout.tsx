@@ -8,6 +8,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { SiteHeader } from "@/components/layout/site-header";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { ChatBubbleWidget } from "@/components/modules/chat/chat-bubble-widget";
+import { SessionIdBootstrap } from "@/components/modules/session-id-bootstrap";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -47,6 +48,7 @@ export default function RootLayout({
           disableTransitionOnChange
         >
           <TooltipProvider>
+            <SessionIdBootstrap />
             <SiteHeader />
             <main className="flex-1">{children}</main>
             <SiteFooter />

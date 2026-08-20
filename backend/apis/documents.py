@@ -18,7 +18,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from apis.deps import CurrentUser, Role, get_current_user, require_role
@@ -196,11 +196,43 @@ async def ingest_document(
     return _to_summary(document, _current_embedding_config(db))
 
 
-@router.get("/agent/documents", response_model=list[DocumentSummary])
-def list_documents(db: Session = Depends(get_db)) -> list[DocumentSummary]:
-    documents = db.scalars(select(Document).order_by(Document.created_at.desc())).all()
+class DocumentListResponse(BaseModel):
+    items: list[DocumentSummary]
+    total: int
+    # Stale-document count across EVERY document, not just this page
+    # (2026-08-20, added alongside pagination) — DocumentManager's
+    # "needs re-embed" banner needs the true total; computing it from
+    # `items` alone would silently undercount (or wrongly hide the
+    # banner) once a stale document lands on a page the owner isn't
+    # currently viewing.
+    needs_reembed_count: int
+
+
+@router.get("/agent/documents", response_model=DocumentListResponse)
+def list_documents(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)) -> DocumentListResponse:
+    """Paginated (2026-08-20, was a plain unbounded list — see the root
+    AGENTS.md's pagination entry)."""
+    total = db.execute(select(func.count()).select_from(Document)).scalar_one()
+    documents = (
+        db.scalars(select(Document).order_by(Document.created_at.desc()).limit(limit).offset(offset)).all()
+    )
     current = _current_embedding_config(db)
-    return [_to_summary(d, current) for d in documents]
+    current_provider, current_model = current
+    needs_reembed_count = db.execute(
+        select(func.count())
+        .select_from(Document)
+        .where(
+            or_(
+                Document.embedding_provider.is_distinct_from(current_provider),
+                Document.embedding_model.is_distinct_from(current_model),
+            )
+        )
+    ).scalar_one()
+    return DocumentListResponse(
+        items=[_to_summary(d, current) for d in documents],
+        total=total,
+        needs_reembed_count=needs_reembed_count,
+    )
 
 
 @router.delete("/agent/documents/{document_id}", status_code=204)

@@ -17,7 +17,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from apis.deps import Role, require_role
@@ -106,12 +106,39 @@ def list_pages(db: Session = Depends(get_db)) -> list[PageSummary]:
     return summaries
 
 
-@admin_router.get("/agent/pages/{slug}/versions", response_model=list[PageVersionSummary])
-def list_versions(slug: str, db: Session = Depends(get_db)) -> list[PageVersionSummary]:
+class PageVersionListResponse(BaseModel):
+    items: list[PageVersionSummary]
+    total: int
+
+
+@admin_router.get("/agent/pages/{slug}/versions", response_model=PageVersionListResponse)
+def list_versions(
+    slug: str, limit: int = 20, offset: int = 0, db: Session = Depends(get_db)
+) -> PageVersionListResponse:
+    """Paginated (2026-08-20, was `page.versions` loaded wholesale via
+    the ORM relationship — real UI pain for a page with a long edit
+    history, see the root AGENTS.md). Queries `PageVersion` directly
+    instead of the relationship so `limit`/`offset` actually apply at
+    the SQL level."""
     page = _get_page_or_404(db, slug)
-    return [
-        PageVersionSummary(id=v.id, created_at=v.created_at, note=v.note) for v in page.versions
-    ]
+    total = db.execute(
+        select(func.count()).select_from(PageVersion).where(PageVersion.page_id == page.id)
+    ).scalar_one()
+    versions = (
+        db.execute(
+            select(PageVersion)
+            .where(PageVersion.page_id == page.id)
+            .order_by(PageVersion.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    return PageVersionListResponse(
+        items=[PageVersionSummary(id=v.id, created_at=v.created_at, note=v.note) for v in versions],
+        total=total,
+    )
 
 
 @admin_router.post("/agent/pages/{slug}/versions/{version_id}/restore", response_model=SaveVersionResponse)

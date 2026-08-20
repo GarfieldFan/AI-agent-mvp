@@ -345,6 +345,14 @@ class CrmEntry(Base):
     chat_session_id: Mapped[int | None] = mapped_column(
         ForeignKey("chat_sessions.id", ondelete="SET NULL"), default=None
     )
+    # Added 2026-08-20 — a stub for real human handoff (deliberately not
+    # built yet, see the root AGENTS.md): apis/chat.py's lead-extraction
+    # call sets this true when a visitor explicitly asks to speak with a
+    # person rather than continue with the chatbot. No live-transfer/
+    # notification infrastructure exists — this is purely a flag an
+    # admin/owner can see and act on manually (CrmPanel/ReviewQueuePanel),
+    # ready for a real handoff feature to build on top of later.
+    wants_human: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
@@ -442,12 +450,27 @@ class Product(Base):
     """A generic, owner-defined orderable thing (2026-08-19) — modeled on
     WooCommerce's product concept rather than anything restaurant- or
     retail-specific: a coffee-shop menu item, a physical good, a virtual/
-    digital good, a bookable service, whatever the owner sells. `category`
-    is free text (like CrmEntry.category/tags), not an enum — this table
+    digital good, a bookable service, whatever the owner sells. This table
     is the same "we build the framework, the owner fills in the specific
     vertical" posture as IntentSchema above, just for things that get
     ordered with a quantity and a real price instead of collected as a
     flat field set.
+
+    `tags` replaced the original single `category: str | None` column
+    2026-08-20 (a real user design decision, not a rename for its own
+    sake) — the two overlapped in purpose (both were "which bucket does
+    this product belong to," category just a rigid single value where
+    tags is a free list) and a single category string turned out to be a
+    real limitation: `cart.search_products`'s matching is plain `ILIKE`
+    text matching, not semantic, so a Chinese-speaking visitor searching
+    "咖啡" could never match a product whose only category text was the
+    English "Coffee" — no shared substring, zero overlap, unlike RAG's
+    embedding-based retrieval which at least has *some* cross-lingual
+    signal. A product can now carry several tags (`["Coffee", "咖啡",
+    "Espresso-based"]`) — synonyms, translations, whatever the owner
+    wants a visitor's phrasing to match against — same free-text,
+    no-enum posture the single category string always had, just widened
+    from one value to a list.
 
     v1 scope cut, deliberate: no variant/attribute matrix (WooCommerce's
     "variable product") — a "Latte Large" vs "Latte Small" are two
@@ -468,7 +491,7 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str | None] = mapped_column(Text, default=None)
     price: Mapped[float] = mapped_column(Numeric(10, 2))
-    category: Mapped[str | None] = mapped_column(String(100), default=None)
+    tags: Mapped[list[str]] = mapped_column(JSONB, default=list)
     available: Mapped[bool] = mapped_column(Boolean, default=True)
     # Pure display data (2026-08-19) — never read server-side (never fed
     # to a vision model, unlike chat_attachments' own images), so it
@@ -588,7 +611,25 @@ class OrderItem(Base):
     original price stays intact even if the referenced Product is later
     renamed, repriced, or deleted (ON DELETE SET NULL on product_id, not
     a cascade — the same "keep the historical record readable" reasoning
-    as CrmEntry.intent_schema_id)."""
+    as CrmEntry.intent_schema_id).
+
+    `comment`/`served` (2026-08-20) support a dine-in "kitchen ticket"
+    workflow on top of the existing columns above, not a new table — the
+    user's own explicit call: this app's scale doesn't need a separate
+    fulfillment entity, two more columns on the line item that already
+    exists is enough. `comment` is a free-text customization ("less
+    sugar", "extra spicy") — same "just store what the visitor typed,
+    don't strictly parse it" posture as `Order.pickup_time`. Because a
+    comment distinguishes otherwise-identical line items (two lattes, one
+    "less sugar" and one plain, must stay two separate rows, not merge
+    into quantity=2), `cart.apply_order_delta` now matches an existing
+    item to merge into by `(product_id, comment)`, not `product_id`
+    alone — see that function's own docstring. `served` is a plain
+    boolean, not a free-text status, mirroring `Order.is_open`'s own
+    "one hard signal, not inferred from free text" reasoning — staff
+    toggle it directly in OrderPanel; unlike `Order.status`, owner-agent
+    has no tool to set it (this is a live kitchen-floor action, not a
+    cheap-to-adjust configuration value)."""
 
     __tablename__ = "order_items"
 
@@ -599,6 +640,8 @@ class OrderItem(Base):
     unit_price_snapshot: Mapped[float] = mapped_column(Numeric(10, 2))
     quantity: Mapped[int] = mapped_column(Integer, default=1)
     subtotal: Mapped[float] = mapped_column(Numeric(10, 2))
+    comment: Mapped[str | None] = mapped_column(String(255), default=None)
+    served: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     order: Mapped["Order"] = relationship(back_populates="items")
 

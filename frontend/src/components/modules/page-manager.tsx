@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { EmptyState } from "@/components/common/empty-state";
+import { Pagination } from "@/components/common/pagination";
 import { ApiError } from "@/lib/api";
 import {
   deletePage,
@@ -25,19 +26,24 @@ function viewHrefFor(slug: string) {
   return slug === "home" ? "/" : `/p/${encodeURIComponent(slug)}`;
 }
 
+const VERSION_PAGE_SIZE = 20;
+
 function VersionHistory({ slug, onRestored }: { slug: string; onRestored: () => void }) {
   const [versions, setVersions] = React.useState<PageVersionSummary[] | null>(null);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState<string | null>(null);
   const [restoringId, setRestoringId] = React.useState<number | null>(null);
 
   const load = React.useCallback(() => {
-    listPageVersions(slug)
-      .then((loaded) => {
-        setVersions(loaded);
+    listPageVersions(slug, VERSION_PAGE_SIZE, (page - 1) * VERSION_PAGE_SIZE)
+      .then((result) => {
+        setVersions(result.items);
+        setTotal(result.total);
         setError(null);
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load versions."));
-  }, [slug]);
+  }, [slug, page]);
 
   React.useEffect(() => {
     load();
@@ -47,7 +53,11 @@ function VersionHistory({ slug, onRestored }: { slug: string; onRestored: () => 
     setRestoringId(versionId);
     try {
       await restorePageVersion(slug, versionId);
-      load();
+      // A restore adds a new version on top (most-recent-first order) —
+      // jump back to page 1 so it's actually visible, mirroring
+      // ProductPanel/DocumentManager's same "new row sorts first" fix.
+      if (page === 1) load();
+      else setPage(1);
       onRestored();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Restore failed.");
@@ -60,28 +70,38 @@ function VersionHistory({ slug, onRestored }: { slug: string; onRestored: () => 
   if (versions === null) return <LoadingSpinner label="Loading versions…" className="mt-2" />;
 
   return (
-    <ul className="mt-2 space-y-1.5 border-l pl-3">
-      {versions.map((version, index) => (
-        <li key={version.id} className="flex items-center justify-between gap-2 text-xs">
-          <span className="text-muted-foreground">
-            {index === 0 ? <span className="font-medium text-foreground">Current — </span> : null}
-            {new Date(version.created_at).toLocaleString()}
-            {version.note ? ` · ${version.note}` : ""}
-          </span>
-          {index !== 0 ? (
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => handleRestore(version.id)}
-              disabled={restoringId !== null}
-            >
-              <RotateCcw className="size-3" />
-              {restoringId === version.id ? "Restoring…" : "Restore"}
-            </Button>
-          ) : null}
-        </li>
-      ))}
-    </ul>
+    <div className="mt-2 space-y-2">
+      <ul className="space-y-1.5 border-l pl-3">
+        {versions.map((version, index) => {
+          // "Current" only ever means the single newest version overall
+          // — index 0 on page 1, never index 0 of a later page.
+          const isCurrent = page === 1 && index === 0;
+          return (
+            <li key={version.id} className="flex items-center justify-between gap-2 text-xs">
+              <span className="text-muted-foreground">
+                {isCurrent ? <span className="font-medium text-foreground">Current — </span> : null}
+                {new Date(version.created_at).toLocaleString()}
+                {version.note ? ` · ${version.note}` : ""}
+              </span>
+              {!isCurrent ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => handleRestore(version.id)}
+                  disabled={restoringId !== null}
+                >
+                  <RotateCcw className="size-3" />
+                  {restoringId === version.id ? "Restoring…" : "Restore"}
+                </Button>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+      {total > VERSION_PAGE_SIZE ? (
+        <Pagination page={page} pageSize={VERSION_PAGE_SIZE} total={total} onPageChange={setPage} />
+      ) : null}
+    </div>
   );
 }
 

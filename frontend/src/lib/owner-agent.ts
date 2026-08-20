@@ -66,10 +66,17 @@ export async function runOwnerAgentCommand(command: string): Promise<OwnerAgentR
   return (await response.json()) as OwnerAgentRunResult;
 }
 
+export type OwnerAgentRunListResult = {
+  items: OwnerAgentRunSummary[];
+  total: number;
+};
+
 /** Queryable run history (2026-08-19, backend/models.py's
  * OwnerAgentRun) — goes through the regular backend (lib/api.ts's
  * apiFetch), not the owner-agent service directly, since this is
- * backend's own table, not owner-agent's own state. Most-recent-first. */
-export function listOwnerAgentRuns(limit = 20) {
-  return apiFetch<OwnerAgentRunSummary[]>(`/api/agent/owner-agent/runs?limit=${limit}`);
+ * backend's own table, not owner-agent's own state. Most-recent-first.
+ * Really paginated now (2026-08-20, was a hard `limit=50` cap with no
+ * way to see older runs at all — see the root AGENTS.md). */
+export function listOwnerAgentRuns(limit = 20, offset = 0) {
+  return apiFetch<OwnerAgentRunListResult>(`/api/agent/owner-agent/runs?limit=${limit}&offset=${offset}`);
 }

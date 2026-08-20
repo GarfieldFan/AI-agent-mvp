@@ -12,6 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { Pagination } from "@/components/common/pagination";
 import { ImageFieldEditor } from "@/components/theme/cte/image-field-editor";
 import { ApiError } from "@/lib/api";
 import {
@@ -24,7 +25,7 @@ import {
 } from "@/lib/products";
 
 function blankDraft(): ProductInput {
-  return { name: "", description: "", price: 0, category: "", available: true, image_url: null };
+  return { name: "", description: "", price: 0, tags: [], available: true, image_url: null };
 }
 
 function draftFromProduct(product: Product): ProductInput {
@@ -32,7 +33,7 @@ function draftFromProduct(product: Product): ProductInput {
     name: product.name,
     description: product.description ?? "",
     price: product.price,
-    category: product.category ?? "",
+    tags: product.tags,
     available: product.available,
     image_url: product.image_url,
   };
@@ -46,24 +47,30 @@ function draftFromProduct(product: Product): ProductInput {
  * (mirrors IntentSchemaPanel staying plain CRUD while the schema-
  * proposal review card lives there too), since a misread price directly
  * affects what a real customer is quoted. */
+const PAGE_SIZE = 20;
+
 export function ProductPanel() {
   const [products, setProducts] = React.useState<Product[] | null>(null);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(1);
   const [listError, setListError] = React.useState<string | null>(null);
   const [deletingId, setDeletingId] = React.useState<number | null>(null);
 
   const [editingId, setEditingId] = React.useState<number | "new" | null>(null);
   const [draft, setDraft] = React.useState<ProductInput>(blankDraft());
+  const [tagsText, setTagsText] = React.useState("");
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(() => {
-    listProducts()
+    listProducts(PAGE_SIZE, (page - 1) * PAGE_SIZE)
       .then((result) => {
-        setProducts(result);
+        setProducts(result.items);
+        setTotal(result.total);
         setListError(null);
       })
       .catch((err) => setListError(err instanceof ApiError ? err.message : "Failed to load products."));
-  }, []);
+  }, [page]);
 
   React.useEffect(() => {
     refresh();
@@ -71,6 +78,7 @@ export function ProductPanel() {
 
   function startCreate() {
     setDraft(blankDraft());
+    setTagsText("");
     setEditingId("new");
     setSaveStatus("idle");
     setSaveError(null);
@@ -78,6 +86,7 @@ export function ProductPanel() {
 
   function startEdit(product: Product) {
     setDraft(draftFromProduct(product));
+    setTagsText(product.tags.join(", "));
     setEditingId(product.id);
     setSaveStatus("idle");
     setSaveError(null);
@@ -95,18 +104,27 @@ export function ProductPanel() {
       name: draft.name.trim(),
       description: draft.description?.trim() || null,
       price: draft.price,
-      category: draft.category?.trim() || null,
+      tags: tagsText
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean),
       available: draft.available,
       image_url: draft.image_url || null,
     };
     try {
       if (editingId === "new") {
         await createProduct(payload);
+        setEditingId(null);
+        // A new product sorts first (most-recent-first order) — jump
+        // back to page 1 so it's actually visible, rather than leaving
+        // the view on whatever page was open when Save was clicked.
+        if (page === 1) refresh();
+        else setPage(1);
       } else {
         await updateProduct(editingId, payload);
+        setEditingId(null);
+        refresh();
       }
-      setEditingId(null);
-      refresh();
     } catch (err) {
       setSaveError(err instanceof ApiError ? err.message : "Save failed — is the backend reachable?");
       setSaveStatus("error");
@@ -118,7 +136,14 @@ export function ProductPanel() {
     setDeletingId(product.id);
     try {
       await deleteProduct(product.id);
-      refresh();
+      // Deleting the only item left on a page (other than page 1) would
+      // otherwise strand the view on a now-empty page — step back one
+      // instead; the effect above re-fetches on the resulting page change.
+      if (products?.length === 1 && page > 1) {
+        setPage((p) => p - 1);
+      } else {
+        refresh();
+      }
     } catch {
       // Best-effort — a failed delete just leaves the product in the list, no separate error UI needed here.
     } finally {
@@ -156,13 +181,15 @@ export function ProductPanel() {
         </p>
       </div>
 
-      {products.length === 0 && editingId === null ? (
+      {total === 0 && editingId === null ? (
         <EmptyState
           icon={Package}
           title="No products yet"
           description="Add one below, or describe your catalog to the owner agent and review its draft."
         />
       ) : null}
+
+      {total > 0 ? <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} /> : null}
 
       <div className="space-y-2">
         {products.map((product) =>
@@ -187,7 +214,7 @@ export function ProductPanel() {
                     {!product.available ? <Badge variant="outline" className="ml-2 text-xs">unavailable</Badge> : null}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    {product.category ? `${product.category} — ` : ""}
+                    {product.tags.length > 0 ? `${product.tags.join(", ")} — ` : ""}
                     {product.description}
                   </p>
                 </div>
@@ -238,11 +265,8 @@ export function ProductPanel() {
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground">Category (optional)</Label>
-              <Input
-                value={draft.category ?? ""}
-                onChange={(e) => setDraft((d) => ({ ...d, category: e.target.value }))}
-              />
+              <Label className="text-xs text-muted-foreground">Tags (comma-separated, optional)</Label>
+              <Input value={tagsText} onChange={(e) => setTagsText(e.target.value)} placeholder="e.g. Coffee, 咖啡" />
             </div>
             <div className="flex items-center gap-1.5 pt-5">
               <Switch

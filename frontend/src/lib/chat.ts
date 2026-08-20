@@ -43,6 +43,23 @@ export function getChatSessionId(): string {
   return id;
 }
 
+/** Overwrites the stored session id — the recovery half of
+ * getChatSessionId (2026-08-20, see components/modules/session-id-
+ * bootstrap.tsx). Losing this id (cleared localStorage, a different
+ * device/browser) otherwise means a visitor's in-progress cart becomes
+ * unreachable — the order still exists server-side, but nothing in the
+ * UI can find it again. A link carrying `?sid=<this id>` (e.g. saved
+ * from /cart's own "Save this cart" button, or a dine-in table's own
+ * printed QR code) restores it with zero backend lookup. Doesn't
+ * validate the id is a real, known session — an unrecognized id just
+ * behaves like a brand-new empty cart, same as any id getChatSessionId
+ * would generate on its own. */
+export function restoreChatSessionId(sid: string): void {
+  const trimmed = sid.trim();
+  if (!trimmed) return;
+  window.localStorage.setItem(SESSION_STORAGE_KEY, trimmed);
+}
+
 /** Calls the user-tier chat endpoint (POST /api/chat) — LLM inference
  * against the owner-selected chat model, no tools/agent access, optionally
  * grounded in uploaded documents (RAG merged in 2026-08-04, see the repo

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Paperclip, Trash2, Users } from "lucide-react";
+import { Headset, Paperclip, Trash2, Users } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { Pagination } from "@/components/common/pagination";
 import { ApiError } from "@/lib/api";
 import {
   cleanupChatUploads,
@@ -27,17 +28,20 @@ import { listIntentSchemas, type IntentSchema } from "@/lib/intent-schemas";
 // Fixed display order + labels for the known categories apis/chat.py's
 // automatic capture and this panel's manual form both use. Anything else
 // (older rows from before `category` existed, or a freeform value) falls
-// into the "Other" bucket below rather than being dropped.
+// into the "Other" bucket below rather than being dropped — mirrors
+// backend/apis/agent.py's `_KNOWN_CRM_CATEGORIES` exactly, see that
+// module's `list_crm_entries` docstring.
 const CATEGORY_GROUPS: { key: string; label: string }[] = [
   { key: "appointment", label: "Appointments" },
   { key: "quote", label: "Quotes" },
   { key: "claim", label: "Claims" },
   { key: "inquiry", label: "Inquiries" },
+  { key: "other", label: "Other" },
 ];
 
 const CATEGORY_FORM_OPTIONS = [
   { value: "none", label: "No category" },
-  ...CATEGORY_GROUPS.map((g) => ({ value: g.key, label: g.label.replace(/s$/, "") })),
+  ...CATEGORY_GROUPS.filter((g) => g.key !== "other").map((g) => ({ value: g.key, label: g.label.replace(/s$/, "") })),
 ];
 
 const STATUS_OPTIONS: { value: CrmStatus; label: string }[] = [
@@ -46,14 +50,7 @@ const STATUS_OPTIONS: { value: CrmStatus; label: string }[] = [
   { value: "closed", label: "Closed" },
 ];
 
-function groupByCategory(entries: CrmEntry[]) {
-  const groups = new Map<string, CrmEntry[]>();
-  for (const entry of entries) {
-    const key = entry.category && CATEGORY_GROUPS.some((g) => g.key === entry.category) ? entry.category : "other";
-    groups.set(key, [...(groups.get(key) ?? []), entry]);
-  }
-  return groups;
-}
+const PAGE_SIZE = 10;
 
 /** Admin/owner only — backend/apis/agent.py's `/agent/crm/entries`,
  * real as of 2026-08-06 (see models.CrmEntry's doc comment for why this
@@ -63,7 +60,18 @@ function groupByCategory(entries: CrmEntry[]) {
  * chat-driven capture (2026-08-08) means most rows now arrive from the
  * public chatbot, not this panel's manual form — admin/owner need to
  * scan by kind of request and move each one through new -> contacted ->
- * closed, not just read a flat list. */
+ * closed, not just read a flat list.
+ *
+ * **Each category paginates independently** (2026-08-20, `CrmCategoryCard`
+ * below, mirroring `ReviewQueuePanel`'s per-schema pattern exactly) —
+ * was a single `listCrmEntries({limit: 200})` fetch grouped client-side,
+ * a stopgap from when this endpoint first became paginated but before
+ * this panel got real pagination of its own. Every fixed category
+ * always renders its own card now (not hidden when empty, same posture
+ * `ReviewQueuePanel` already uses for a queue with zero entries) — the
+ * only exception is the very first load, where the top-level "No leads
+ * yet" `EmptyState` replaces all five cards once every one of them has
+ * confirmed a `total` of 0. */
 export function CrmPanel() {
   const [email, setEmail] = React.useState("");
   const [summary, setSummary] = React.useState("");
@@ -72,10 +80,13 @@ export function CrmPanel() {
   const [pushStatus, setPushStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [pushError, setPushError] = React.useState<string | null>(null);
 
-  const [entries, setEntries] = React.useState<CrmEntry[] | null>(null);
-  const [listError, setListError] = React.useState<string | null>(null);
-  const [statusErrorByEntry, setStatusErrorByEntry] = React.useState<Record<string, string>>({});
-  const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  // Bumped after a successful manual push — each CrmCategoryCard's own
+  // fetch effect depends on this, so every category re-fetches its
+  // current page (the new entry only actually becomes visible if that
+  // category happens to be showing page 1, same tradeoff ProductPanel's
+  // own "new row sorts first" fix accepts elsewhere in this app).
+  const [refreshToken, setRefreshToken] = React.useState(0);
+
   // Owner-configured schemas (2026-08-19) — fetched purely to resolve
   // collected_fields' raw keys into real labels below; failure here just
   // means field keys render unresolved, never breaks the entry list.
@@ -88,25 +99,22 @@ export function CrmPanel() {
     return map;
   }, [schemas]);
 
+  // Each CrmCategoryCard reports its own total once loaded, so the panel
+  // can tell "every category confirmed empty" apart from "still loading"
+  // without a separate counts endpoint.
+  const [categoryTotals, setCategoryTotals] = React.useState<Record<string, number>>({});
+  const allCategoriesLoaded = Object.keys(categoryTotals).length === CATEGORY_GROUPS.length;
+  const grandTotal = Object.values(categoryTotals).reduce((a, b) => a + b, 0);
+
   const [cleanupStatus, setCleanupStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [cleanupError, setCleanupError] = React.useState<string | null>(null);
   const [cleanupResult, setCleanupResult] = React.useState<CleanupUploadsResult | null>(null);
 
-  const refresh = React.useCallback(() => {
-    listCrmEntries()
-      .then((result) => {
-        setEntries(result);
-        setListError(null);
-      })
-      .catch((err) => setListError(err instanceof ApiError ? err.message : "Failed to load CRM entries."));
-  }, []);
-
   React.useEffect(() => {
-    refresh();
     listIntentSchemas()
       .then(setSchemas)
       .catch(() => setSchemas([]));
-  }, [refresh]);
+  }, []);
 
   async function handlePush() {
     if (!email.trim() || !summary.trim()) return;
@@ -128,25 +136,10 @@ export function CrmPanel() {
       setTagsInput("");
       setCategory("none");
       setPushStatus("idle");
-      refresh();
+      setRefreshToken((t) => t + 1);
     } catch (err) {
       setPushError(err instanceof ApiError ? err.message : "Push failed — is the backend reachable?");
       setPushStatus("error");
-    }
-  }
-
-  async function handleDelete(entry: CrmEntry) {
-    if (!window.confirm(`Delete the lead from ${entry.contact_email}? This also removes its attached file, if any. This cannot be undone.`)) {
-      return;
-    }
-    setDeletingId(entry.crm_id);
-    try {
-      await deleteCrmEntry(entry.crm_id);
-      setEntries((prev) => prev?.filter((e) => e.crm_id !== entry.crm_id) ?? prev);
-    } catch (err) {
-      setListError(err instanceof ApiError ? err.message : "Failed to delete entry.");
-    } finally {
-      setDeletingId(null);
     }
   }
 
@@ -163,25 +156,9 @@ export function CrmPanel() {
     }
   }
 
-  async function handleStatusChange(entry: CrmEntry, status: CrmStatus) {
-    const previous = entries;
-    setEntries((prev) => prev?.map((e) => (e.crm_id === entry.crm_id ? { ...e, status } : e)) ?? prev);
-    setStatusErrorByEntry((prev) => ({ ...prev, [entry.crm_id]: "" }));
-    try {
-      await updateCrmEntryStatus(entry.crm_id, status);
-    } catch (err) {
-      setEntries(previous); // roll back the optimistic update
-      setStatusErrorByEntry((prev) => ({
-        ...prev,
-        [entry.crm_id]: err instanceof ApiError ? err.message : "Failed to update status.",
-      }));
-    }
+  function handleCategoryTotal(key: string, total: number) {
+    setCategoryTotals((prev) => ({ ...prev, [key]: total }));
   }
-
-  const groups = entries ? groupByCategory(entries) : null;
-  const orderedGroups = groups
-    ? [...CATEGORY_GROUPS, { key: "other", label: "Other" }].filter((g) => (groups.get(g.key)?.length ?? 0) > 0)
-    : [];
 
   return (
     <div className="space-y-4 rounded-xl border p-4">
@@ -243,106 +220,208 @@ export function CrmPanel() {
       </div>
 
       <div className="space-y-4 border-t pt-4">
-        {listError ? <ErrorMessage description={listError} onRetry={refresh} /> : null}
-        {entries === null && !listError ? <LoadingSpinner label="Loading leads…" /> : null}
-        {entries && entries.length === 0 ? (
+        {allCategoriesLoaded && grandTotal === 0 ? (
           <EmptyState icon={Users} title="No leads yet" description="Captured chatbot leads or manual entries will appear here." />
-        ) : null}
+        ) : (
+          CATEGORY_GROUPS.map((group) => (
+            <CrmCategoryCard
+              key={group.key}
+              categoryKey={group.key}
+              label={group.label}
+              refreshToken={refreshToken}
+              fieldLabelsBySchema={fieldLabelsBySchema}
+              onTotalKnown={(total) => handleCategoryTotal(group.key, total)}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
 
-        {orderedGroups.map((group) => (
-          <div key={group.key} className="space-y-2">
-            <div className="flex items-center gap-2">
-              <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{group.label}</h4>
-              <Badge variant="secondary" className="text-xs">
-                {groups?.get(group.key)?.length ?? 0}
-              </Badge>
+/** One category's own entries + pagination + status/delete controls —
+ * split out (2026-08-20) so each category owns its own page state
+ * independently, mirroring ReviewQueuePanel's ReviewQueueCard exactly. */
+function CrmCategoryCard({
+  categoryKey,
+  label,
+  refreshToken,
+  fieldLabelsBySchema,
+  onTotalKnown,
+}: {
+  categoryKey: string;
+  label: string;
+  refreshToken: number;
+  fieldLabelsBySchema: Map<number, Record<string, string>>;
+  onTotalKnown: (total: number) => void;
+}) {
+  const [entries, setEntries] = React.useState<CrmEntry[] | null>(null);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(1);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [statusErrorByEntry, setStatusErrorByEntry] = React.useState<Record<string, string>>({});
+  const [deletingId, setDeletingId] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(() => {
+    listCrmEntries({ category: categoryKey, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE })
+      .then((result) => {
+        setEntries(result.items);
+        setTotal(result.total);
+        onTotalKnown(result.total);
+        setLoadError(null);
+      })
+      .catch((err) => setLoadError(err instanceof ApiError ? err.message : "Failed to load entries."));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onTotalKnown is a stable closure per render, not a real dependency
+  }, [categoryKey, page]);
+
+  React.useEffect(() => {
+    refresh();
+  }, [refresh, refreshToken]);
+
+  async function handleDelete(entry: CrmEntry) {
+    if (
+      !window.confirm(
+        `Delete the lead from ${entry.contact_email}? This also removes its attached file, if any. This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setDeletingId(entry.crm_id);
+    try {
+      await deleteCrmEntry(entry.crm_id);
+      // Deleting the only item left on a non-first page would otherwise
+      // strand the view on a now-empty page — step back one instead.
+      if (entries?.length === 1 && page > 1) {
+        setPage((p) => p - 1);
+      } else {
+        refresh();
+      }
+    } catch (err) {
+      setLoadError(err instanceof ApiError ? err.message : "Failed to delete entry.");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  async function handleStatusChange(entry: CrmEntry, status: CrmStatus) {
+    const previous = entries;
+    setEntries((prev) => prev?.map((e) => (e.crm_id === entry.crm_id ? { ...e, status } : e)) ?? prev);
+    setStatusErrorByEntry((prev) => ({ ...prev, [entry.crm_id]: "" }));
+    try {
+      await updateCrmEntryStatus(entry.crm_id, status);
+    } catch (err) {
+      setEntries(previous); // roll back the optimistic update
+      setStatusErrorByEntry((prev) => ({
+        ...prev,
+        [entry.crm_id]: err instanceof ApiError ? err.message : "Failed to update status.",
+      }));
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{label}</h4>
+        <Badge variant="secondary" className="text-xs">
+          {total}
+        </Badge>
+      </div>
+
+      {loadError ? <ErrorMessage description={loadError} onRetry={refresh} /> : null}
+      {entries === null && !loadError ? <LoadingSpinner label={`Loading ${label.toLowerCase()}…`} /> : null}
+      {entries !== null && entries.length === 0 ? (
+        <p className="text-xs text-muted-foreground">Nothing here yet.</p>
+      ) : null}
+
+      <div className="space-y-2">
+        {entries?.map((entry) => (
+          <div key={entry.crm_id} className="space-y-1 rounded-lg border p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm font-medium">
+                {entry.contact_name ? `${entry.contact_name} — ` : ""}
+                {entry.contact_email}
+                {entry.contact_phone ? (
+                  <span className="ml-2 font-normal text-muted-foreground">{entry.contact_phone}</span>
+                ) : null}
+                {entry.wants_human ? (
+                  <Badge variant="destructive" className="ml-2 gap-1 text-xs">
+                    <Headset className="size-3" />
+                    Wants human
+                  </Badge>
+                ) : null}
+              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs text-muted-foreground">{new Date(entry.created_at).toLocaleString()}</p>
+                <Select value={entry.status} onValueChange={(v) => v && handleStatusChange(entry, v as CrmStatus)}>
+                  <SelectTrigger className="h-7 w-32 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {STATUS_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Delete entry"
+                  disabled={deletingId === entry.crm_id}
+                  onClick={() => handleDelete(entry)}
+                >
+                  <Trash2 className="size-3.5" />
+                </Button>
+              </div>
             </div>
-            <div className="space-y-2">
-              {groups?.get(group.key)?.map((entry) => (
-                <div key={entry.crm_id} className="space-y-1 rounded-lg border p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-sm font-medium">
-                      {entry.contact_name ? `${entry.contact_name} — ` : ""}
-                      {entry.contact_email}
-                      {entry.contact_phone ? (
-                        <span className="ml-2 font-normal text-muted-foreground">{entry.contact_phone}</span>
-                      ) : null}
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <p className="text-xs text-muted-foreground">{new Date(entry.created_at).toLocaleString()}</p>
-                      <Select value={entry.status} onValueChange={(v) => v && handleStatusChange(entry, v as CrmStatus)}>
-                        <SelectTrigger className="h-7 w-32 text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {STATUS_OPTIONS.map((opt) => (
-                            <SelectItem key={opt.value} value={opt.value}>
-                              {opt.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        aria-label="Delete entry"
-                        disabled={deletingId === entry.crm_id}
-                        onClick={() => handleDelete(entry)}
-                      >
-                        <Trash2 className="size-3.5" />
-                      </Button>
-                    </div>
-                  </div>
-                  <p className="text-sm text-muted-foreground">{entry.summary}</p>
-                  {entry.intent_schema_id && Object.keys(entry.collected_fields).length > 0 ? (
-                    <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 rounded-md bg-muted/50 p-2 text-xs">
-                      {Object.entries(entry.collected_fields).map(([key, value]) => (
-                        <React.Fragment key={key}>
-                          <dt className="font-medium text-muted-foreground">
-                            {fieldLabelsBySchema.get(entry.intent_schema_id!)?.[key] ?? key}
-                          </dt>
-                          <dd className="truncate">{value}</dd>
-                        </React.Fragment>
-                      ))}
-                    </dl>
-                  ) : null}
-                  {entry.attachment_url ? (
-                    <a
-                      href={entry.attachment_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-xs text-primary underline underline-offset-2"
-                    >
-                      <Paperclip className="size-3" />
-                      View attached file
-                    </a>
-                  ) : null}
-                  {entry.analysis_notes ? (
-                    <details className="rounded-md bg-muted/50 p-2 text-xs">
-                      <summary className="cursor-pointer font-medium text-muted-foreground">
-                        Deep-scan notes
-                      </summary>
-                      <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{entry.analysis_notes}</p>
-                    </details>
-                  ) : null}
-                  {entry.tags.length > 0 ? (
-                    <div className="flex flex-wrap gap-1">
-                      {entry.tags.map((tag) => (
-                        <Badge key={tag} variant="secondary" className="text-xs">
-                          {tag}
-                        </Badge>
-                      ))}
-                    </div>
-                  ) : null}
-                  {statusErrorByEntry[entry.crm_id] ? (
-                    <p className="text-xs text-destructive">{statusErrorByEntry[entry.crm_id]}</p>
-                  ) : null}
-                </div>
-              ))}
-            </div>
+            <p className="text-sm text-muted-foreground">{entry.summary}</p>
+            {entry.intent_schema_id && Object.keys(entry.collected_fields).length > 0 ? (
+              <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 rounded-md bg-muted/50 p-2 text-xs">
+                {Object.entries(entry.collected_fields).map(([key, value]) => (
+                  <React.Fragment key={key}>
+                    <dt className="font-medium text-muted-foreground">
+                      {fieldLabelsBySchema.get(entry.intent_schema_id!)?.[key] ?? key}
+                    </dt>
+                    <dd className="truncate">{value}</dd>
+                  </React.Fragment>
+                ))}
+              </dl>
+            ) : null}
+            {entry.attachment_url ? (
+              <a
+                href={entry.attachment_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs text-primary underline underline-offset-2"
+              >
+                <Paperclip className="size-3" />
+                View attached file
+              </a>
+            ) : null}
+            {entry.analysis_notes ? (
+              <details className="rounded-md bg-muted/50 p-2 text-xs">
+                <summary className="cursor-pointer font-medium text-muted-foreground">Deep-scan notes</summary>
+                <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{entry.analysis_notes}</p>
+              </details>
+            ) : null}
+            {entry.tags.length > 0 ? (
+              <div className="flex flex-wrap gap-1">
+                {entry.tags.map((tag) => (
+                  <Badge key={tag} variant="secondary" className="text-xs">
+                    {tag}
+                  </Badge>
+                ))}
+              </div>
+            ) : null}
+            {statusErrorByEntry[entry.crm_id] ? (
+              <p className="text-xs text-destructive">{statusErrorByEntry[entry.crm_id]}</p>
+            ) : null}
           </div>
         ))}
       </div>
+
+      {total > PAGE_SIZE ? <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} /> : null}
     </div>
   );
 }

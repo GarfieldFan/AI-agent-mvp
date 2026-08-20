@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, Paperclip, Send, X } from "lucide-react";
+import { Loader2, Paperclip, Send, Upload, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -91,6 +91,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   const [uploadError, setUploadError] = React.useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
+  // Drag-and-drop over the whole panel, not just the paperclip button
+  // (2026-08-20 — the click-to-browse path already existed, dropping a
+  // file anywhere on the chat window didn't work at all). `dragCounter`
+  // (not a plain boolean) is the standard fix for the "dragleave fires
+  // when the pointer crosses into a child element, flickering the
+  // overlay off mid-drag" browser quirk — dragenter/dragleave fire once
+  // per element boundary crossed, so only clear the active state once
+  // the count returns to 0 (left every nested element, not just one).
+  const [dragActive, setDragActive] = React.useState(false);
+  const dragCounter = React.useRef(0);
+
   React.useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, pending, error]);
@@ -155,6 +166,35 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     }
   }
 
+  function handleDragEnter(event: React.DragEvent) {
+    event.preventDefault();
+    if (pending || uploading) return;
+    dragCounter.current += 1;
+    if (event.dataTransfer.types.includes("Files")) setDragActive(true);
+  }
+
+  function handleDragOver(event: React.DragEvent) {
+    // Merely hovering still needs preventDefault on every dragover event,
+    // or the browser's default "reject the drop" behavior wins and onDrop
+    // never fires at all.
+    event.preventDefault();
+  }
+
+  function handleDragLeave(event: React.DragEvent) {
+    event.preventDefault();
+    dragCounter.current = Math.max(0, dragCounter.current - 1);
+    if (dragCounter.current === 0) setDragActive(false);
+  }
+
+  function handleDrop(event: React.DragEvent) {
+    event.preventDefault();
+    dragCounter.current = 0;
+    setDragActive(false);
+    if (pending || uploading) return;
+    const file = event.dataTransfer.files?.[0];
+    if (file) handleAttachmentSelect(file);
+  }
+
   async function handleSend(event: React.FormEvent) {
     event.preventDefault();
     const text = draft.trim();
@@ -171,14 +211,16 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     setUploadError(null);
     setError(null);
 
+    // step 3's "anything else?" used to short-circuit here with a canned
+    // "that's been captured" reply and never actually call the backend —
+    // found 2026-08-20 from a real report: a visitor who attached a file
+    // right at this step had it silently discarded, never analyzed, never
+    // captured into any CrmEntry/queue. CRM capture and attachment
+    // analysis are both fully real now (unlike when this stub was
+    // written), so step 3 gets exactly the same real backend call every
+    // other turn does — no reason for it to be a dead end.
     if (step === 3) {
-      pushMessage({
-        role: "assistant",
-        content:
-          "Thanks — that's been captured. (CRM handoff and live agent transfer are placeholder integrations for now.)",
-      });
       setStep("done");
-      return;
     }
 
     setPending(true);
@@ -200,7 +242,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   }
 
   return (
-    <div className={cn("flex h-[32rem] flex-col overflow-hidden", !embedded && "rounded-xl border")}>
+    <div
+      className={cn("relative flex h-[32rem] flex-col overflow-hidden", !embedded && "rounded-xl border")}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {dragActive ? (
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 border-2 border-dashed border-primary bg-background/90">
+          <Upload className="size-6 text-primary" aria-hidden="true" />
+          <p className="text-sm font-medium text-primary">Drop a photo or PDF to attach</p>
+        </div>
+      ) : null}
       <ScrollArea className="min-h-0 flex-1 p-4">
         <div className="flex flex-col gap-3">
           {messages.map((message) => (

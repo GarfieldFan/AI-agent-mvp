@@ -9,6 +9,7 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { EmptyState } from "@/components/common/empty-state";
 import { FileDropzone } from "@/components/common/file-dropzone";
+import { Pagination } from "@/components/common/pagination";
 import { ApiError } from "@/lib/api";
 import { fileToBase64 } from "@/lib/file";
 import {
@@ -40,11 +41,16 @@ function formatSize(bytes: number) {
  * only; the public chatbot (/chat) only ever *reads* what's ingested here,
  * via backend/retrieval.py — see the root AGENTS.md's 2026-08-04 note on
  * merging the old standalone /knowledge page into the main chatbot. */
+const PAGE_SIZE = 20;
+
 export function DocumentManager() {
   const [file, setFile] = React.useState<File | null>(null);
   const [uploadStatus, setUploadStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [uploadError, setUploadError] = React.useState<string | null>(null);
   const [documents, setDocuments] = React.useState<DocumentSummary[] | null>(null);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(1);
+  const [staleCount, setStaleCount] = React.useState(0);
   const [listError, setListError] = React.useState<string | null>(null);
   const [deletingId, setDeletingId] = React.useState<number | null>(null);
   const [reembedStatus, setReembedStatus] = React.useState<"idle" | "loading" | "error">("idle");
@@ -52,13 +58,17 @@ export function DocumentManager() {
   const [reembedResult, setReembedResult] = React.useState<ReembedAllResult | null>(null);
 
   const refresh = React.useCallback(() => {
-    listDocuments()
-      .then((docs) => {
-        setDocuments(docs);
+    listDocuments(PAGE_SIZE, (page - 1) * PAGE_SIZE)
+      .then((result) => {
+        setDocuments(result.items);
+        setTotal(result.total);
+        // Across every document, not just this page — see
+        // lib/documents.ts's DocumentListResult doc comment.
+        setStaleCount(result.needs_reembed_count);
         setListError(null);
       })
       .catch((err) => setListError(err instanceof ApiError ? err.message : "Failed to load documents."));
-  }, []);
+  }, [page]);
 
   React.useEffect(() => {
     refresh();
@@ -73,7 +83,10 @@ export function DocumentManager() {
       await ingestDocument(file.name, file.type, dataUri);
       setFile(null);
       setUploadStatus("idle");
-      refresh();
+      // A new document sorts first (most-recent-first order) — jump
+      // back to page 1 so it's actually visible.
+      if (page === 1) refresh();
+      else setPage(1);
     } catch (err) {
       setUploadError(err instanceof ApiError ? err.message : "Upload failed — is the backend reachable?");
       setUploadStatus("error");
@@ -84,7 +97,13 @@ export function DocumentManager() {
     setDeletingId(id);
     try {
       await deleteDocument(id);
-      refresh();
+      // Deleting the only item left on a non-first page would otherwise
+      // strand the view on a now-empty page — step back one instead.
+      if (documents?.length === 1 && page > 1) {
+        setPage((p) => p - 1);
+      } else {
+        refresh();
+      }
     } catch (err) {
       setListError(err instanceof ApiError ? err.message : "Delete failed.");
     } finally {
@@ -106,8 +125,6 @@ export function DocumentManager() {
       setReembedStatus("error");
     }
   }
-
-  const staleCount = documents?.filter((d) => d.needs_reembed).length ?? 0;
 
   return (
     <div className="space-y-4 rounded-xl border bg-muted/40 p-4">
@@ -171,13 +188,14 @@ export function DocumentManager() {
 
         {listError ? <ErrorMessage description={listError} onRetry={refresh} /> : null}
         {documents === null && !listError ? <LoadingSpinner label="Loading documents…" /> : null}
-        {documents && documents.length === 0 ? (
+        {documents !== null && total === 0 ? (
           <EmptyState
             icon={FileText}
             title="No documents yet"
             description="Upload one above to start building the knowledge base."
           />
         ) : null}
+        {total > 0 ? <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} /> : null}
         {documents?.map((doc) => (
           <div key={doc.id} className="flex items-center justify-between gap-3 rounded-lg border p-3">
             <div className="flex min-w-0 items-start gap-2">

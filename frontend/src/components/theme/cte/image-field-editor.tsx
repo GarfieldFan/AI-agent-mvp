@@ -9,6 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ErrorMessage } from "@/components/common/error-message";
 import { FileDropzone } from "@/components/common/file-dropzone";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { Pagination } from "@/components/common/pagination";
 import { ThemeImageBox } from "@/components/theme/theme-image-box";
 import { ApiError } from "@/lib/api";
 import { fileToBase64 } from "@/lib/file";
@@ -20,6 +21,8 @@ type ImageFieldEditorProps = {
   value: ThemeImage;
   onChange: (image: ThemeImage) => void;
 };
+
+const LIBRARY_PAGE_SIZE = 24;
 
 /** The image field's editor UI inside CteEditorPopover's Sheet — four ways
  * to land on a `ThemeImage`: type a URL directly, upload a file, generate
@@ -43,24 +46,32 @@ export function ImageFieldEditor({ value, onChange }: ImageFieldEditorProps) {
   const [genError, setGenError] = React.useState<string | null>(null);
 
   const [libraryItems, setLibraryItems] = React.useState<MediaItem[]>([]);
+  const [libraryTotal, setLibraryTotal] = React.useState(0);
+  const [libraryPage, setLibraryPage] = React.useState(1);
   const [libraryStatus, setLibraryStatus] = React.useState<"idle" | "loading" | "error">("idle");
-  const libraryFetched = React.useRef(false);
 
-  // Fetched on the tab-switch event itself, not a useEffect watching
-  // `tab` — an effect calling setState synchronously in its body trips
-  // the react-hooks/set-state-in-effect lint rule and risks a cascading
-  // render; driving it from the actual user interaction avoids both.
+  // Fetched from the actual user interaction (tab click, page click,
+  // retry click) that should trigger it, never a useEffect watching
+  // `tab`/`libraryPage` — an effect calling setState synchronously in
+  // its body trips the react-hooks/set-state-in-effect lint rule and
+  // risks a cascading render; driving it from the real event avoids
+  // both, and lets a single function serve every trigger.
+  function fetchLibraryPage(page: number) {
+    setLibraryPage(page);
+    setLibraryStatus("loading");
+    listMedia(LIBRARY_PAGE_SIZE, (page - 1) * LIBRARY_PAGE_SIZE)
+      .then((result) => {
+        setLibraryItems(result.items);
+        setLibraryTotal(result.total);
+        setLibraryStatus("idle");
+      })
+      .catch(() => setLibraryStatus("error"));
+  }
+
   function handleTabChange(next: string) {
     setTab(next);
-    if (next === "library" && !libraryFetched.current) {
-      libraryFetched.current = true;
-      setLibraryStatus("loading");
-      listMedia()
-        .then((items) => {
-          setLibraryItems(items);
-          setLibraryStatus("idle");
-        })
-        .catch(() => setLibraryStatus("error"));
+    if (next === "library" && libraryStatus === "idle" && libraryItems.length === 0) {
+      fetchLibraryPage(1);
     }
   }
 
@@ -161,10 +172,7 @@ export function ImageFieldEditor({ value, onChange }: ImageFieldEditorProps) {
           {libraryStatus === "error" ? (
             <ErrorMessage
               description="Could not load the media library."
-              onRetry={() => {
-                libraryFetched.current = false;
-                handleTabChange("library");
-              }}
+              onRetry={() => fetchLibraryPage(libraryPage)}
             />
           ) : null}
           {libraryStatus === "idle" && libraryItems.length === 0 ? (
@@ -186,6 +194,15 @@ export function ImageFieldEditor({ value, onChange }: ImageFieldEditorProps) {
               </button>
             ))}
           </div>
+          {libraryTotal > LIBRARY_PAGE_SIZE ? (
+            <Pagination
+              page={libraryPage}
+              pageSize={LIBRARY_PAGE_SIZE}
+              total={libraryTotal}
+              onPageChange={fetchLibraryPage}
+              disabled={libraryStatus === "loading"}
+            />
+          ) : null}
         </TabsContent>
       </Tabs>
     </div>

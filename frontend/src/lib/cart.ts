@@ -14,10 +14,14 @@ export type CartAddResult = {
   total_amount: number;
 };
 
-export function addToCart(productId: number, quantity = 1) {
+/** `comment` (2026-08-20, e.g. "less sugar", "extra spicy") — see
+ * backend/cart.py's apply_order_delta docstring: two lines for the same
+ * product with different comments stay separate lines, never merged
+ * into one quantity. */
+export function addToCart(productId: number, quantity = 1, comment?: string | null) {
   return apiFetch<CartAddResult>("/api/cart/add", {
     method: "POST",
-    body: { session_id: getChatSessionId(), product_id: productId, quantity },
+    body: { session_id: getChatSessionId(), product_id: productId, quantity, comment: comment || null },
   });
 }
 
@@ -34,6 +38,8 @@ export type CartItem = {
   unit_price_snapshot: number;
   quantity: number;
   subtotal: number;
+  comment: string | null;
+  served: boolean;
 };
 
 export type Cart = {
@@ -56,13 +62,24 @@ export function getCart(): Promise<Cart | null> {
 }
 
 /** Powers /cart's quantity +/- and Remove controls — `quantityDelta` can
- * be negative (Remove sends -(current quantity)). Reuses the exact same
- * backend delta-application code addToCart's own POST /cart/add does, so
- * there's one order-mutation path regardless of which UI triggered it. */
-export function updateCartItem(productId: number, quantityDelta: number) {
+ * be negative (Remove sends -(current quantity)). Targets a specific
+ * line by `itemId` (2026-08-20, was `productId`) — a product can now
+ * have more than one line in the cart (different comments), so the
+ * product id alone can no longer say which line was meant. */
+export function updateCartItem(itemId: number, quantityDelta: number) {
   return apiFetch<CartAddResult>("/api/cart/update", {
     method: "POST",
-    body: { session_id: getChatSessionId(), product_id: productId, quantity_delta: quantityDelta },
+    body: { session_id: getChatSessionId(), item_id: itemId, quantity_delta: quantityDelta },
+  });
+}
+
+/** Sets/clears a cart line's customization note after it's already in
+ * the cart (2026-08-20) — separate from updateCartItem since this isn't
+ * a quantity change. `comment: null`/empty clears it. */
+export function updateCartItemComment(itemId: number, comment: string | null) {
+  return apiFetch<CartAddResult>(`/api/cart/item/${itemId}/comment`, {
+    method: "POST",
+    body: { session_id: getChatSessionId(), comment: comment || null },
   });
 }
 

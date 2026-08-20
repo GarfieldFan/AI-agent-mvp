@@ -121,7 +121,10 @@ export function CheckoutPage() {
 
   return (
     <Container className="max-w-2xl space-y-6 py-10">
-      <PageHeader title="Checkout" description="No payment is collected here — this just confirms your order." />
+      <PageHeader
+        title="Checkout"
+        description={`Order #${cart.id} — no payment is collected here, this just confirms your order.`}
+      />
 
       <Card>
         <CardContent className="space-y-2">

@@ -14,6 +14,7 @@ import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
+import { slugifyKey } from "@/lib/slug";
 import {
   createIntentSchema,
   deleteIntentSchema,
@@ -69,6 +70,15 @@ export function IntentSchemaPanel() {
   const [draft, setDraft] = React.useState<IntentSchemaInput>(BLANK_DRAFT);
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
+  // field_key, like the schema's own top-level key, is auto-derived from
+  // the field's label rather than typed — but only for a field that's NEW
+  // in this editing session; a field that already existed when editing
+  // started keeps its key locked (CrmEntry.collected_fields rows already
+  // reference it by that exact key, so silently changing it would orphan
+  // already-collected data). Captured once per edit session, not derived
+  // from `draft` on every render, since draft.fields itself gets mutated
+  // as the owner types.
+  const existingFieldKeysRef = React.useRef<Set<string>>(new Set());
 
   const refresh = React.useCallback(() => {
     listIntentSchemas()
@@ -85,6 +95,7 @@ export function IntentSchemaPanel() {
 
   function startCreate() {
     setDraft(BLANK_DRAFT);
+    existingFieldKeysRef.current = new Set();
     setEditingId("new");
     setSaveStatus("idle");
     setSaveError(null);
@@ -92,6 +103,7 @@ export function IntentSchemaPanel() {
 
   function startEdit(schema: IntentSchema) {
     setDraft(draftFromSchema(schema));
+    existingFieldKeysRef.current = new Set(schema.fields.map((f) => f.field_key));
     setEditingId(schema.id);
     setSaveStatus("idle");
     setSaveError(null);
@@ -238,12 +250,34 @@ export function IntentSchemaPanel() {
         <div className="space-y-3 rounded-lg border border-dashed p-3">
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground">Key (stable id, e.g. insurance_claim)</Label>
-              <Input value={draft.key} onChange={(e) => setDraft((d) => ({ ...d, key: e.target.value }))} />
+              <Label className="text-xs text-muted-foreground">
+                Key (stable id — auto-generated from the label{editingId !== "new" ? ", locked once created" : ""})
+              </Label>
+              <Input value={draft.key} disabled className="font-mono text-muted-foreground" />
             </div>
             <div className="space-y-1">
               <Label className="text-xs text-muted-foreground">Label (shown to the owner)</Label>
-              <Input value={draft.label} onChange={(e) => setDraft((d) => ({ ...d, label: e.target.value }))} />
+              <Input
+                value={draft.label}
+                onChange={(e) => {
+                  const label = e.target.value;
+                  setDraft((d) => ({
+                    ...d,
+                    label,
+                    // Only auto-derive on create — once a schema exists,
+                    // its key is a stable id other things reference (e.g.
+                    // owner-agent's manage_review_queue looks it up by
+                    // key), so editing the label afterward must never
+                    // silently change it.
+                    key: editingId === "new" ? slugifyKey(label) : d.key,
+                  }));
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                This is what the AI reads to decide whether a visitor&apos;s request is something this
+                business handles — be specific (e.g. &quot;Home insurance application&quot;, not just
+                &quot;Application&quot;).
+              </p>
             </div>
           </div>
           <div className="space-y-1">
@@ -262,14 +296,24 @@ export function IntentSchemaPanel() {
             {draft.fields.map((field, i) => (
               <div key={i} className="grid grid-cols-[1fr_1fr_auto_auto_auto] items-center gap-2">
                 <Input
-                  placeholder="field_key"
+                  placeholder="field_key (auto)"
                   value={field.field_key}
-                  onChange={(e) => updateFieldAt(i, { field_key: e.target.value })}
+                  disabled
+                  className="font-mono text-muted-foreground"
                 />
                 <Input
                   placeholder="Label"
                   value={field.label}
-                  onChange={(e) => updateFieldAt(i, { label: e.target.value })}
+                  onChange={(e) => {
+                    const label = e.target.value;
+                    // Only auto-derive for a field that's new in this
+                    // editing session — a field that already existed has
+                    // its key locked, same reasoning as the schema-level
+                    // key above (something else may already reference it
+                    // by that exact key).
+                    const isExisting = existingFieldKeysRef.current.has(field.field_key);
+                    updateFieldAt(i, { label, field_key: isExisting ? field.field_key : slugifyKey(label) });
+                  }}
                 />
                 <Select
                   value={field.field_type}

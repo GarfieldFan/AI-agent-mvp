@@ -19,17 +19,17 @@ import type { ProductListBlock as ProductListBlockData } from "@/lib/theme";
  * automatically on the client — no CORS issue, this is a plain public
  * unauthenticated GET.
  *
- * `product_ids` (2026-08-20) takes priority over `category` when both are
+ * `product_ids` (2026-08-20) takes priority over `tags` when both are
  * set — see lib/theme.ts's ProductListBlock doc comment. Also gained a
  * real `Editable` wrapper this same day — before this, an inserted
  * product-list block had no way to actually set its filter at all once
  * placed (BlockInsertMenu only ever creates the unfiltered default). */
-export function ProductListBlock({ category, product_ids, path }: ProductListBlockData & { path: string }) {
+export function ProductListBlock({ tags, product_ids, path }: ProductListBlockData & { path: string }) {
   const [products, setProducts] = React.useState<Product[] | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
-    listPublicProducts(category ?? null, product_ids ?? null)
+    listPublicProducts(tags ?? null, product_ids ?? null)
       .then((result) => {
         if (!cancelled) setProducts(result);
       })
@@ -39,14 +39,14 @@ export function ProductListBlock({ category, product_ids, path }: ProductListBlo
     return () => {
       cancelled = true;
     };
-  }, [category, product_ids]);
+  }, [tags, product_ids]);
 
   return (
     <Editable
       as="div"
       path={path}
       fieldType="block-product-list"
-      value={{ type: "product-list", category, product_ids }}
+      value={{ type: "product-list", tags, product_ids }}
     >
       {products === null ? (
         <LoadingSpinner label="Loading products…" />

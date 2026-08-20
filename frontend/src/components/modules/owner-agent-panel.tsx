@@ -12,6 +12,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { Pagination } from "@/components/common/pagination";
 import { ApiError } from "@/lib/api";
 import {
   createIntentSchema,
@@ -28,6 +29,8 @@ import {
   type OwnerAgentRunSummary,
 } from "@/lib/owner-agent";
 import { createProduct, updateProduct, type ProductInput } from "@/lib/products";
+
+const HISTORY_PAGE_SIZE = 20;
 
 /** Shape returned by backend/apis/intent_schemas.py's
  * propose_intent_schema — never a database write, just a draft for the
@@ -69,6 +72,8 @@ export function OwnerAgentPanel() {
   const [error, setError] = React.useState<string | null>(null);
   const [result, setResult] = React.useState<OwnerAgentRunResult | null>(null);
   const [history, setHistory] = React.useState<OwnerAgentRunSummary[] | null>(null);
+  const [historyTotal, setHistoryTotal] = React.useState(0);
+  const [historyPage, setHistoryPage] = React.useState(1);
 
   // Schema-proposal review (2026-08-19) — see propose_intent_schema's
   // description in owner-agent/tools.py: the agent never writes a
@@ -93,8 +98,13 @@ export function OwnerAgentPanel() {
   const [productApplyError, setProductApplyError] = React.useState<string | null>(null);
 
   const refreshHistory = React.useCallback(() => {
-    listOwnerAgentRuns().then(setHistory).catch(() => setHistory([]));
-  }, []);
+    listOwnerAgentRuns(HISTORY_PAGE_SIZE, (historyPage - 1) * HISTORY_PAGE_SIZE)
+      .then((result) => {
+        setHistory(result.items);
+        setHistoryTotal(result.total);
+      })
+      .catch(() => setHistory([]));
+  }, [historyPage]);
 
   React.useEffect(() => {
     refreshHistory();
@@ -112,7 +122,12 @@ export function OwnerAgentPanel() {
       const runResult = await runOwnerAgentCommand(command.trim());
       setResult(runResult);
       setStatus("idle");
-      refreshHistory(); // best-effort — owner-agent logs the run to backend itself
+      // best-effort — owner-agent logs the run to backend itself. A new
+      // run sorts first (most-recent-first order) — jump back to page 1
+      // so it's actually visible, same fix as ProductPanel/
+      // DocumentManager's own "new row sorts first" pattern.
+      if (historyPage === 1) refreshHistory();
+      else setHistoryPage(1);
 
       const proposalStep = runResult.steps.find(
         (step) => step.tool === "propose_intent_schema" && step.ok,
@@ -213,7 +228,7 @@ export function OwnerAgentPanel() {
           name: proposal.product.name.trim(),
           description: proposal.product.description?.trim() || null,
           price: proposal.product.price,
-          category: proposal.product.category?.trim() || null,
+          tags: proposal.product.tags ?? [],
           available: proposal.product.available,
         };
         if (proposal.already_exists && proposal.existing_id !== null) {
@@ -397,9 +412,16 @@ export function OwnerAgentPanel() {
                       onChange={(e) => updateProductDraftAt(i, { name: e.target.value })}
                     />
                     <Input
-                      placeholder="Category"
-                      value={proposal.product.category ?? ""}
-                      onChange={(e) => updateProductDraftAt(i, { category: e.target.value })}
+                      placeholder="Tags (comma-separated)"
+                      value={(proposal.product.tags ?? []).join(", ")}
+                      onChange={(e) =>
+                        updateProductDraftAt(i, {
+                          tags: e.target.value
+                            .split(",")
+                            .map((tag) => tag.trim())
+                            .filter(Boolean),
+                        })
+                      }
                     />
                     <Input
                       type="number"
@@ -497,6 +519,9 @@ export function OwnerAgentPanel() {
               </div>
             </details>
           ))}
+          {historyTotal > HISTORY_PAGE_SIZE ? (
+            <Pagination page={historyPage} pageSize={HISTORY_PAGE_SIZE} total={historyTotal} onPageChange={setHistoryPage} />
+          ) : null}
         </div>
       ) : null}
     </div>

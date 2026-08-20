@@ -32,8 +32,20 @@ export function listPages() {
   return apiFetch<PageSummary[]>("/api/agent/pages");
 }
 
-export function listPageVersions(slug: string) {
-  return apiFetch<PageVersionSummary[]>(`/api/agent/pages/${encodeURIComponent(slug)}/versions`);
+export type PageVersionListResult = {
+  items: PageVersionSummary[];
+  total: number;
+};
+
+/** Paginated (2026-08-20, was a plain unbounded fetch of `page.versions`
+ * loaded wholesale via the ORM relationship — see the root AGENTS.md).
+ * `listPages()` above (the list of page slugs, not a slug's own version
+ * history) deliberately stays unpaginated — a handful of pages per site,
+ * not a real pagination candidate. */
+export function listPageVersions(slug: string, limit = 20, offset = 0) {
+  return apiFetch<PageVersionListResult>(
+    `/api/agent/pages/${encodeURIComponent(slug)}/versions?limit=${limit}&offset=${offset}`,
+  );
 }
 
 /** Copies an old version's content into a brand-new version on top —

@@ -35,6 +35,11 @@ export type CrmEntry = {
    * `collected_fields`' keys into real labels. */
   intent_schema_id: number | null;
   collected_fields: Record<string, string>;
+  /** Added 2026-08-20 — a human-handoff stub (see backend/models.py's
+   * CrmEntry.wants_human docstring): true when the visitor explicitly
+   * asked to speak with a person. No live-transfer feature exists yet —
+   * purely a flag for the owner to notice and follow up on manually. */
+  wants_human: boolean;
 };
 
 /** Admin/owner only — see backend/apis/agent.py. Stores the entry in this
@@ -49,8 +54,39 @@ export function pushCrmEntry(entry: {
   return apiFetch<CrmEntry>("/api/agent/crm/entries", { method: "POST", body: entry });
 }
 
-export function listCrmEntries() {
-  return apiFetch<CrmEntry[]>("/api/agent/crm/entries");
+export type CrmEntryListResult = {
+  items: CrmEntry[];
+  total: number;
+};
+
+export type CrmEntryListFilters = {
+  limit?: number;
+  offset?: number;
+  /** Restricts to one IntentSchema's captured entries — what
+   * ReviewQueuePanel uses for each queue's own paginated view
+   * (2026-08-20, see the root AGENTS.md). Omitted = every schema
+   * (and pre-IntentSchema entries). */
+  intentSchemaId?: number;
+  /** Restricts to one of `CrmPanel`'s fixed category groups
+   * (2026-08-20) — `"appointment"|"quote"|"claim"|"inquiry"`, or the
+   * special value `"other"` (anything NOT in that set, including a null
+   * category — matches the backend's own `_KNOWN_CRM_CATEGORIES`
+   * exactly). What lets each of `CrmPanel`'s category sections paginate
+   * independently, mirroring `ReviewQueuePanel`'s per-schema pattern. */
+  category?: string;
+};
+
+/** Paginated (2026-08-20, was a plain unbounded fetch — see the root
+ * AGENTS.md). `limit` defaults to a generous single page (matches the
+ * backend's own default) for a caller that doesn't care about paging —
+ * `CrmPanel`/`ReviewQueuePanel` always pass their own explicit page size. */
+export function listCrmEntries(filters: CrmEntryListFilters = {}) {
+  const params = new URLSearchParams();
+  params.set("limit", String(filters.limit ?? 100));
+  params.set("offset", String(filters.offset ?? 0));
+  if (filters.intentSchemaId !== undefined) params.set("intent_schema_id", String(filters.intentSchemaId));
+  if (filters.category !== undefined) params.set("category", filters.category);
+  return apiFetch<CrmEntryListResult>(`/api/agent/crm/entries?${params.toString()}`);
 }
 
 /** The one mutation a captured lead supports — moving it through

@@ -115,7 +115,12 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "crm_list_entries": ToolSpec(
         name="crm_list_entries",
-        description="Returns every CRM entry captured so far, most recent first. No arguments.",
+        description=(
+            'Returns CRM entries, most recent first, as {"items": [...], "total": <count>}. No '
+            "arguments needed — defaults to the 100 most recent entries, which covers \"every entry\" "
+            'for a typical catalog; pass {"limit": <n>} for more if "total" says there are more than '
+            "you got back."
+        ),
         method="GET",
         path="/api/agent/crm/entries",
     ),
@@ -223,9 +228,11 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "list_products": ToolSpec(
         name="list_products",
         description=(
-            "Returns every product in the owner's catalog (id, name, description, price, category, "
-            "available) — use this BEFORE propose_products to check what already exists, so you don't "
-            "re-propose something that's already there. No arguments."
+            'Returns the owner\'s catalog (id, name, description, price, tags, available) as '
+            '{"items": [...], "total": <count>} — use this BEFORE propose_products to check what '
+            "already exists, so you don't re-propose something that's already there. No arguments "
+            'needed — defaults to the 100 most recent products; pass {"limit": <n>} for more if '
+            '"total" says there are more than you got back.'
         ),
         method="GET",
         path="/api/agent/products",
@@ -236,8 +243,11 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
             "Drafts one or more products for the owner to review — this NEVER creates or changes real "
             "products itself, it only returns a draft. Call list_products first to avoid re-proposing "
             'something that already exists. Args: {"products": [{"name": "<name>", "description": '
-            '"<optional>", "price": <number>, "category": "<optional, e.g. Coffee, Pastry, Digital '
-            'download>", "available": true}]}. Get prices right — a real customer will be quoted whatever '
+            '"<optional>", "price": <number>, "tags": ["<optional, e.g. \\"Coffee\\", plus a translation '
+            'like \\"咖啡\\" if the business serves multi-lingual customers>"], "available": true}]}. '
+            "Add multiple tags freely — a product can carry both a category-like tag and a translation, "
+            "which is also what makes cross-lingual product search work. Get prices right — a real "
+            "customer will be quoted whatever "
             "you propose once the owner applies it. After calling this, tell the owner a draft is ready "
             "to review in the Owner agent panel — never claim any product has already been created."
         ),
@@ -300,7 +310,9 @@ async def execute_tool(spec: ToolSpec, args: dict, bearer_token: str) -> tuple[b
     """Never raises — a network/timeout failure becomes a {"error": ...}
     result the model sees in its next turn and can react to (retry, adjust,
     or give up gracefully), same as a backend 4xx/5xx does. The result
-    itself isn't always a dict — crm_list_entries returns a JSON array."""
+    itself isn't always a dict — e.g. list_intent_schemas returns a JSON
+    array. (crm_list_entries/list_products used to be array responses too,
+    before 2026-08-20's pagination — now {"items": [...], "total": N}.)"""
     path = spec.path
     remaining_args = dict(args)
     for param in _PATH_PARAM_RE.findall(path):

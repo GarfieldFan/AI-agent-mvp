@@ -39,14 +39,14 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import Text, cast, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from apis.chat import _get_or_create_session
 from apis.deps import Role, require_role
-from cart import apply_order_delta, find_active_order, search_products
+from cart import apply_order_delta, count_search_products, find_active_order, search_products
 from db import get_db
-from models import AppSettings, Order, Product, ProductFieldDefinition, ProductRelation
+from models import AppSettings, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation
 
 admin_router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -94,7 +94,7 @@ class ProductPayload(BaseModel):
     name: str
     description: str | None = None
     price: float
-    category: str | None = None
+    tags: list[str] = []
     available: bool = True
     image_url: str | None = None
     custom_fields: dict = {}
@@ -113,7 +113,7 @@ def _to_product_summary(db: Session, row: Product) -> ProductSummary:
         name=row.name,
         description=row.description,
         price=float(row.price),
-        category=row.category,
+        tags=row.tags,
         available=row.available,
         image_url=row.image_url,
         custom_fields=row.custom_fields,
@@ -123,10 +123,28 @@ def _to_product_summary(db: Session, row: Product) -> ProductSummary:
     )
 
 
-@admin_router.get("/agent/products", response_model=list[ProductSummary])
-def list_products(db: Session = Depends(get_db)) -> list[ProductSummary]:
-    rows = db.execute(select(Product).order_by(Product.created_at.desc())).scalars().all()
-    return [_to_product_summary(db, r) for r in rows]
+class ProductListResponse(BaseModel):
+    items: list[ProductSummary]
+    total: int
+
+
+@admin_router.get("/agent/products", response_model=ProductListResponse)
+def list_products(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)) -> ProductListResponse:
+    """Paginated (2026-08-20, was a plain unbounded list — real UI pain
+    once a catalog grows past a screenful, see the root AGENTS.md).
+    `limit` defaults to 100, not `ProductPanel`'s own page size (20) —
+    this default only matters to a caller that never passes the param at
+    all, which today means owner-agent's `list_products` tool (its own
+    description still says "returns every product," used to check for
+    duplicates before `propose_products` drafts one — a small page would
+    silently miss existing products past page 1). `ProductPanel` always
+    passes its own explicit `limit`/`offset`, so this default doesn't
+    constrain it at all."""
+    total = db.execute(select(func.count()).select_from(Product)).scalar_one()
+    rows = (
+        db.execute(select(Product).order_by(Product.created_at.desc()).limit(limit).offset(offset)).scalars().all()
+    )
+    return ProductListResponse(items=[_to_product_summary(db, r) for r in rows], total=total)
 
 
 @admin_router.post("/agent/products", response_model=ProductSummary)
@@ -139,7 +157,7 @@ def create_product(req: ProductPayload, db: Session = Depends(get_db)) -> Produc
         name=req.name.strip(),
         description=req.description,
         price=req.price,
-        category=req.category,
+        tags=req.tags or [],
         available=req.available,
         image_url=req.image_url,
         custom_fields=req.custom_fields or {},
@@ -162,7 +180,7 @@ def update_product(product_id: int, req: ProductPayload, db: Session = Depends(g
     row.name = req.name.strip()
     row.description = req.description
     row.price = req.price
-    row.category = req.category
+    row.tags = req.tags or []
     row.available = req.available
     row.image_url = req.image_url
     row.custom_fields = req.custom_fields or {}
@@ -412,6 +430,8 @@ class OrderItemSummary(BaseModel):
     unit_price_snapshot: float
     quantity: int
     subtotal: float
+    comment: str | None
+    served: bool
 
 
 class OrderSummary(BaseModel):
@@ -445,6 +465,8 @@ def _to_order_summary(row: Order) -> OrderSummary:
                 unit_price_snapshot=float(i.unit_price_snapshot),
                 quantity=i.quantity,
                 subtotal=float(i.subtotal),
+                comment=i.comment,
+                served=i.served,
             )
             for i in row.items
         ],
@@ -452,14 +474,62 @@ def _to_order_summary(row: Order) -> OrderSummary:
     )
 
 
-@admin_router.get("/agent/orders", response_model=list[OrderSummary])
-def list_orders(db: Session = Depends(get_db)) -> list[OrderSummary]:
+class OrderListResponse(BaseModel):
+    items: list[OrderSummary]
+    total: int
+
+
+@admin_router.get("/agent/orders", response_model=OrderListResponse)
+def list_orders(
+    limit: int = 20,
+    offset: int = 0,
+    q: str | None = None,
+    status: str | None = None,
+    is_open: bool | None = None,
+    db: Session = Depends(get_db),
+) -> OrderListResponse:
+    """Paginated + server-side filtered (2026-08-20, was a plain
+    unbounded list with the same search/status/open filtering done
+    client-side in `OrderPanel` — moved server-side specifically because
+    client-side filtering only ever sees whatever page happened to be
+    loaded, so a real search would silently miss an order that exists
+    but isn't on the current page. `q` matches order id (cast to text),
+    contact_name/email, pickup_time, note, OR any of the order's own
+    item names — the same fields `OrderPanel`'s pre-pagination client
+    filter checked, just run in SQL now."""
+    filters = []
+    if status is not None:
+        filters.append(Order.status == status)
+    if is_open is not None:
+        filters.append(Order.is_open == is_open)
+    if q and q.strip():
+        q_like = f"%{q.strip()}%"
+        item_match = select(OrderItem.order_id).where(OrderItem.item_name_snapshot.ilike(q_like))
+        filters.append(
+            or_(
+                cast(Order.id, Text).ilike(q_like),
+                Order.contact_name.ilike(q_like),
+                Order.contact_email.ilike(q_like),
+                Order.pickup_time.ilike(q_like),
+                Order.note.ilike(q_like),
+                Order.id.in_(item_match),
+            )
+        )
+
+    total = db.execute(select(func.count()).select_from(Order).where(*filters)).scalar_one()
     rows = (
-        db.execute(select(Order).options(selectinload(Order.items)).order_by(Order.created_at.desc()))
+        db.execute(
+            select(Order)
+            .options(selectinload(Order.items))
+            .where(*filters)
+            .order_by(Order.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
         .scalars()
         .all()
     )
-    return [_to_order_summary(r) for r in rows]
+    return OrderListResponse(items=[_to_order_summary(r) for r in rows], total=total)
 
 
 class UpdateOrderRequest(BaseModel):
@@ -484,6 +554,34 @@ def update_order(order_id: int, req: UpdateOrderRequest, db: Session = Depends(g
     return _to_order_summary(row)
 
 
+class UpdateOrderItemRequest(BaseModel):
+    served: bool | None = None
+    comment: str | None = None
+
+
+@admin_router.patch("/agent/order-items/{item_id}", response_model=OrderSummary)
+def update_order_item(item_id: int, req: UpdateOrderItemRequest, db: Session = Depends(get_db)) -> OrderSummary:
+    """Staff-side per-line kitchen controls (2026-08-20) — `served` is
+    what OrderPanel's per-item toggle calls (own the ticket floor: which
+    dishes are out, which are still coming); `comment` is here too so
+    staff can correct a garbled customer note, not just read it. Neither
+    is exposed to owner-agent — see OrderItem's own docstring for why
+    this is a live kitchen action, not a cheap config value. Returns the
+    whole parent OrderSummary (not just the one item) since OrderPanel
+    already renders a full order at a time, same shape as update_order."""
+    row = db.get(OrderItem, item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Order item not found.")
+    if req.served is not None:
+        row.served = req.served
+    if req.comment is not None:
+        row.comment = req.comment.strip() or None
+    db.commit()
+    order = db.get(Order, row.order_id)
+    db.refresh(order)
+    return _to_order_summary(order)
+
+
 # =========================================================================
 # Public storefront surface (no auth) — apis/pages.py's public_router split
 # =========================================================================
@@ -494,7 +592,7 @@ class PublicProductSummary(BaseModel):
     name: str
     description: str | None
     price: float
-    category: str | None
+    tags: list[str]
     image_url: str | None
     custom_fields: dict
     bundle_items: list[RelationSummary] = []
@@ -507,7 +605,7 @@ def _to_public_summary(db: Session, row: Product) -> PublicProductSummary:
         name=row.name,
         description=row.description,
         price=float(row.price),
-        category=row.category,
+        tags=row.tags,
         image_url=row.image_url,
         custom_fields=row.custom_fields,
         bundle_items=_relations_for(db, row.id, "bundle"),
@@ -530,19 +628,26 @@ def list_public_product_fields(db: Session = Depends(get_db)) -> list[ProductFie
 
 @public_router.get("/products", response_model=list[PublicProductSummary])
 def list_public_products(
-    category: str | None = None, ids: str | None = None, db: Session = Depends(get_db)
+    tags: str | None = None, ids: str | None = None, db: Session = Depends(get_db)
 ) -> list[PublicProductSummary]:
     """What the ProductList Block fetches (client-side — see that
     component's own docstring for why) — available products only.
 
     `ids` (2026-08-20, comma-separated product ids) is an explicit
     allow-list — "feature exactly these products, in this order" (e.g. a
-    homepage bestsellers strip) — and takes priority over `category` when
+    homepage bestsellers strip) — and takes priority over `tags` when
     both are given; the two aren't meant to be combined. Results are
     reordered to match the given id order (SQL `IN` doesn't preserve it),
     so "id list = display order" holds. An id with no matching *available*
     product is silently dropped, not an error — same "degrade, don't
-    break the page" posture as every other page-rendering read here."""
+    break the page" posture as every other page-rendering read here.
+
+    `tags` (comma-separated, replaced the old single `category` param
+    2026-08-20 — see `models.Product`'s docstring) matches a product if
+    ANY given tag appears as a substring of its own tags list (same
+    cast-to-text `ILIKE` approach as `cart.search_products`, kept
+    consistent rather than introducing a second, differently-behaved
+    matching mechanism just for this one filter)."""
     if ids:
         try:
             id_list = [int(part) for part in ids.split(",") if part.strip()]
@@ -558,14 +663,24 @@ def list_public_products(
         return [_to_public_summary(db, r) for r in ordered]
 
     stmt = select(Product).where(Product.available.is_(True))
-    if category:
-        stmt = stmt.where(Product.category == category)
+    if tags:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        if tag_list:
+            tag_conditions = [cast(Product.tags, Text).ilike(f"%{t}%") for t in tag_list]
+            combined = tag_conditions[0]
+            for cond in tag_conditions[1:]:
+                combined = combined | cond
+            stmt = stmt.where(combined)
     rows = db.execute(stmt.order_by(Product.created_at.desc())).scalars().all()
     return [_to_public_summary(db, r) for r in rows]
 
 
 class ProductSearchResponse(BaseModel):
     products: list[PublicProductSummary]
+    # Added 2026-08-20 for /search's own pagination — total match count
+    # ignoring limit/offset, from cart.count_search_products (shares its
+    # filter condition with search_products so the two can't disagree).
+    total: int = 0
 
 
 # Registered BEFORE /products/{product_id} — FastAPI matches routes in
@@ -574,12 +689,19 @@ class ProductSearchResponse(BaseModel):
 # or a request to /products/search gets swallowed as product_id="search"
 # (a real bug caught here: it 422'd with "search" isn't a valid int).
 @public_router.get("/products/search", response_model=ProductSearchResponse)
-def search_products_endpoint(q: str, limit: int = 20, db: Session = Depends(get_db)) -> ProductSearchResponse:
+def search_products_endpoint(
+    q: str, limit: int = 20, offset: int = 0, db: Session = Depends(get_db)
+) -> ProductSearchResponse:
     """Wraps cart.search_products directly — what /search and the chat
     pipeline's own search path both ultimately reuse, so a visitor gets
-    the identical result set whether they browse the page or ask in chat."""
-    rows = search_products(db, q, limit=limit)
-    return ProductSearchResponse(products=[_to_public_summary(db, r) for r in rows])
+    the identical result set whether they browse the page or ask in chat.
+    `offset`/`total` (2026-08-20) close a real known gap: this used to
+    hard-cap at `limit` with no "showing X of N" signal at all — a query
+    matching more than `limit` products silently dropped the rest with
+    no indication anything was cut off (see the root AGENTS.md)."""
+    rows = search_products(db, q, limit=limit, offset=offset)
+    total = count_search_products(db, q)
+    return ProductSearchResponse(products=[_to_public_summary(db, r) for r in rows], total=total)
 
 
 @public_router.get("/products/{product_id}", response_model=PublicProductSummary)
@@ -596,6 +718,10 @@ class CartAddRequest(BaseModel):
     session_id: str
     product_id: int
     quantity: int = 1
+    # A per-line customization note ("less sugar", "extra spicy") — see
+    # cart.apply_order_delta's docstring for why this is part of what
+    # identifies a distinct line, not just product_id.
+    comment: str | None = None
 
 
 class CartAddResponse(BaseModel):
@@ -624,7 +750,7 @@ def add_to_cart(req: CartAddRequest, db: Session = Depends(get_db)) -> CartAddRe
         db.add(order)
         db.flush()  # populates order.id before apply_order_delta's OrderItem rows reference it
 
-    apply_order_delta(db, order, product, req.quantity)
+    apply_order_delta(db, order, product, req.quantity, comment=req.comment)
     db.commit()
     db.refresh(order)
     return CartAddResponse(order_id=order.id, total_amount=float(order.total_amount))
@@ -645,40 +771,93 @@ def get_cart(session_id: str, db: Session = Depends(get_db)) -> OrderSummary | N
 
 class CartUpdateRequest(BaseModel):
     session_id: str
-    product_id: int
+    # Targets the specific OrderItem row (2026-08-20, was product_id) —
+    # a product can now have more than one line in the same cart when
+    # lines carry different comments (see cart.apply_order_delta's
+    # docstring), so product_id alone can no longer say which line the
+    # visitor's +/-/Remove control meant.
+    item_id: int
     # Unlike CartAddRequest.quantity (always positive, "add this many"),
     # this can be negative — the /cart page's quantity stepper and Remove
-    # button both resolve to this one endpoint, reusing apply_order_delta
-    # exactly like every other cart mutation in this app (never a second,
-    # divergent mutation path).
+    # button both resolve to this one endpoint. Remove is just a delta
+    # equal to -(current quantity), computed client-side from what
+    # GET /cart already returned.
     quantity_delta: int
 
 
 @public_router.post("/cart/update", response_model=CartAddResponse)
 def update_cart_item(req: CartUpdateRequest, db: Session = Depends(get_db)) -> CartAddResponse:
-    """The /cart page's quantity +/- and Remove controls — Remove is just
-    a delta equal to -(current quantity), computed client-side from what
-    GET /cart already returned. Decrementing/removing an item already in
-    the cart is always allowed even if the product has since become
-    unavailable (a visitor must always be able to take something OUT of
-    their cart); only a positive delta (adding more) is blocked for an
-    unavailable/missing product, mirroring add_to_cart's own check."""
+    """Decrementing/removing an item already in the cart is always
+    allowed even if the product has since become unavailable (a visitor
+    must always be able to take something OUT of their cart); only a
+    positive delta (adding more) is blocked for an unavailable/missing
+    product, mirroring add_to_cart's own check. Ownership is implicit —
+    the item must belong to this session's own active order, never just
+    any item_id.
+
+    **The one exception: an already-`served` line is fully locked**
+    (2026-08-20, real bug fix) — once the kitchen marks a line served
+    (`OrderPanel`), a visitor can no longer change its quantity or
+    remove it at all, not even a decrease. Before this fix, a visitor
+    could delete a dish after it was already delivered (free food) or
+    silently change what the final bill reflects versus what was
+    actually served (a dispute waiting to happen). Ordering more of the
+    same product after its line is served opens a new, separate,
+    unserved line instead — see cart.apply_order_delta's docstring."""
     if req.quantity_delta == 0:
         raise HTTPException(status_code=400, detail="quantity_delta must not be zero.")
-    product = db.get(Product, req.product_id)
-    if product is None or (req.quantity_delta > 0 and not product.available):
-        raise HTTPException(status_code=404, detail="Product not found.")
 
     session = _get_or_create_session(db, req.session_id, None)
     order = find_active_order(db, session.id)
-    if order is None:
-        if req.quantity_delta <= 0:
-            raise HTTPException(status_code=404, detail="No active cart to update.")
-        order = Order(chat_session_id=session.id, is_open=True)
-        db.add(order)
-        db.flush()  # populates order.id before apply_order_delta's OrderItem rows reference it
+    item = next((i for i in order.items if i.id == req.item_id), None) if order else None
+    if item is None:
+        raise HTTPException(status_code=404, detail="Cart item not found.")
+    if item.served:
+        raise HTTPException(
+            status_code=400, detail="This item has already been served and can no longer be changed."
+        )
+    if req.quantity_delta > 0:
+        product = db.get(Product, item.product_id) if item.product_id is not None else None
+        if product is None or not product.available:
+            raise HTTPException(status_code=404, detail="Product not found.")
 
-    apply_order_delta(db, order, product, req.quantity_delta)
+    new_quantity = item.quantity + req.quantity_delta
+    if new_quantity <= 0:
+        order.items.remove(item)
+    else:
+        item.quantity = new_quantity
+        item.subtotal = float(item.unit_price_snapshot) * new_quantity
+    order.total_amount = sum((float(i.subtotal) for i in order.items), 0.0)
+
+    db.commit()
+    db.refresh(order)
+    return CartAddResponse(order_id=order.id, total_amount=float(order.total_amount))
+
+
+class CartItemCommentRequest(BaseModel):
+    session_id: str
+    comment: str | None = None
+
+
+@public_router.post("/cart/item/{item_id}/comment", response_model=CartAddResponse)
+def update_cart_item_comment(
+    item_id: int, req: CartItemCommentRequest, db: Session = Depends(get_db)
+) -> CartAddResponse:
+    """Lets a visitor attach, edit, or clear a per-line customization
+    note ("less sugar", "extra spicy") on an item already in their cart
+    (2026-08-20) — separate from /cart/update since a comment edit isn't
+    a quantity change. `comment: null`/empty clears it. Ownership scoped
+    to this session's own active order, same as update_cart_item."""
+    session = _get_or_create_session(db, req.session_id, None)
+    order = find_active_order(db, session.id)
+    item = next((i for i in order.items if i.id == item_id), None) if order else None
+    if item is None:
+        raise HTTPException(status_code=404, detail="Cart item not found.")
+    if item.served:
+        raise HTTPException(
+            status_code=400, detail="This item has already been served and can no longer be changed."
+        )
+    item.comment = (req.comment or "").strip() or None
     db.commit()
     db.refresh(order)
     return CartAddResponse(order_id=order.id, total_amount=float(order.total_amount))

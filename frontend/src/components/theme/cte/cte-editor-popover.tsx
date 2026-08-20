@@ -302,11 +302,11 @@ const BORDER_WIDTH_OPTIONS = [
   { value: "thick" as const, label: "Thick" },
 ];
 // ProductListBlock's filter mode (2026-08-20) — not a schema field itself,
-// just this popover's own UI state for choosing which of category/
+// just this popover's own UI state for choosing which of tags/
 // product_ids (mutually exclusive on the wire, see lib/theme.ts) is active.
 const PRODUCT_FILTER_OPTIONS = [
   { value: "all" as const, label: "Every available product" },
-  { value: "category" as const, label: "One category" },
+  { value: "tags" as const, label: "By tag" },
   { value: "ids" as const, label: "Specific products" },
 ];
 const BUTTON_ACTION_OPTIONS = [
@@ -462,19 +462,19 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
   const [bbProductId, setBbProductId] = React.useState<number | null>(buttonBlockValue?.product_id ?? null);
 
   // block-product-list draft (2026-08-20) — `plFilterMode` is this
-  // popover's own UI state, not a schema field: category/product_ids are
+  // popover's own UI state, not a schema field: tags/product_ids are
   // mutually exclusive on the wire (see lib/theme.ts), so the form only
   // ever writes one of them back, derived from whichever the stored value
   // already had set.
   const productListValue = fieldType === "block-product-list" ? (value as ProductListBlockValue) : null;
-  const [plFilterMode, setPlFilterMode] = React.useState<"all" | "category" | "ids">(
+  const [plFilterMode, setPlFilterMode] = React.useState<"all" | "tags" | "ids">(
     productListValue?.product_ids && productListValue.product_ids.length > 0
       ? "ids"
-      : productListValue?.category
-        ? "category"
+      : productListValue?.tags && productListValue.tags.length > 0
+        ? "tags"
         : "all",
   );
-  const [plCategory, setPlCategory] = React.useState(productListValue?.category ?? "");
+  const [plTags, setPlTags] = React.useState((productListValue?.tags ?? []).join(", "));
   const [plProductIds, setPlProductIds] = React.useState<number[]>(productListValue?.product_ids ?? []);
 
   // block-product-card draft (2026-08-20)
@@ -497,7 +497,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
   React.useEffect(() => {
     if (!needsCatalog || catalog !== null) return;
     listProducts()
-      .then(setCatalog)
+      .then((result) => setCatalog(result.items))
       .catch(() => setCatalog([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [needsCatalog]);
@@ -590,9 +590,13 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         product_id: bbProductId,
       } satisfies ButtonBlockValue;
     } else if (fieldType === "block-product-list" && productListValue) {
+      const parsedTags = plTags
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean);
       return {
         ...productListValue,
-        category: plFilterMode === "category" ? plCategory || null : null,
+        tags: plFilterMode === "tags" && parsedTags.length > 0 ? parsedTags : null,
         product_ids: plFilterMode === "ids" ? plProductIds : null,
       } satisfies ProductListBlockValue;
     } else if (fieldType === "block-product-card" && productCardValue) {
@@ -677,7 +681,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
     bbAction,
     bbProductId,
     plFilterMode,
-    plCategory,
+    plTags,
     plProductIds,
     pcProductId,
   ]);
@@ -901,13 +905,13 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
                 options={PRODUCT_FILTER_OPTIONS}
                 onChange={(v) => v && setPlFilterMode(v)}
               />
-              {plFilterMode === "category" ? (
+              {plFilterMode === "tags" ? (
                 <div className="space-y-1">
-                  <label className="text-xs font-medium text-muted-foreground">Category</label>
+                  <label className="text-xs font-medium text-muted-foreground">Tags (comma-separated, any match)</label>
                   <Input
-                    value={plCategory}
-                    onChange={(event) => setPlCategory(event.target.value)}
-                    placeholder="e.g. Coffee"
+                    value={plTags}
+                    onChange={(event) => setPlTags(event.target.value)}
+                    placeholder="e.g. Coffee, 咖啡"
                     autoFocus
                   />
                 </div>

@@ -143,6 +143,25 @@ router = APIRouter()
 # not "the chatbot can't see its own documents."
 MIN_CITATION_SCORE = 0.4
 
+# How many of the most recent history messages actually get sent to the
+# LLM (2026-08-20) — the client sends the visitor's ENTIRE conversation
+# every turn (frontend/src/lib/chat.ts's sendChatMessage has no cap of
+# its own), and until this constant existed, this handler forwarded all
+# of it verbatim to up to three LLM calls a turn (order extraction, lead
+# extraction, the main reply — see the concurrency comment below). A
+# long-running conversation was resending its whole history every single
+# turn, real unbounded latency/cost growth, not just a theoretical
+# concern. Truncating here (not client-side) keeps `ChatMessage`'s own
+# DB persistence — and the client's own in-memory `messages` state, so a
+# visitor can still scroll their own full conversation — completely
+# unaffected; only what actually reaches the model is bounded. 20 keeps
+# roughly the last 10 user/assistant turn pairs, a plain "recent window"
+# rather than a real summarization/compaction strategy — a coarser tool
+# than this app needs today, and a real regression: cross-turn context
+# older than the window (e.g. something said 15 turns ago) genuinely
+# stops being visible to the model, not just to a human skimming.
+MAX_HISTORY_MESSAGES = 20
+
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant embedded in a developer's portfolio website. "
     "If document excerpts are provided below a question, treat them as your "
@@ -168,6 +187,20 @@ SYSTEM_PROMPT = (
     "need, and if they haven't given a contact email yet, ask for one so "
     "the team can follow up. Once they've given you an email, confirm "
     "you've noted their request — don't ask for it again. If a message "
+    "below starts with '(Available request types', that lists every kind "
+    "of request this business is actually configured to handle — treat a "
+    "match against that list as authoritative confirmation you offer it, "
+    "confirm you can help, and start collecting what's needed, even if "
+    "the knowledge-base excerpts above say nothing about it (a configured "
+    "request type is a deliberate business decision the owner made; the "
+    "knowledge base is just background documents, and staying silent on "
+    "a topic there doesn't mean it's out of scope). Only when a visitor "
+    "asks about something that matches NEITHER the knowledge-base "
+    "excerpts NOR that list should you say honestly that you're not sure "
+    "that's something this business provides and a team member can "
+    "confirm, rather than assuming yes just to be agreeable. This doesn't "
+    "apply to general knowledge questions (math, trivia, etc.) — only to "
+    "claims about what this specific business does or sells. If a message "
     "below starts with '(Signed-in visitor', the visitor is logged in and "
     "you already know their email and past requests from that block — "
     "don't ask them who they are or for their email, and greet a "
@@ -260,6 +293,35 @@ def _in_progress_context_block(schema: IntentSchema, entry: CrmEntry) -> str:
     )
 
 
+def _available_request_types_block(schemas: list[IntentSchema]) -> str | None:
+    """Folded into the MAIN reply's context (2026-08-20), unconditionally
+    whenever any IntentSchema exists — not just an already-in-progress one
+    (`_in_progress_context_block` above only fires from turn 2+ of a
+    specific request already underway). Without this, the reply's own
+    prose had no way to know what kinds of requests this business
+    actually handles beyond whatever the RAG-retrieved knowledge-base
+    documents happen to say — a real, confirmed problem (found 2026-08-20,
+    a business whose uploaded documents describe real-estate but has an
+    `insurance_application` schema configured): the reply would hedge
+    ("not sure that's something we offer") on a request a schema was
+    LITERALLY SET UP TO COLLECT, because RAG grounding was silent on it.
+
+    A configured schema is a stronger, more deliberate signal of business
+    scope than whatever happens to be in the knowledge base — an owner
+    doesn't add a schema by accident. So `SYSTEM_PROMPT` is written to
+    treat a match against this block as authoritative: confirm the
+    business handles it and start collecting, even with zero RAG support.
+    RAG documents keep their own job (answering factual questions), this
+    block owns "is this in scope at all.\""""
+    if not schemas:
+        return None
+    lines = "\n".join(f"- {s.label}: {s.description}" for s in schemas)
+    return (
+        f"(Available request types this business handles, regardless of what the knowledge-base "
+        f"documents above do or don't mention:\n{lines})"
+    )
+
+
 def _lead_extraction_system_prompt(
     known_email: str | None,
     attachment_info: dict | None,
@@ -301,10 +363,12 @@ def _lead_extraction_system_prompt(
             '{"is_lead": true or false, "category": "appointment" or "quote" or "claim" or "inquiry" or null, '
             '"contact_email": "<the email address, or null>", "contact_name": "<the visitor\'s name, or '
             'null>", "contact_phone": "<a phone number, or null>", "summary": "<one concise sentence '
-            'describing what they want, for a human reviewing this later>"}\n\n'
+            'describing what they want, for a human reviewing this later>", "wants_human": true or false}\n\n'
             "Set is_lead to false for small talk, general questions, or a real request that has no contact "
             "email anywhere in the conversation, no signed-in account email, and no attachment-analysis email "
-            "above. Never invent a value that isn't actually present in the conversation text or given above."
+            "above. Never invent a value that isn't actually present in the conversation text or given above. "
+            "Set wants_human to true only if the visitor explicitly asks to speak with a person/human/team "
+            "member directly, rather than continuing with the chatbot."
         )
 
     # Owner-configured schema mode (2026-08-19) — the category list and
@@ -349,12 +413,15 @@ def _lead_extraction_system_prompt(
         '"contact_email": "<the email address, or null>", "contact_name": "<the visitor\'s name, or '
         'null>", "contact_phone": "<a phone number, or null>", "summary": "<one concise sentence '
         'describing what they want, for a human reviewing this later>", '
-        '"fields": {"<field_key>": "<value>", ...}}\n\n'
+        '"fields": {"<field_key>": "<value>", ...}, "wants_human": true or false}\n\n'
         "Only include a field_key in \"fields\" if you found an actual value for it in THIS "
         "conversation (new or already given) — never invent one, never include a field_key that isn't "
         "listed under the matched schema_key above. Set is_lead to false for small talk, general "
         "questions, or a request that doesn't match any schema above and has no contact email anywhere "
-        "in the conversation, no signed-in account email, and no attachment-analysis email above."
+        "in the conversation, no signed-in account email, and no attachment-analysis email above. Set "
+        "wants_human to true only if the visitor explicitly asks to speak with a person/human/team "
+        "member directly, rather than continuing with the chatbot — independent of whether is_lead/"
+        "schema_key match anything above."
     )
 
 
@@ -413,6 +480,7 @@ async def _lead_extraction_call(
 def _apply_lead_capture(
     db: Session,
     parsed: dict | None,
+    message: str = "",
     known_email: str | None = None,
     attachment_url: str | None = None,
     attachment_info: dict | None = None,
@@ -463,6 +531,8 @@ def _apply_lead_capture(
         if not isinstance(summary, str) or not summary.strip():
             summary = message[:500]
 
+        wants_human = bool(parsed.get("wants_human"))
+
         matched_schema = None
         if schemas:
             schema_key = parsed.get("schema_key")
@@ -487,6 +557,8 @@ def _apply_lead_capture(
                     active_entry.contact_phone = contact_phone.strip()
                 if attachment_url and not active_entry.attachment_url:
                     active_entry.attachment_url = attachment_url
+                if wants_human and not active_entry.wants_human:
+                    active_entry.wants_human = True
                 db.commit()
             else:
                 db.add(
@@ -501,6 +573,7 @@ def _apply_lead_capture(
                         intent_schema_id=matched_schema.id,
                         collected_fields=new_fields,
                         chat_session_id=chat_session_id,
+                        wants_human=wants_human,
                     )
                 )
                 db.commit()
@@ -525,6 +598,7 @@ def _apply_lead_capture(
                 tags=["source:chat"],
                 attachment_url=attachment_url,
                 chat_session_id=chat_session_id,
+                wants_human=wants_human,
             )
         )
         db.commit()
@@ -569,7 +643,7 @@ def _menu_context_block(products: list[Product]) -> str:
     context) — so the assistant can answer "what do you have" / "how
     much is a latte" from the real catalog, not just capture orders."""
     lines = "\n".join(
-        f"- #{p.id} {p.name} — ${float(p.price):.2f}" + (f" ({p.category})" if p.category else "")
+        f"- #{p.id} {p.name} — ${float(p.price):.2f}" + (f" ({', '.join(p.tags)})" if p.tags else "")
         for p in products
     )
     return f"(Available products:\n{lines})"
@@ -1008,6 +1082,10 @@ async def chat(
     before this existed."""
     sources: list[ChatSource] = []
     user_content = req.message
+    # Bounded view of the conversation actually sent to the LLM — see
+    # MAX_HISTORY_MESSAGES's own comment. Every use of the visitor's
+    # history below reads this, never req.history directly.
+    history = req.history[-MAX_HISTORY_MESSAGES:]
 
     # Logged (and committed) before the provider call so the question
     # itself is captured for market-research review even if generation
@@ -1120,6 +1198,10 @@ async def chat(
         if active_schema is not None and active_entry is not None:
             user_content = f"{_in_progress_context_block(active_schema, active_entry)}\n\n{user_content}"
 
+        available_request_types_block = _available_request_types_block(intent_schemas)
+        if available_request_types_block:
+            user_content = f"{available_request_types_block}\n\n{user_content}"
+
         if products:
             user_content = f"{_menu_context_block(products)}\n\n{user_content}"
         if active_order is not None:
@@ -1143,14 +1225,14 @@ async def chat(
         # resolve (below), since its context needs the real
         # order/total — see this module's "Product ordering" section.
         order_extraction_task = (
-            asyncio.create_task(_order_extraction_call(provider, req.history, req.message, active_order))
+            asyncio.create_task(_order_extraction_call(provider, history, req.message, active_order))
             if products
             else None
         )
         lead_extraction_task = asyncio.create_task(
             _lead_extraction_call(
                 provider,
-                req.history,
+                history,
                 req.message,
                 current.email,
                 req.attachment_url,
@@ -1171,7 +1253,7 @@ async def chat(
             f"{user_content}{_attachment_note(req.attachment_url)}{_attachment_info_note(attachment_info)}"
         )
 
-        messages = [{"role": turn.role, "content": turn.content} for turn in req.history]
+        messages = [{"role": turn.role, "content": turn.content} for turn in history]
         messages.append({"role": "user", "content": user_content})
 
         try:
@@ -1192,13 +1274,14 @@ async def chat(
         _apply_lead_capture(
             db,
             lead_parsed,
-            current.email,
-            req.attachment_url,
-            attachment_info,
-            chat_session_id,
-            intent_schemas,
-            active_schema,
-            active_entry,
+            message=req.message,
+            known_email=current.email,
+            attachment_url=req.attachment_url,
+            attachment_info=attachment_info,
+            chat_session_id=chat_session_id,
+            schemas=intent_schemas,
+            active_schema=active_schema,
+            active_entry=active_entry,
         )
 
         apply_resolved_order_turn(db, chat_session_id, current.email, active_order, order_turn)
@@ -1208,6 +1291,35 @@ async def chat(
             db.commit()
 
         response_products, search_link = _order_turn_response_fields(order_turn)
+        # A turn the order-extraction call itself classified as being
+        # about the product catalog is a strictly more specific, more
+        # authoritative source than a RAG chunk that merely cleared
+        # MIN_CITATION_SCORE's own admittedly-weak threshold (see that
+        # constant's docstring — score alone can't reliably separate
+        # relevant from not). Found from a real report (2026-08-20): a
+        # visitor asked "do you have coffee," got a correct product-catalog
+        # answer (from `_menu_context_block`, unconditionally present —
+        # never RAG), but the reply still showed an unrelated company PDF
+        # as a "Source," since that chunk happened to score just above the
+        # threshold despite having nothing to do with the question.
+        # Deliberately checked on `order_turn`'s own raw fields, not just
+        # `response_products`/`search_link` — that browse query resolved
+        # to *zero* matching products ("咖啡" isn't literal text on any
+        # of these products' name/tags — a cross-lingual search miss, see
+        # `models.Product.tags`'s docstring for the fix), so response_products/
+        # search_link were both None even though the turn was genuinely,
+        # confidently about the catalog; checking `search_phrase` (set by
+        # the extraction call whenever the visitor asks what's available,
+        # independent of how many products it resolves to) catches this
+        # case too.
+        if (
+            response_products is not None
+            or search_link is not None
+            or order_turn.search_phrase is not None
+            or order_turn.resolved
+            or order_turn.ambiguous
+        ):
+            sources = []
         return ChatResponse(reply=reply, sources=sources, products=response_products, search_link=search_link)
     finally:
         chat_request_finished()

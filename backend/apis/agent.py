@@ -30,7 +30,7 @@ from typing import Annotated, Literal, Union
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 import chat_attachments
@@ -312,11 +312,13 @@ class ContainerBlock(BaseModel):
 
 class ProductListBlock(BaseModel):
     type: Literal["product-list"] = "product-list"
-    # None = every available product; set to filter to one category
-    # (matches Product.category's own free-text values, e.g. "Coffee").
-    category: str | None = None
+    # None/empty = every available product; set to filter to products
+    # carrying any of these tags (2026-08-20, replaced the old single
+    # `category: str | None` — matches `Product.tags`, see that model's
+    # docstring for why).
+    tags: list[str] | None = None
     # Added 2026-08-20 — an explicit ordered allow-list, takes priority
-    # over `category` when both are set. See the matching frontend field's
+    # over `tags` when both are set. See the matching frontend field's
     # doc comment for the full "feature exactly these products" design.
     product_ids: list[int] | None = None
     width: BlockWidth = "auto"
@@ -1143,6 +1145,12 @@ class CrmEntryResponse(BaseModel):
     # null for entries captured the old fixed-category way.
     intent_schema_id: int | None
     collected_fields: dict
+    # Added 2026-08-20 — human-handoff stub, see models.CrmEntry's
+    # wants_human docstring. True when the visitor explicitly asked to
+    # speak with a person; purely informational here (no live-transfer
+    # feature exists yet), lets CrmPanel/ReviewQueuePanel flag it for the
+    # owner to see and act on manually.
+    wants_human: bool
 
 
 def _crm_entry_response(entry: CrmEntry) -> CrmEntryResponse:
@@ -1160,6 +1168,7 @@ def _crm_entry_response(entry: CrmEntry) -> CrmEntryResponse:
         created_at=entry.created_at,
         intent_schema_id=entry.intent_schema_id,
         collected_fields=entry.collected_fields,
+        wants_human=entry.wants_human,
     )
 
 
@@ -1189,14 +1198,64 @@ def create_crm_entry(req: CrmEntryRequest, db: Session = Depends(get_db)) -> Crm
     return _crm_entry_response(entry)
 
 
-@router.get("/agent/crm/entries", response_model=list[CrmEntryResponse])
-def list_crm_entries(db: Session = Depends(get_db)) -> list[CrmEntryResponse]:
+# The fixed, built-in category vocabulary `CrmPanel` groups entries by —
+# mirrors the frontend's own CATEGORY_GROUPS (crm-panel.tsx) exactly.
+# Anything outside this set (an older/manual row, or a genuinely
+# freeform value) falls into the "other" bucket, same as the frontend's
+# own pre-existing grouping logic already did client-side.
+_KNOWN_CRM_CATEGORIES = ("appointment", "quote", "claim", "inquiry")
+
+
+class CrmEntryListResponse(BaseModel):
+    items: list[CrmEntryResponse]
+    total: int
+
+
+@router.get("/agent/crm/entries", response_model=CrmEntryListResponse)
+def list_crm_entries(
+    limit: int = 100,
+    offset: int = 0,
+    intent_schema_id: int | None = None,
+    category: str | None = None,
+    db: Session = Depends(get_db),
+) -> CrmEntryListResponse:
     """Most-recent-first — lets an admin see what's actually been
     captured so far, the same "not just a black-box POST" bar every other
     real capability in this file already meets (DocumentManager,
-    PageManager, ...)."""
-    entries = db.query(CrmEntry).order_by(CrmEntry.created_at.desc()).all()
-    return [_crm_entry_response(e) for e in entries]
+    PageManager, ...).
+
+    Paginated (2026-08-20, was a plain unbounded list — real UI pain for
+    both `CrmPanel` and `ReviewQueuePanel` once leads pile up, see the
+    root AGENTS.md). `intent_schema_id` (2026-08-20) is what makes this
+    endpoint usable for `ReviewQueuePanel`'s own per-queue pagination —
+    each `IntentView` queue now requests its own page of just that
+    schema's entries directly, instead of fetching every entry and
+    filtering client-side. `category` (2026-08-20) is the same idea for
+    `CrmPanel`'s own fixed category groups — `"other"` is a special value
+    matching anything NOT in `_KNOWN_CRM_CATEGORIES` (including a null
+    category), mirroring the frontend's pre-existing "other" bucket
+    definition exactly rather than introducing a second, divergent
+    notion of what "other" means. `limit` defaults to 100, not
+    `CrmPanel`'s own page size — this default only matters to a caller
+    that never passes the param, which today means owner-agent's
+    `crm_list_entries` tool (its own description still says "every CRM
+    entry captured so far"); `CrmPanel`/`ReviewQueuePanel` always pass
+    their own explicit `limit`/`offset`, so this default doesn't
+    constrain them at all."""
+    stmt = select(CrmEntry)
+    if intent_schema_id is not None:
+        stmt = stmt.where(CrmEntry.intent_schema_id == intent_schema_id)
+    if category == "other":
+        stmt = stmt.where(
+            or_(CrmEntry.category.is_(None), CrmEntry.category.notin_(_KNOWN_CRM_CATEGORIES))
+        )
+    elif category is not None:
+        stmt = stmt.where(CrmEntry.category == category)
+    total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+    entries = (
+        db.execute(stmt.order_by(CrmEntry.created_at.desc()).limit(limit).offset(offset)).scalars().all()
+    )
+    return CrmEntryListResponse(items=[_crm_entry_response(e) for e in entries], total=total)
 
 
 @router.delete("/agent/crm/entries/{entry_id}", status_code=204)
@@ -1503,21 +1562,41 @@ def log_owner_agent_run(
     )
 
 
-@router.get("/agent/owner-agent/runs", response_model=list[OwnerAgentRunSummary])
-def list_owner_agent_runs(db: Session = Depends(get_db), limit: int = 50) -> list[OwnerAgentRunSummary]:
+class OwnerAgentRunListResponse(BaseModel):
+    items: list[OwnerAgentRunSummary]
+    total: int
+
+
+@router.get("/agent/owner-agent/runs", response_model=OwnerAgentRunListResponse)
+def list_owner_agent_runs(
+    db: Session = Depends(get_db), limit: int = 20, offset: int = 0
+) -> OwnerAgentRunListResponse:
     """Most-recent-first — what makes owner-agent's history actually
     queryable (the JSONL file is greppable from a shell on the host,
-    this is queryable from the dashboard/API without one)."""
-    rows = db.execute(select(OwnerAgentRun).order_by(OwnerAgentRun.created_at.desc()).limit(limit)).scalars().all()
-    return [
-        OwnerAgentRunSummary(
-            id=r.id,
-            owner_email=r.owner_email,
-            command=r.command,
-            final_answer=r.final_answer,
-            stopped_reason=r.stopped_reason,
-            steps=r.steps,
-            created_at=r.created_at,
-        )
-        for r in rows
-    ]
+    this is queryable from the dashboard/API without one).
+
+    Real pagination (2026-08-20, was a hard `limit=50` cap with no
+    `offset`/`total` at all — older runs were simply unreachable once a
+    site passed 50 runs, not really "pagination," see the root
+    AGENTS.md)."""
+    total = db.execute(select(func.count()).select_from(OwnerAgentRun)).scalar_one()
+    rows = (
+        db.execute(select(OwnerAgentRun).order_by(OwnerAgentRun.created_at.desc()).limit(limit).offset(offset))
+        .scalars()
+        .all()
+    )
+    return OwnerAgentRunListResponse(
+        items=[
+            OwnerAgentRunSummary(
+                id=r.id,
+                owner_email=r.owner_email,
+                command=r.command,
+                final_answer=r.final_answer,
+                stopped_reason=r.stopped_reason,
+                steps=r.steps,
+                created_at=r.created_at,
+            )
+            for r in rows
+        ],
+        total=total,
+    )

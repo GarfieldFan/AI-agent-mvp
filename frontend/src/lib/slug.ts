@@ -14,3 +14,21 @@ export function slugify(input: string): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 }
+
+/** Same normalization as `slugify`, but underscore-joined (`snake_case`)
+ * instead of hyphenated — matches this project's own "_key" convention
+ * for programmatic identifiers (`IntentSchema.key` e.g. "insurance_claim",
+ * `IntentField.field_key` e.g. "policy_number") rather than the
+ * hyphenated page-slug convention `slugify` produces. Added 2026-08-20
+ * so IntentSchemaPanel can auto-derive a schema's stable `key` from its
+ * owner-typed `label`, instead of asking the owner to hand-invent a
+ * "technical-looking" id themselves. */
+export function slugifyKey(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_")
+    .replace(/[^a-z0-9_]/g, "")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+}

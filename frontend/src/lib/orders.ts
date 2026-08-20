@@ -15,6 +15,8 @@ export type OrderItem = {
   unit_price_snapshot: number;
   quantity: number;
   subtotal: number;
+  comment: string | null;
+  served: boolean;
 };
 
 export type Order = {
@@ -35,8 +37,31 @@ export type OrderUpdateInput = {
   is_open?: boolean;
 };
 
-export function listOrders() {
-  return apiFetch<Order[]>("/api/agent/orders");
+export type OrderListResult = {
+  items: Order[];
+  total: number;
+};
+
+export type OrderListFilters = {
+  limit?: number;
+  offset?: number;
+  q?: string;
+  status?: string;
+  isOpen?: boolean;
+};
+
+/** Paginated + server-side filtered (2026-08-20, was a plain unbounded
+ * fetch with the search/status/open filtering done client-side in
+ * `OrderPanel` — moved server-side once pagination made client-side
+ * filtering incorrect, see the root `AGENTS.md`). */
+export function listOrders(filters: OrderListFilters = {}) {
+  const params = new URLSearchParams();
+  params.set("limit", String(filters.limit ?? 20));
+  params.set("offset", String(filters.offset ?? 0));
+  if (filters.q) params.set("q", filters.q);
+  if (filters.status) params.set("status", filters.status);
+  if (filters.isOpen !== undefined) params.set("is_open", String(filters.isOpen));
+  return apiFetch<OrderListResult>(`/api/agent/orders?${params.toString()}`);
 }
 
 export function updateOrder(id: number, input: OrderUpdateInput) {
@@ -45,4 +70,13 @@ export function updateOrder(id: number, input: OrderUpdateInput) {
 
 export function listOrderStatusOptions() {
   return apiFetch<{ status_options: string[] }>("/api/agent/order-status-options");
+}
+
+/** Staff-side per-line kitchen control (2026-08-20) — toggles whether a
+ * dish has gone out. Returns the whole parent Order (not just the item),
+ * matching updateOrder's own shape. Never exposed to owner-agent — see
+ * backend/models.py's OrderItem docstring for why this is a live
+ * kitchen-floor action, not a cheap-to-adjust config value. */
+export function updateOrderItemServed(itemId: number, served: boolean) {
+  return apiFetch<Order>(`/api/agent/order-items/${itemId}`, { method: "PATCH", body: { served } });
 }

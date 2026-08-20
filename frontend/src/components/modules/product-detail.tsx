@@ -53,7 +53,9 @@ export function ProductDetail({ product, fieldDefinitions }: ProductDetailProps)
         <div className="space-y-4">
           <div>
             <h1 className="text-2xl font-bold">{product.name}</h1>
-            {product.category ? <p className="text-sm text-muted-foreground">{product.category}</p> : null}
+            {product.tags.length > 0 ? (
+              <p className="text-sm text-muted-foreground">{product.tags.join(", ")}</p>
+            ) : null}
           </div>
           <p className="text-xl font-semibold">${product.price.toFixed(2)}</p>
           {product.description ? <p className="text-sm leading-relaxed">{product.description}</p> : null}

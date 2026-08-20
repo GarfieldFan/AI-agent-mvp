@@ -37,7 +37,7 @@ export function SourceCitationList({ sources, className }: SourceCitationListPro
               <FileText className="size-3" aria-hidden="true" />[{index + 1}]{" "}
               {source.document_title}
             </TooltipTrigger>
-            <TooltipContent className="max-w-xs">
+            <TooltipContent className="flex w-64 max-w-xs flex-col items-start gap-0.5 text-left">
               <p className="font-medium">{source.document_title}</p>
               <p className="text-muted-foreground">{source.excerpt}</p>
             </TooltipContent>

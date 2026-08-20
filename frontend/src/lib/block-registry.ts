@@ -46,7 +46,7 @@ export const BLOCK_REGISTRY: BlockTypeDef[] = [
   {
     type: "product-list",
     label: "Product list",
-    description: "A grid of products from your catalog. Filter to one category, or pick specific products, after inserting.",
+    description: "A grid of products from your catalog. Filter by tag, or pick specific products, after inserting.",
     insertable: true,
     createDefault: () => ({ type: "product-list" }),
   },

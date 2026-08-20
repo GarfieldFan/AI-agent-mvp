@@ -44,8 +44,18 @@ export function ingestDocument(filename: string, contentType: string, contentBas
   });
 }
 
-export function listDocuments() {
-  return apiFetch<DocumentSummary[]>("/api/agent/documents");
+export type DocumentListResult = {
+  items: DocumentSummary[];
+  total: number;
+  /** Stale-document count across EVERY document, not just this page —
+   * see backend/apis/documents.py's DocumentListResponse docstring. */
+  needs_reembed_count: number;
+};
+
+/** Paginated (2026-08-20, was a plain unbounded fetch — see the root
+ * AGENTS.md). */
+export function listDocuments(limit = 50, offset = 0) {
+  return apiFetch<DocumentListResult>(`/api/agent/documents?limit=${limit}&offset=${offset}`);
 }
 
 export function deleteDocument(id: number) {

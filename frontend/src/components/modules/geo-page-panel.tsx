@@ -41,12 +41,15 @@ export function GeoPagePanel() {
     setLoadStatus("loading");
     setLoadError(null);
     try {
-      const [page, versions] = await Promise.all([
+      // Only the single newest version is needed here (a "last updated"
+      // display), so limit=1 rather than fetching a whole paginated list
+      // just to read its first item.
+      const [page, versionsResult] = await Promise.all([
         getPublicPage(GEO_PAGE_SLUG),
-        listPageVersions(GEO_PAGE_SLUG).catch(() => [] as PageVersionSummary[]),
+        listPageVersions(GEO_PAGE_SLUG, 1, 0).catch(() => ({ items: [] as PageVersionSummary[], total: 0 })),
       ]);
       setCurrent(page);
-      setLatestVersion(versions[0] ?? null);
+      setLatestVersion(versionsResult.items[0] ?? null);
       setLoadStatus("idle");
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : "Failed to load the SEO/GEO page.");

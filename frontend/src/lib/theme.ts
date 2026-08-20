@@ -363,19 +363,21 @@ export type ContainerBlock = {
 /** Added 2026-08-19 — a grid of product cards from the owner's Product
  * catalog (lib/products.ts), owner-inserted only via CTE (never
  * vision-generated — see backend/apis/agent.py's ProductListBlock
- * docstring). `category` null shows every available product; set it to
- * filter to one (matches Product.category's free-text values).
+ * docstring). `tags` (2026-08-20, replaced the old single `category`
+ * string — see backend/models.py's Product docstring) null/empty shows
+ * every available product; set one or more to filter to products
+ * carrying ANY of them (OR-matched against Product.tags).
  *
  * `product_ids` (2026-08-20) is a second, more specific filter — an
  * explicit ordered allow-list ("feature exactly these 3 products, in
  * this order," e.g. a homepage "bestsellers" strip) instead of "every
- * product in a category." Takes priority over `category` when both are
+ * product with this tag." Takes priority over `tags` when both are
  * set — the two aren't meant to be combined, `product_ids` already names
  * exactly what should show. `null`/empty keeps the original
- * category-or-everything behavior unchanged. */
+ * tags-or-everything behavior unchanged. */
 export type ProductListBlock = {
   type: "product-list";
-  category?: string | null;
+  tags?: string[] | null;
   product_ids?: number[] | null;
   width?: BlockWidth;
 };
