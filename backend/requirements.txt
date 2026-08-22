@@ -22,3 +22,14 @@ python-docx==1.2.0
 json-repair==0.61.7
 pytest==9.1.1
 pytest-asyncio==1.4.0
+stripe==15.5.1
+# 2026-08-21 — scheduled_tasks.py's recurring-task engine (cron-style,
+# in-process) and documents.py's URL-based ingestion (HTML -> clean text
+# extraction for legal/regulation pages, letting an owner point at a
+# government URL instead of only uploading files). Both top-level only,
+# same curated-pin posture as everything above — trafilatura's own
+# transitive tree (courlan/dateparser/htmldate/justext/etc.) isn't
+# individually pinned here either, matching how stripe's own transitive
+# deps aren't.
+apscheduler==3.11.3
+trafilatura==2.2.0

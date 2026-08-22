@@ -7,19 +7,28 @@ import { Accordion, AccordionItem, AccordionPanel, AccordionTrigger } from "@/co
 import { EmptyState } from "@/components/common/empty-state";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { RoleBadge } from "@/components/common/role-badge";
+import { BusinessProfilePanel } from "@/components/modules/business-profile-panel";
+import { ChatPromptSettingsPanel } from "@/components/modules/chat-prompt-settings-panel";
+import { ChatSessionViewerPanel } from "@/components/modules/chat-session-viewer-panel";
 import { CrmPanel } from "@/components/modules/crm-panel";
 import { DocumentManager } from "@/components/modules/document-manager";
 import { GeoPagePanel } from "@/components/modules/geo-page-panel";
 import { IntentSchemaPanel } from "@/components/modules/intent-schema-panel";
+import { MapSettingsPanel } from "@/components/modules/map-settings-panel";
 import { ModelSettingsPanel } from "@/components/modules/model-settings-panel";
+import { NotificationSettingsPanel } from "@/components/modules/notification-settings-panel";
+import { OAuthSettingsPanel } from "@/components/modules/oauth-settings-panel";
 import { OrderPanel } from "@/components/modules/order-panel";
 import { OwnerAgentPanel } from "@/components/modules/owner-agent-panel";
 import { PageGeneratorPanel } from "@/components/modules/page-generator-panel";
 import { PageManager } from "@/components/modules/page-manager";
+import { PaymentSettingsPanel } from "@/components/modules/payment-settings-panel";
 import { PosterGeneratorPanel } from "@/components/modules/poster-generator-panel";
 import { ProductPanel } from "@/components/modules/product-panel";
 import { ReportPanel } from "@/components/modules/report-panel";
 import { ReviewQueuePanel } from "@/components/modules/review-queue-panel";
+import { ScheduledTasksPanel } from "@/components/modules/scheduled-tasks-panel";
+import { UserManagementPanel } from "@/components/modules/user-management-panel";
 import { ApiError, apiFetch } from "@/lib/api";
 import { clearAuth, useAuth } from "@/lib/auth";
 
@@ -111,7 +120,9 @@ export function AgentConsoleSection() {
             <AccordionTrigger>AI & knowledge base</AccordionTrigger>
             <AccordionPanel>
               <ModelSettingsPanel />
+              <ChatPromptSettingsPanel />
               <DocumentManager />
+              <ScheduledTasksPanel />
             </AccordionPanel>
           </AccordionItem>
 
@@ -128,12 +139,20 @@ export function AgentConsoleSection() {
             </AccordionPanel>
           </AccordionItem>
 
+          <AccordionItem value="seo-geo">
+            <AccordionTrigger>SEO & AI discoverability</AccordionTrigger>
+            <AccordionPanel>
+              <BusinessProfilePanel />
+            </AccordionPanel>
+          </AccordionItem>
+
           <AccordionItem value="crm-reporting">
             <AccordionTrigger>CRM & reporting</AccordionTrigger>
             <AccordionPanel>
               <IntentSchemaPanel />
               <CrmPanel />
               <ReportPanel />
+              <ChatSessionViewerPanel />
             </AccordionPanel>
           </AccordionItem>
 
@@ -142,6 +161,9 @@ export function AgentConsoleSection() {
             <AccordionPanel>
               <ProductPanel />
               <OrderPanel />
+              <PaymentSettingsPanel />
+              <NotificationSettingsPanel />
+              <MapSettingsPanel />
             </AccordionPanel>
           </AccordionItem>
 
@@ -149,6 +171,14 @@ export function AgentConsoleSection() {
             <AccordionTrigger>Review queues</AccordionTrigger>
             <AccordionPanel>
               <ReviewQueuePanel />
+            </AccordionPanel>
+          </AccordionItem>
+
+          <AccordionItem value="users-access">
+            <AccordionTrigger>Users & access</AccordionTrigger>
+            <AccordionPanel>
+              <UserManagementPanel />
+              <OAuthSettingsPanel />
             </AccordionPanel>
           </AccordionItem>
 

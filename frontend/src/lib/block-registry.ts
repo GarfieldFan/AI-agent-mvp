@@ -57,6 +57,13 @@ export const BLOCK_REGISTRY: BlockTypeDef[] = [
     insertable: true,
     createDefault: () => ({ type: "product-card", product_id: null }),
   },
+  {
+    type: "map",
+    label: "Map",
+    description: "A business-location map — set the address after inserting. Always links out to Google Maps even with no map provider configured.",
+    insertable: true,
+    createDefault: () => ({ type: "map", query: "" }),
+  },
 ];
 
 export const INSERTABLE_BLOCK_TYPES = BLOCK_REGISTRY.filter((def) => def.insertable);

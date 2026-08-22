@@ -11,6 +11,9 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { apiFetch, ApiError } from "@/lib/api";
 import { setAuth } from "@/lib/auth";
+import { getOAuthProviders, googleOAuthStartUrl, facebookOAuthStartUrl, xOAuthStartUrl, type OAuthProviders } from "@/lib/oauth";
+
+type MeResponse = { email: string; role: "owner" | "admin" | "user" };
 
 type LoginResponse = {
   access_token: string;
@@ -30,6 +33,46 @@ export function LoginForm() {
   const [password, setPassword] = React.useState("");
   const [status, setStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [error, setError] = React.useState<string | null>(null);
+  const [oauthProviders, setOauthProviders] = React.useState<OAuthProviders>({ google: false, facebook: false, x: false });
+
+  React.useEffect(() => {
+    getOAuthProviders()
+      .then(setOauthProviders)
+      .catch(() => setOauthProviders({ google: false, facebook: false, x: false }));
+  }, []);
+
+  // Picks up the redirect back from any provider's own consent screen
+  // (see backend/apis/oauth.py's callbacks — same "?param=..., frontend
+  // bootstraps and strips it" pattern as session-id-bootstrap.tsx's
+  // `?sid=`, scoped to this page only since OAuth only ever completes
+  // here). Only the token comes back on the URL — email/role are
+  // resolved via GET /auth/me with that token, not stuffed into the URL
+  // too, so a bookmarked/shared login link can't accidentally leak a
+  // readable profile summary alongside the token.
+  React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("oauth_token");
+    const oauthError = params.get("oauth_error");
+    if (!token && !oauthError) return;
+    window.history.replaceState(null, "", window.location.pathname);
+
+    // Resolves through a promise chain even for the immediate-error case
+    // (never a bare synchronous setState call in the effect body) — trips
+    // react-hooks/set-state-in-effect otherwise, same class of fix already
+    // applied elsewhere in this app (MapBlock, ChatSessionViewerPanel).
+    async function finishOAuthLogin(): Promise<void> {
+      setStatus("loading");
+      if (oauthError || !token) throw new Error("oauth_error");
+      const me = await apiFetch<MeResponse>("/api/auth/me", { token });
+      setAuth({ token, email: me.email, role: me.role });
+      router.push("/dashboard");
+    }
+    finishOAuthLogin().catch(() => {
+      setError("Social sign-in failed — please try again.");
+      setStatus("error");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -84,6 +127,52 @@ export function LoginForm() {
           <ErrorMessage description={error} onRetry={() => setStatus("idle")} />
         ) : null}
       </form>
+
+      {oauthProviders.google || oauthProviders.facebook || oauthProviders.x ? (
+        <div className="space-y-2">
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase">
+              <span className="bg-background px-2 text-muted-foreground">Or</span>
+            </div>
+          </div>
+          {oauthProviders.google ? (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              render={<a href={googleOAuthStartUrl()} />}
+              nativeButton={false}
+            >
+              Sign in with Google
+            </Button>
+          ) : null}
+          {oauthProviders.facebook ? (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              render={<a href={facebookOAuthStartUrl()} />}
+              nativeButton={false}
+            >
+              Sign in with Facebook
+            </Button>
+          ) : null}
+          {oauthProviders.x ? (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              render={<a href={xOAuthStartUrl()} />}
+              nativeButton={false}
+            >
+              Sign in with X
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
         <p className="font-medium text-foreground">Demo accounts (password: 0000)</p>

@@ -22,11 +22,48 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    hashed_password: Mapped[str] = mapped_column(String(255))
+    # Nullable (2026-08-22, was NOT NULL) — an account created via OAuth
+    # (apis/oauth.py) has no local password at all; the owner confirmed
+    # directly that admin/owner accounts stay password-only, so this is
+    # only ever null for a `role == "user"` account. Login still checks
+    # this the same way it always did (apis/auth.py's login) — an
+    # OAuth-only account simply can never succeed there, which is
+    # correct: its only real login path is the OAuth flow.
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Plain string, not a DB enum — matches apis/deps.py's Role(str, Enum)
     # by value, kept as a string here so seeding/migrating doesn't need to
     # touch a Postgres enum type if roles ever change.
     role: Mapped[str] = mapped_column(String(32), default="user")
+    # Which OAuth provider last authenticated this account (2026-08-22,
+    # e.g. "google") — null for a password-only account. Informational
+    # only (shown in a future user-management UI); identity matching
+    # itself is by email (see apis/oauth.py's find-or-create), not this
+    # field — a real deployment's own choice to trust a provider's
+    # verified email as the join key across providers, not a stored
+    # per-provider subject id (out of scope for this app's current
+    # single-tenant scale).
+    oauth_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Added 2026-08-22, pre-emptively — this app has no public password
+    # self-signup today (apis/auth.py's own docstring: "no signup"), so
+    # the attack this guards against isn't exploitable yet, but the user
+    # asked to close it now rather than risk forgetting once self-signup
+    # ever gets built: WITHOUT this flag, an attacker could pre-register
+    # an unverified password account under a victim's real email, then
+    # silently retain access once the real owner later signs in with
+    # Google (apis/oauth.py's find-or-create merges by email alone — see
+    # that module's own docstring). False by default (the cautious
+    # state) — any *future* account-creation path that doesn't
+    # explicitly reason about this defaults to "not verified," never
+    # "trusted." Only ever set True by a path that has real proof of
+    # email ownership: seed.py's own admin-provisioned demo accounts,
+    # and apis/oauth.py's Google callback (Google itself verifies the
+    # email). apis/oauth.py's callback checks this on every "existing
+    # user" merge — an unverified existing account gets its
+    # `hashed_password` cleared and `email_verified` flipped to True
+    # (the verified owner reclaims the account; whoever set that
+    # original unverified password loses access), rather than silently
+    # trusting whatever was there before.
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
@@ -82,6 +119,54 @@ class Document(Base):
     embedding_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     uploaded_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Set only for a document ingested via POST /agent/documents/ingest-
+    # from-url (2026-08-21) — null for every plain file upload. Lets
+    # `_run_url_ingest` (apis/documents.py) re-fetch the same source on a
+    # manual "Re-sync" click or a recurring ScheduledTask, and lets
+    # DocumentManager show where a document actually came from.
+    source_url: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    # Added 2026-08-21 — a real distinction the user raised directly:
+    # some ingested documents ARE facts about the business itself (a
+    # service description, a company profile), others are background
+    # reference material the business operates within but doesn't own
+    # (a statute, a regulation, a legal code — the motivating example was
+    # literally "the Constitution isn't company material, but the chatbot
+    # still needs to know about it"). True (the default — every existing
+    # and future document unless explicitly marked otherwise) means
+    # "treat this as a fact about the business" — apis/agent.py's
+    # _gather_ready_document_text (feeding generate_geo_page,
+    # detect_business_type, propose_intent_schema, and
+    # business_profile.py's suggest endpoint) only includes
+    # is_company_material=True documents, since synthesizing "who is this
+    # company" content from a law's own text would misrepresent it as a
+    # company fact. False documents are still fully searchable in
+    # ordinary RAG retrieval (apis/chat.py's /api/chat) — retrieve.py
+    # flags them in the context block so the model treats them as
+    # background reference, not an authoritative company fact, and (via
+    # the owner's own configurable chat_system_prompt, see apis/
+    # chat_settings.py) an owner can instruct the public chatbot to stay
+    # general and defer specifics to a real professional consultation
+    # when citing this kind of source — a boolean flag, not free-text
+    # tags, same "one hard signal, not inferred from free text" posture
+    # as Order.is_open/OrderItem.served elsewhere in this app.
+    is_company_material: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Added 2026-08-21, generalizing the legal "repealed/proposed" example
+    # the user raised into an industry-agnostic mechanism — free text, not
+    # a fixed enum, same "owner defines their own vocabulary" posture as
+    # CrmEntry.status/Order.status/IntentView.status_options elsewhere in
+    # this app (a hardcoded "repealed"/"in-force"/"proposed" enum would
+    # only fit law; the next owner might need "discontinued"/"superseded
+    # form"/"experimental" for an entirely different industry). Null means
+    # no status note at all — the common case, no behavior change.
+    # apis/chat.py's context-block formatting surfaces this note to the
+    # model alongside a retrieved chunk; SYSTEM_PROMPT tells the model to
+    # weigh it when answering, without this app ever hardcoding what any
+    # particular status word means. Settable manually or via an optional
+    # LLM-suggested draft at ingest time (apis/documents.py's
+    # _suggest_status_note) — conservative by design, only ever proposes a
+    # note when the source text explicitly states its own status, never a
+    # guess.
+    status_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     chunks: Mapped[list["DocumentChunk"]] = relationship(
@@ -188,6 +273,156 @@ class AppSettings(Base):
     # owner-agent is the only way to set it, matching how IntentView's
     # status_options also has no manual editor, only manage_review_queue.
     order_status_options: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=None)
+    # Payment gate (2026-08-20, see backend/payments.py) — same
+    # "swappable provider, null means use the default" posture as every
+    # AI provider above, extended to a new capability domain: actually
+    # taking money for an Order. Deliberately a separate, distinct set of
+    # fields from the AI-provider ones above, not reused, even though the
+    # *pattern* is identical — this is not an AI capability. `null`/
+    # `"test"` (the default) means no real charge ever happens; checkout
+    # works with zero configuration, same as chat/vision/embedding/image
+    # generation all falling back to Ollama/ComfyUI with nothing set.
+    # `stripe_secret_key` is write-only, same echo-back rule as
+    # `custom_api_key` — never returned by GET /agent/payment-settings.
+    # `stripe_publishable_key` is the one exception: Stripe's own
+    # publishable key is meant to be public (it's embedded in client-side
+    # JS on every Stripe integration), safe to echo back and expose to
+    # the browser. `stripe_webhook_secret` verifies that
+    # POST /webhooks/stripe requests actually came from Stripe (HMAC
+    # signature check, backend/payments.py's verify_stripe_webhook) —
+    # without it, anyone who found that URL could POST a fake
+    # "payment succeeded" event.
+    payment_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    stripe_secret_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_publishable_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_webhook_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Email + SMS gate (2026-08-20, see backend/notifications.py) — the
+    # identical "swappable provider, null/'test' means the default no-op"
+    # pattern as payment above, applied to a third capability domain.
+    # Nothing in this app currently triggers a real send automatically
+    # (see notifications.py's own docstring) — these fields exist purely
+    # so a provider CAN be configured and tested; `apis/notifications.py`'s
+    # test-send endpoints are the only current callers.
+    # `mailgun_api_key`/`twilio_auth_token` are write-only, same echo-back
+    # rule as `stripe_secret_key` above. `mailgun_domain`/
+    # `mailgun_from_address`/`twilio_from_number`/`twilio_account_sid`
+    # aren't secrets (a Twilio Account SID is a public identifier, the
+    # same way a Stripe publishable key is) — safe to echo back.
+    email_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mailgun_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mailgun_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mailgun_from_address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sms_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    twilio_account_sid: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    twilio_auth_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    twilio_from_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Map embed gate (2026-08-21, see backend/maps.py) — same "swappable
+    # provider, null/'test' means the safe zero-config default" pattern as
+    # payment/email above, extended to a fourth capability domain: showing
+    # a business location. `null`/`"test"` means no live in-page embed —
+    # `MapBlock` still always renders a plain "open in Google Maps" link
+    # built client-side from its own query text, independent of this
+    # setting entirely (the redirect floor the owner asked about is
+    # unconditional). Unlike stripe_secret_key/mailgun_api_key/
+    # twilio_auth_token, Google's own Maps Embed API key is DESIGNED to be
+    # used client-side (restricted via Google Cloud Console's own
+    # HTTP-referrer allowlist, not a bearer-style secret) — still kept
+    # write-only here anyway, same echo-back rule as every other
+    # credential in this app, since backend/maps.py assembles the embed
+    # URL server-side and the browser never needs the raw key at all.
+    map_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    google_maps_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Business profile (2026-08-21, see backend/apis/business_profile.py) —
+    # structured "who/where/how to reach us" facts, the input this app was
+    # missing for real GEO (Generative Engine Optimization): a JSON-LD
+    # schema.org LocalBusiness block only an AI/search crawler reads, not
+    # a human-facing page. Deliberately owner-entered/confirmed, never
+    # LLM-written directly — same "misread real-world fact has real
+    # consequences" posture as Product pricing and IntentSchema
+    # definitions elsewhere in this app (a wrong phone number sends a real
+    # customer to the wrong place). An LLM CAN suggest a first draft from
+    # ingested documents (mirrors detect_business_type's own "propose,
+    # never auto-write" precedent) but never saves anything itself.
+    # No secrets here — every field is safe to echo back and, in fact,
+    # meant to be publicly crawlable (GET /api/business-profile has no
+    # auth gate at all, unlike payment/notification/map's write-only
+    # credential fields).
+    business_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    business_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # A schema.org type (https://schema.org/LocalBusiness and its many
+    # subtypes, e.g. "Plumber", "Restaurant", "Dentist") — free text, not
+    # a closed enum, since schema.org has hundreds of business subtypes
+    # and this app has no reason to maintain its own copy of that list.
+    # None/blank falls back to the generic "LocalBusiness" at JSON-LD
+    # build time (frontend/src/lib/business-profile.ts).
+    business_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    business_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    business_phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    business_street_address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    business_locality: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    business_region: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    business_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    business_country: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # None falls back to FRONTEND_PUBLIC_URL (this deployment's own known
+    # public origin) at read time — see apis/business_profile.py.
+    business_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    business_logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Each entry a schema.org openingHours-spec string (e.g.
+    # "Mo-Fr 09:00-17:00", "Sa 10:00-14:00") — one owner-typed line per
+    # entry (see BusinessProfilePanel), not a day-by-day time-picker UI;
+    # a deliberate v1 scope cut, same "simplest thing that produces valid
+    # structured data" posture as Order.pickup_time staying free text.
+    business_hours: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # sameAs URLs (other authoritative profiles: Google Business Profile,
+    # Yelp, Facebook, ...) — corroborates entity identity for AI/search
+    # crawlers the same way Product.tags corroborates product identity;
+    # same JSONB-list-of-strings shape, kept consistent with that
+    # existing precedent rather than a second, differently-shaped list
+    # field.
+    business_social_links: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # Owner-configurable public-chat system prompt (2026-08-21, see
+    # apis/chat.py's `_resolve_system_prompt` and apis/chat_settings.py) —
+    # null/empty means "use the built-in SYSTEM_PROMPT default." A
+    # deliberate, confirmed-with-the-user design: the owner may FULLY
+    # REPLACE this text, not just append to it — safe to allow in full
+    # because every dynamic per-turn fact (RAG excerpts, visitor
+    # identity, in-progress intake state, order/cart state) is injected
+    # into the USER message, never this system string, and the separate
+    # lead-capture/order-extraction classification calls run against
+    # their own fixed prompts this field never touches. See
+    # `_resolve_system_prompt`'s own docstring for the full reasoning.
+    chat_system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Social login for the public `user` tier only (2026-08-22, see
+    # apis/oauth.py) — confirmed directly with the user: admin/owner stay
+    # on the existing password+JWT system, never OAuth, since those
+    # accounts hold real privilege and shouldn't depend on a third-party
+    # identity provider's own account security/recovery. Same
+    # owner-configured-credentials pattern as Stripe/Mailgun/Twilio —
+    # `google_oauth_client_secret` is write-only, never echoed back by
+    # GET /agent/oauth-settings; `google_oauth_client_id` is safe to echo
+    # (it's embedded in the browser-visible authorize-URL redirect
+    # anyway, same posture as Stripe's own publishable key). "Configured"
+    # is derived from both being non-null — no separate enabled flag,
+    # same posture as apis/notifications.py's is_email_configured.
+    google_oauth_client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    google_oauth_client_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Facebook (2026-08-22) — same authorization-code-grant shape as
+    # Google, a real second implementation once Google was proven.
+    facebook_oauth_client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    facebook_oauth_client_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # X (2026-08-22) — NOT the same flow shape as Google/Facebook: OAuth
+    # 2.0 with PKCE (apis/oauth.py generates and stores a code_verifier
+    # per attempt, not just a state nonce). Flagged clearly to the owner
+    # in OAuthSettingsPanel and in apis/oauth.py's own docstring: X's
+    # standard API does not reliably return an email address at all —
+    # that needs an elevated permission from X's own Developer Portal
+    # this app has no control over, so X sign-in may simply fail at the
+    # "no email returned" step depending on what the owner's X app is
+    # actually approved for. Built anyway, honestly documented rather
+    # than silently omitted, since the user asked for the interface to
+    # exist and be ready.
+    x_oauth_client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    x_oauth_client_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
     updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
@@ -353,6 +588,30 @@ class CrmEntry(Base):
     # admin/owner can see and act on manually (CrmPanel/ReviewQueuePanel),
     # ready for a real handoff feature to build on top of later.
     wants_human: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Cross-session resume via an emailed one-time code (2026-08-20,
+    # apis/crm_resume.py) — closes a real gap flagged earlier: a visitor
+    # who abandons a multi-turn structured intake (an insurance claim
+    # mid-fill, say) in one browser session currently can't be reunited
+    # with their own in-progress entry in a new one at all —
+    # apis/chat.py's `_find_active_entry` is deliberately scoped to one
+    # `chat_session_id` only (see that function's own docstring for the
+    # scope decision behind that). Verifying a one-time code emailed to
+    # the address already on file — rather than trusting a re-typed
+    # email alone — is what makes resuming safe to build: without it,
+    # anyone who merely knew a visitor's email could read/continue their
+    # claim (real PII sits behind this: incident details, phone,
+    # attached photos). `resume_code_hash` is a SHA-256 hash, never the
+    # plaintext code — the code itself is only ever held in memory long
+    # enough to email it. `resume_code_attempts` caps guesses at a fixed
+    # limit (`apis/crm_resume.py`'s MAX_RESUME_ATTEMPTS) — a 6-digit code
+    # has only a million possibilities, so a short expiry + a hard
+    # attempt cap does the real work here, not hash strength. This whole
+    # feature is inert until an owner configures a real email provider
+    # (`apis/notifications.py`'s `is_email_configured`) — there's no way
+    # to deliver a code otherwise.
+    resume_code_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    resume_code_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    resume_code_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
@@ -597,6 +856,25 @@ class Order(Base):
     pickup_time: Mapped[str | None] = mapped_column(String(255), default=None)
     note: Mapped[str | None] = mapped_column(Text, default=None)
     total_amount: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
+    # Payment state (2026-08-20, backend/payments.py) — deliberately
+    # separate from `status` above, not a value stuffed into that same
+    # free-text field: `status` is a label owner-agent (or the owner
+    # themselves) can set to literally anything via
+    # set_order_status_options, so it can never be a trustworthy signal
+    # for "did a real payment actually succeed." `payment_status` is
+    # never owner-agent-writable — only POST /cart/checkout (for the
+    # "test" provider's synchronous skip) and POST /webhooks/stripe (for
+    # a real Stripe confirmation) ever set it. "unpaid" (default) ->
+    # "paid" | "failed"; "refunded" exists as a value this column can
+    # hold but nothing currently sets it — a real refund flow isn't
+    # built yet, see the root AGENTS.md.
+    payment_status: Mapped[str] = mapped_column(String(16), default="unpaid", server_default="unpaid")
+    payment_provider: Mapped[str | None] = mapped_column(String(32), default=None)
+    # Stripe's own Checkout Session id — what POST /webhooks/stripe
+    # matches an incoming event back to the right Order by, never
+    # anything the browser itself supplies (the browser can't be trusted
+    # to say which order got paid).
+    payment_reference: Mapped[str | None] = mapped_column(String(255), default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     items: Mapped[list["OrderItem"]] = relationship(
@@ -666,3 +944,42 @@ class DocumentChunk(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+class ScheduledTask(Base):
+    """A generic recurring job (2026-08-21, see backend/scheduler.py) —
+    not embed-specific despite the feature that motivated it (re-syncing
+    a URL-ingested legal document daily). `task_type` is a dispatch key
+    into `scheduler.TASK_REGISTRY`; any already-existing, already-real
+    maintenance action in this app (re-sync a URL document, re-embed
+    everything, clean up orphaned chat uploads, purge stale CRM entries,
+    ...) becomes schedulable by adding one small registry entry that
+    calls the function that already exists — this table doesn't know or
+    care what a task_type actually does, only when to run it.
+
+    Two independent interfaces write to this same table: a real CRUD API
+    (apis/scheduled_tasks.py, for an owner who wants to inspect/edit
+    directly) and owner-agent's `manage_scheduled_task` tool (for "just
+    tell it what you want in plain language") — neither is more
+    authoritative than the other, they're just two ways to reach the
+    same mechanism, same "give the owner choices" posture as everything
+    else in this app."""
+
+    __tablename__ = "scheduled_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    task_type: Mapped[str] = mapped_column(String(64))
+    task_args: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    # Standard 5-field cron syntax ("minute hour day month weekday"), e.g.
+    # "0 3 * * *" for daily at 03:00 — parsed via APScheduler's own
+    # CronTrigger.from_crontab, no custom scheduling DSL invented here.
+    cron_expression: Mapped[str] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    last_run_at: Mapped[datetime | None] = mapped_column(default=None)
+    # "success" | "error" | null (never run yet)
+    last_run_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    last_run_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_by: Mapped[str | None] = mapped_column(String(255), default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())

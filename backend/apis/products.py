@@ -35,6 +35,7 @@ owner-agent writes directly (`set_order_status_options`, mirrors
 afterward, unlike a schema, a price, or a custom-field definition.
 """
 
+import os
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -44,9 +45,13 @@ from sqlalchemy.orm import Session, selectinload
 
 from apis.chat import _get_or_create_session
 from apis.deps import Role, require_role
+from apis.payments import resolve_payment_provider
 from cart import apply_order_delta, count_search_products, find_active_order, search_products
 from db import get_db
 from models import AppSettings, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation
+from payments import PaymentProviderNotConfigured
+
+FRONTEND_PUBLIC_URL = os.environ.get("FRONTEND_PUBLIC_URL", "http://localhost:3000")
 
 admin_router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -443,6 +448,10 @@ class OrderSummary(BaseModel):
     pickup_time: str | None
     note: str | None
     total_amount: float
+    # Payment gate (2026-08-20, backend/payments.py) — see models.Order's
+    # own docstring for why this is separate from `status` above.
+    payment_status: str
+    payment_provider: str | None
     items: list[OrderItemSummary]
     created_at: datetime
 
@@ -457,6 +466,8 @@ def _to_order_summary(row: Order) -> OrderSummary:
         pickup_time=row.pickup_time,
         note=row.note,
         total_amount=float(row.total_amount),
+        payment_status=row.payment_status,
+        payment_provider=row.payment_provider,
         items=[
             OrderItemSummary(
                 id=i.id,
@@ -871,15 +882,30 @@ class CheckoutRequest(BaseModel):
     note: str | None = None
 
 
-@public_router.post("/cart/checkout", response_model=OrderSummary)
-def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> OrderSummary:
-    """Finalizes the visitor's own active cart — no real payment anywhere
-    in this app (see models.py's Order docstring), so "checking out" means
-    recording the contact/pickup details and flipping `is_open` to False,
-    the same signal the owner's own dashboard (OrderPanel) already uses
-    for "no more chat/cart add-ons to this order," reused here for "the
-    visitor themselves is done adding to it." 400s on an empty/missing
-    cart rather than creating an empty Order — nothing to check out."""
+class CheckoutResponse(BaseModel):
+    order: OrderSummary
+    # Set only when the configured payment provider needs the visitor's
+    # browser to go somewhere else to actually pay (Stripe's own hosted
+    # Checkout page) — null when payment already resolved synchronously
+    # (the "test" provider, see backend/payments.py). The frontend
+    # redirects the browser here when set, shows the normal confirmation
+    # screen when not.
+    checkout_url: str | None
+
+
+@public_router.post("/cart/checkout", response_model=CheckoutResponse)
+async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> CheckoutResponse:
+    """Finalizes the visitor's own active cart through the owner's
+    configured payment gate (backend/payments.py) — "test" (the default)
+    skips straight to a paid, closed order with no real charge; "stripe"
+    creates a real Checkout Session and hands back its URL instead of
+    closing the order immediately. The order only actually closes
+    (`is_open = False`) once payment is confirmed — synchronously here
+    for "test," asynchronously via `POST /webhooks/stripe` for a real
+    Stripe payment, since a visitor can close the tab right after paying
+    and before any redirect back to this site completes. 400s on an
+    empty/missing cart rather than creating an empty Order — nothing to
+    check out."""
     session = _get_or_create_session(db, req.session_id, None)
     order = find_active_order(db, session.id)
     if order is None or not order.items:
@@ -893,8 +919,25 @@ def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> OrderS
         order.pickup_time = req.pickup_time.strip() or None
     if req.note is not None:
         order.note = req.note.strip() or None
-    order.is_open = False
-
     db.commit()
     db.refresh(order)
-    return _to_order_summary(order)
+
+    try:
+        provider_name, provider = resolve_payment_provider(db)
+    except PaymentProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    success_url = f"{FRONTEND_PUBLIC_URL}/checkout?order_id={order.id}&paid=1"
+    cancel_url = f"{FRONTEND_PUBLIC_URL}/checkout?order_id={order.id}"
+    try:
+        result = await provider.create_checkout(order, success_url, cancel_url)
+    except PaymentProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    order.payment_provider = provider_name
+    if result.already_paid:
+        order.payment_status = "paid"
+        order.is_open = False
+    db.commit()
+    db.refresh(order)
+    return CheckoutResponse(order=_to_order_summary(order), checkout_url=result.redirect_url)

@@ -1,10 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { FileText, RefreshCw, Trash2, UploadCloud } from "lucide-react";
+import { FileText, Link2, RefreshCw, Trash2, UploadCloud } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { EmptyState } from "@/components/common/empty-state";
@@ -15,8 +19,11 @@ import { fileToBase64 } from "@/lib/file";
 import {
   deleteDocument,
   ingestDocument,
+  ingestFromUrl,
   listDocuments,
   reembedAllDocuments,
+  resyncDocument,
+  updateDocument,
   type DocumentSummary,
   type DocumentStatus,
   type ReembedAllResult,
@@ -45,6 +52,8 @@ const PAGE_SIZE = 20;
 
 export function DocumentManager() {
   const [file, setFile] = React.useState<File | null>(null);
+  const [uploadIsCompanyMaterial, setUploadIsCompanyMaterial] = React.useState(true);
+  const [uploadSuggestStatusNote, setUploadSuggestStatusNote] = React.useState(false);
   const [uploadStatus, setUploadStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [uploadError, setUploadError] = React.useState<string | null>(null);
   const [documents, setDocuments] = React.useState<DocumentSummary[] | null>(null);
@@ -56,6 +65,15 @@ export function DocumentManager() {
   const [reembedStatus, setReembedStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [reembedError, setReembedError] = React.useState<string | null>(null);
   const [reembedResult, setReembedResult] = React.useState<ReembedAllResult | null>(null);
+
+  const [urlInput, setUrlInput] = React.useState("");
+  const [urlIsCompanyMaterial, setUrlIsCompanyMaterial] = React.useState(true);
+  const [urlSuggestStatusNote, setUrlSuggestStatusNote] = React.useState(false);
+  const [urlStatus, setUrlStatus] = React.useState<"idle" | "loading" | "error">("idle");
+  const [urlError, setUrlError] = React.useState<string | null>(null);
+  const [resyncingId, setResyncingId] = React.useState<number | null>(null);
+  const [togglingId, setTogglingId] = React.useState<number | null>(null);
+  const [noteDraftById, setNoteDraftById] = React.useState<Record<number, string>>({});
 
   const refresh = React.useCallback(() => {
     listDocuments(PAGE_SIZE, (page - 1) * PAGE_SIZE)
@@ -80,7 +98,7 @@ export function DocumentManager() {
     setUploadError(null);
     try {
       const dataUri = await fileToBase64(file);
-      await ingestDocument(file.name, file.type, dataUri);
+      await ingestDocument(file.name, file.type, dataUri, uploadIsCompanyMaterial, uploadSuggestStatusNote);
       setFile(null);
       setUploadStatus("idle");
       // A new document sorts first (most-recent-first order) — jump
@@ -108,6 +126,63 @@ export function DocumentManager() {
       setListError(err instanceof ApiError ? err.message : "Delete failed.");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  async function handleAddFromUrl() {
+    const urls = urlInput
+      .split("\n")
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (urls.length === 0) return;
+    setUrlStatus("loading");
+    setUrlError(null);
+    try {
+      await ingestFromUrl(urls.length === 1 ? urls[0] : urls, urlIsCompanyMaterial, urlSuggestStatusNote);
+      setUrlInput("");
+      setUrlStatus("idle");
+      // Fetching/embedding runs in the background — the new rows start
+      // out "pending" and need a fresh fetch to actually show up.
+      if (page === 1) refresh();
+      else setPage(1);
+    } catch (err) {
+      setUrlError(err instanceof ApiError ? err.message : "Fetch failed — is the backend reachable?");
+      setUrlStatus("error");
+    }
+  }
+
+  async function handleResync(id: number) {
+    setResyncingId(id);
+    try {
+      await resyncDocument(id);
+      refresh();
+    } catch (err) {
+      setListError(err instanceof ApiError ? err.message : "Re-sync failed.");
+    } finally {
+      setResyncingId(null);
+    }
+  }
+
+  async function handleToggleCompanyMaterial(doc: DocumentSummary) {
+    setTogglingId(doc.id);
+    try {
+      await updateDocument(doc.id, !doc.is_company_material);
+      refresh();
+    } catch (err) {
+      setListError(err instanceof ApiError ? err.message : "Update failed.");
+    } finally {
+      setTogglingId(null);
+    }
+  }
+
+  async function handleSaveNote(doc: DocumentSummary) {
+    const draft = noteDraftById[doc.id];
+    if (draft === undefined || draft === (doc.status_note ?? "")) return;
+    try {
+      await updateDocument(doc.id, undefined, draft);
+      refresh();
+    } catch (err) {
+      setListError(err instanceof ApiError ? err.message : "Update failed.");
     }
   }
 
@@ -144,6 +219,19 @@ export function DocumentManager() {
         label="Drag & drop a document here, or click to browse"
         disabled={uploadStatus === "loading"}
       />
+      <div className="flex items-center gap-2">
+        <Switch checked={uploadIsCompanyMaterial} onCheckedChange={(c) => setUploadIsCompanyMaterial(Boolean(c))} />
+        <Label className="text-xs text-muted-foreground">
+          This states facts about the business itself (off = background reference material, e.g. a law
+          or regulation)
+        </Label>
+      </div>
+      <div className="flex items-center gap-2">
+        <Switch checked={uploadSuggestStatusNote} onCheckedChange={(c) => setUploadSuggestStatusNote(Boolean(c))} />
+        <Label className="text-xs text-muted-foreground">
+          Let the model draft a status note (e.g. &quot;repealed&quot;) if the text explicitly states one
+        </Label>
+      </div>
       <Button onClick={handleUpload} disabled={!file || uploadStatus === "loading"}>
         <UploadCloud className="size-4" />
         Upload
@@ -155,6 +243,43 @@ export function DocumentManager() {
       {uploadStatus === "error" && uploadError ? (
         <ErrorMessage description={uploadError} onRetry={() => setUploadStatus("idle")} />
       ) : null}
+
+      <div className="space-y-2 border-t pt-4">
+        <div className="space-y-1">
+          <p className="text-sm font-medium">Or add from a URL</p>
+          <p className="text-xs text-muted-foreground">
+            One URL per line — a webpage&apos;s own main text is extracted automatically, or a URL
+            pointing directly at a PDF/DOCX is parsed the same way an upload would be. Runs in the
+            background; watch status below.
+          </p>
+        </div>
+        <Textarea
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+          placeholder={"https://example.gov/statutes/title-12\nhttps://example.gov/statutes/title-13"}
+          rows={2}
+          className="font-mono text-xs"
+        />
+        <div className="flex items-center gap-2">
+          <Switch checked={urlIsCompanyMaterial} onCheckedChange={(c) => setUrlIsCompanyMaterial(Boolean(c))} />
+          <Label className="text-xs text-muted-foreground">
+            These state facts about the business itself (off = background reference material)
+          </Label>
+        </div>
+        <div className="flex items-center gap-2">
+          <Switch checked={urlSuggestStatusNote} onCheckedChange={(c) => setUrlSuggestStatusNote(Boolean(c))} />
+          <Label className="text-xs text-muted-foreground">
+            Let the model draft a status note per URL if its own text explicitly states one
+          </Label>
+        </div>
+        <Button variant="outline" onClick={handleAddFromUrl} disabled={!urlInput.trim() || urlStatus === "loading"}>
+          <Link2 className="size-4" />
+          {urlStatus === "loading" ? "Adding…" : "Add from URL"}
+        </Button>
+        {urlStatus === "error" && urlError ? (
+          <ErrorMessage description={urlError} onRetry={() => setUrlStatus("idle")} />
+        ) : null}
+      </div>
 
       <div className="space-y-2 border-t pt-4">
         {staleCount > 0 ? (
@@ -197,7 +322,8 @@ export function DocumentManager() {
         ) : null}
         {total > 0 ? <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} /> : null}
         {documents?.map((doc) => (
-          <div key={doc.id} className="flex items-center justify-between gap-3 rounded-lg border p-3">
+          <div key={doc.id} className="space-y-2 rounded-lg border p-3">
+          <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-start gap-2">
               <FileText className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
               <div className="min-w-0">
@@ -207,6 +333,16 @@ export function DocumentManager() {
                   {doc.status === "ready" ? ` · ${doc.chunk_count} chunks` : ""}
                   {doc.status === "error" && doc.error_message ? ` · ${doc.error_message}` : ""}
                 </p>
+                {doc.source_url ? (
+                  <a
+                    href={doc.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block truncate text-xs text-primary underline underline-offset-2"
+                  >
+                    {doc.source_url}
+                  </a>
+                ) : null}
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -215,7 +351,28 @@ export function DocumentManager() {
                   Needs re-embed
                 </Badge>
               ) : null}
+              <button
+                type="button"
+                onClick={() => handleToggleCompanyMaterial(doc)}
+                disabled={togglingId !== null}
+                title="Click to toggle — whether this document states facts about the business itself, or is background reference material"
+              >
+                <Badge variant={doc.is_company_material ? "secondary" : "outline"} className="cursor-pointer text-[10px]">
+                  {doc.is_company_material ? "Company info" : "Reference material"}
+                </Badge>
+              </button>
               <Badge variant={STATUS_BADGE[doc.status].variant}>{STATUS_BADGE[doc.status].label}</Badge>
+              {doc.source_url ? (
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={`Re-sync ${doc.filename}`}
+                  onClick={() => handleResync(doc.id)}
+                  disabled={resyncingId !== null}
+                >
+                  <RefreshCw className="size-3.5" />
+                </Button>
+              ) : null}
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -226,6 +383,14 @@ export function DocumentManager() {
                 <Trash2 className="size-3.5" />
               </Button>
             </div>
+          </div>
+          <Input
+            value={noteDraftById[doc.id] ?? doc.status_note ?? ""}
+            onChange={(e) => setNoteDraftById((prev) => ({ ...prev, [doc.id]: e.target.value }))}
+            onBlur={() => handleSaveNote(doc)}
+            placeholder={'Status note (e.g. "Repealed 2024-01-01, replaced by SB-123") — shown to the AI alongside this source'}
+            className="h-8 text-xs"
+          />
           </div>
         ))}
       </div>

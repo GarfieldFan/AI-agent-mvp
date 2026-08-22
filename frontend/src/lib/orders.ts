@@ -28,6 +28,12 @@ export type Order = {
   pickup_time: string | null;
   note: string | null;
   total_amount: number;
+  /** Payment gate (2026-08-20, backend/payments.py) — "unpaid" | "paid" |
+   * "failed" | "refunded" (nothing sets "refunded" yet). Deliberately
+   * separate from `status` above — never owner-agent-writable, only a
+   * real "test"-provider checkout or a verified Stripe webhook sets it. */
+  payment_status: string;
+  payment_provider: string | null;
   items: OrderItem[];
   created_at: string;
 };

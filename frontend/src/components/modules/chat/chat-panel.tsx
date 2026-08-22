@@ -11,6 +11,7 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { ApiError } from "@/lib/api";
 import { sendChatMessage, uploadChatAttachment, type ChatApiTurn } from "@/lib/chat";
+import { requestResumeCode, verifyResumeCode } from "@/lib/crm-resume";
 import { fileToBase64 } from "@/lib/file";
 import type { ChatMessage, ChatOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -102,6 +103,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   const [dragActive, setDragActive] = React.useState(false);
   const dragCounter = React.useRef(0);
 
+  // "Continue a previous request" (2026-08-20, backend/apis/crm_resume.py)
+  // — deliberately independent of the chat/LLM layer entirely: both
+  // calls below are plain REST, never routed through sendChatMessage or
+  // any LLM-driven intent detection. Collapsed by default (`resumeOpen`)
+  // so it doesn't compete with the scripted intake flow above; expands
+  // into a two-step form (email, then code) inline above the composer.
+  const [resumeOpen, setResumeOpen] = React.useState(false);
+  const [resumeStep, setResumeStep] = React.useState<"email" | "code">("email");
+  const [resumeEmail, setResumeEmail] = React.useState("");
+  const [resumeCode, setResumeCode] = React.useState("");
+  const [resumeStatus, setResumeStatus] = React.useState<"idle" | "sending" | "verifying" | "error">("idle");
+  const [resumeError, setResumeError] = React.useState<string | null>(null);
+
   React.useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, pending, error]);
@@ -163,6 +177,54 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function handleResumeRequestCode(event: React.FormEvent) {
+    event.preventDefault();
+    if (!resumeEmail.trim()) return;
+    setResumeStatus("sending");
+    setResumeError(null);
+    try {
+      await requestResumeCode(resumeEmail.trim());
+      setResumeStep("code");
+      setResumeStatus("idle");
+    } catch (err) {
+      setResumeError(err instanceof ApiError ? err.message : "Couldn't send a code — try again in a moment.");
+      setResumeStatus("error");
+    }
+  }
+
+  async function handleResumeVerifyCode(event: React.FormEvent) {
+    event.preventDefault();
+    if (!resumeCode.trim()) return;
+    setResumeStatus("verifying");
+    setResumeError(null);
+    try {
+      const result = await verifyResumeCode(resumeEmail.trim(), resumeCode.trim());
+      if (!result.resumed) {
+        setResumeError("That code didn't work — check it and try again.");
+        setResumeStatus("error");
+        return;
+      }
+      const fields = result.collected_fields ?? {};
+      const summary = Object.entries(fields)
+        .map(([key, value]) => `${key.replace(/_/g, " ")}: ${value}`)
+        .join(", ");
+      pushMessage({
+        role: "assistant",
+        content: summary
+          ? `Welcome back — I've pulled up your previous request. Here's what we have so far: ${summary}. Let's keep going.`
+          : "Welcome back — I've pulled up your previous request. Let's keep going.",
+      });
+      setResumeOpen(false);
+      setResumeStep("email");
+      setResumeEmail("");
+      setResumeCode("");
+      setResumeStatus("idle");
+    } catch (err) {
+      setResumeError(err instanceof ApiError ? err.message : "Couldn't verify that code — try again in a moment.");
+      setResumeStatus("error");
     }
   }
 
@@ -273,6 +335,77 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
       </ScrollArea>
 
       <div className="shrink-0 border-t">
+        {!resumeOpen ? (
+          <button
+            type="button"
+            onClick={() => setResumeOpen(true)}
+            className="w-full px-3 pt-2 text-left text-xs text-muted-foreground underline-offset-2 hover:underline"
+          >
+            Continuing a previous request? Enter your code
+          </button>
+        ) : (
+          <div className="space-y-1.5 px-3 pt-2">
+            {resumeStep === "email" ? (
+              <form onSubmit={handleResumeRequestCode} className="flex items-center gap-2">
+                <Input
+                  type="email"
+                  value={resumeEmail}
+                  onChange={(event) => setResumeEmail(event.target.value)}
+                  placeholder="Email you used before"
+                  className="h-8 flex-1 text-xs"
+                  disabled={resumeStatus === "sending"}
+                />
+                <Button type="submit" size="sm" disabled={!resumeEmail.trim() || resumeStatus === "sending"}>
+                  {resumeStatus === "sending" ? "Sending…" : "Send code"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Cancel"
+                  onClick={() => {
+                    setResumeOpen(false);
+                    setResumeError(null);
+                  }}
+                >
+                  <X className="size-3" />
+                </Button>
+              </form>
+            ) : (
+              <form onSubmit={handleResumeVerifyCode} className="flex items-center gap-2">
+                <Input
+                  value={resumeCode}
+                  onChange={(event) => setResumeCode(event.target.value)}
+                  placeholder="6-digit code"
+                  className="h-8 flex-1 text-xs"
+                  disabled={resumeStatus === "verifying"}
+                />
+                <Button type="submit" size="sm" disabled={!resumeCode.trim() || resumeStatus === "verifying"}>
+                  {resumeStatus === "verifying" ? "Checking…" : "Continue"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Cancel"
+                  onClick={() => {
+                    setResumeOpen(false);
+                    setResumeStep("email");
+                    setResumeError(null);
+                  }}
+                >
+                  <X className="size-3" />
+                </Button>
+              </form>
+            )}
+            {resumeStep === "email" ? (
+              <p className="text-xs text-muted-foreground">
+                If we find a matching request, we&apos;ll email you a code to continue it.
+              </p>
+            ) : null}
+            {resumeStatus === "error" && resumeError ? <p className="text-xs text-destructive">{resumeError}</p> : null}
+          </div>
+        )}
         {pendingAttachment ? (
           <div className="flex items-center gap-2 px-3 pt-2 text-xs text-muted-foreground">
             <Paperclip className="size-3 shrink-0" />

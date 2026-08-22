@@ -113,10 +113,10 @@ from apis.model_settings import resolve_chat_provider, resolve_embedding_provide
 from cart import apply_order_delta, find_active_order, search_products
 from db import get_db
 from llm_json import parse_lenient_json
-from models import ChatMessage, ChatSession, CrmEntry, IntentSchema, Order, Product
+from models import AppSettings, ChatMessage, ChatSession, CrmEntry, IntentSchema, Order, Product
 from providers.base import ProviderNotConfigured
 from resource_broker import chat_request_finished, chat_request_started
-from retrieval import retrieve
+from retrieval import RetrievedChunk, retrieve
 
 router = APIRouter()
 
@@ -167,7 +167,22 @@ SYSTEM_PROMPT = (
     "If document excerpts are provided below a question, treat them as your "
     "knowledge about a company/business the site owner has configured you to "
     "represent — answer using them when relevant, and don't invent details "
-    "beyond what they say. If no excerpts are provided, or none of them are "
+    "beyond what they say. An excerpt marked '(from ... — background "
+    "reference material, not a fact about this business)' is context the "
+    "business operates within, not a fact ABOUT the business itself (e.g. a "
+    "law or regulation the business is subject to, not something the "
+    "business itself states) — you can still use it to give a general, "
+    "accurate answer, but don't present it as the business's own claim, and "
+    "if the question needs precise, specific, or professional-level detail "
+    "from this kind of source, say plainly that a qualified professional "
+    "should confirm the specifics rather than answering with full "
+    "certainty yourself. An excerpt marked with a 'status note' (e.g. "
+    "'status note: repealed 2024-01-01, replaced by SB-123') is telling you "
+    "something important about that source's own current validity — factor "
+    "it directly into your answer (e.g. don't state a repealed/superseded/ "
+    "withdrawn rule as if it's still in effect; mention the status when it's "
+    "relevant to what's being asked) rather than treating the excerpt as "
+    "unconditionally current. If no excerpts are provided, or none of them are "
     "actually relevant to the question, fall back to being a friendly "
     "general-purpose conversational assistant: answer general questions "
     "directly and honestly (including simple ones like math) instead of "
@@ -223,6 +238,46 @@ SYSTEM_PROMPT = (
     "collected; once nothing is missing, confirm the request is complete "
     "instead of continuing to ask questions."
 )
+
+
+def _resolve_system_prompt(db: Session) -> str:
+    """Owner-configurable (2026-08-21, apis/chat_settings.py) — an
+    AppSettings.chat_system_prompt row FULLY REPLACES the built-in
+    SYSTEM_PROMPT above when set (confirmed directly with the user, a
+    full replace rather than an append-only override). This is safe
+    to allow in full because every dynamic per-turn fact this app injects
+    (RAG excerpts, visitor identity, in-progress intake state, order/cart
+    state, available request types — see this module's own `user_content`
+    assembly around the main provider.chat() call below) is folded into
+    the USER message, never into this system string, and the separate
+    lead-capture/order-extraction classification calls
+    (_lead_extraction_call/_order_extraction_call) run against their own
+    fixed system prompts this setting never touches. A full override
+    here only ever changes the main reply's tone/persona/framing — never
+    the underlying business-logic mechanics (what gets captured into a
+    CrmEntry, what an order total is). None/unset uses the built-in
+    default, same fallback posture as every other owner-config field."""
+    row = db.get(AppSettings, 1)
+    if row and row.chat_system_prompt:
+        return row.chat_system_prompt
+    return SYSTEM_PROMPT
+
+
+def _chunk_source_note(chunk: RetrievedChunk) -> str:
+    """Builds the parenthetical qualifier appended to a retrieved chunk's
+    citation line in the RAG context block — is_company_material's
+    marker and status_note (2026-08-21) are independent and can both
+    apply to the same chunk, so this composes them rather than picking
+    one. Empty string when neither applies (the common case), so an
+    ordinary chunk's citation line is unchanged from before either field
+    existed."""
+    parts = []
+    if not chunk.is_company_material:
+        parts.append("background reference material, not a fact about this business")
+    if chunk.status_note:
+        parts.append(f"status note: {chunk.status_note}")
+    return f" — {'; '.join(parts)}" if parts else ""
+
 
 # Gates lead-capture extraction on a turn with NO configured intent
 # schemas — only worth a second LLM call on a turn that could plausibly
@@ -1163,7 +1218,8 @@ async def chat(
             # call belongs to the model reading the actual content, not to a
             # cosine-similarity number computed before it ever sees the text.
             context_block = "\n\n".join(
-                f"[{i + 1}] (from {c.document_title}): {c.content}" for i, c in enumerate(chunks)
+                f"[{i + 1}] (from {c.document_title}{_chunk_source_note(c)}): {c.content}"
+                for i, c in enumerate(chunks)
             )
             user_content = (
                 f"Context (use only if relevant to the question):\n{context_block}\n\nQuestion: {req.message}"
@@ -1257,7 +1313,7 @@ async def chat(
         messages.append({"role": "user", "content": user_content})
 
         try:
-            reply = await provider.chat(messages, system=SYSTEM_PROMPT)
+            reply = await provider.chat(messages, system=_resolve_system_prompt(db))
         except ProviderNotConfigured as e:
             # lead_extraction_task was already started concurrently above
             # (see this section's comment) — if the main reply fails, it's

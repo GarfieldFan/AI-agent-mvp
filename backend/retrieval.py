@@ -31,6 +31,20 @@ class RetrievedChunk(BaseModel):
     content: str
     excerpt: str
     score: float
+    # False for a document the owner marked as background reference
+    # material rather than a fact about the business itself (2026-08-21,
+    # models.Document.is_company_material — see that column's own
+    # docstring). apis/chat.py's context-block formatting flags this to
+    # the model explicitly, since a retrieved reference-material chunk
+    # should never be treated as an authoritative statement about the
+    # business.
+    is_company_material: bool = True
+    # Free-text owner/LLM-drafted status note (2026-08-21,
+    # models.Document.status_note — see that column's docstring), e.g.
+    # "Repealed 2024-01-01, replaced by SB-123". None when unset (the
+    # common case). Surfaced the same way as is_company_material's own
+    # marker.
+    status_note: str | None = None
 
 
 async def retrieve(
@@ -51,6 +65,8 @@ async def retrieve(
             DocumentChunk.document_id,
             DocumentChunk.content,
             Document.filename,
+            Document.is_company_material,
+            Document.status_note,
             DocumentChunk.embedding.cosine_distance(query_vector).label("distance"),
         )
         .join(Document, Document.id == DocumentChunk.document_id)
@@ -68,6 +84,8 @@ async def retrieve(
             content=row.content,
             excerpt=row.content[:EXCERPT_LENGTH] + ("…" if len(row.content) > EXCERPT_LENGTH else ""),
             score=max(0.0, 1 - row.distance),
+            is_company_material=row.is_company_material,
+            status_note=row.status_note,
         )
         for row in rows
     ]

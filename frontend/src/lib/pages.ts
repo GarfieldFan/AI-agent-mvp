@@ -72,3 +72,15 @@ export async function getPublicPage(slug: string): Promise<GeneratedPage | null>
     return null;
   }
 }
+
+export type PublicPageSummary = {
+  slug: string;
+  updated_at: string;
+};
+
+/** Public, no-auth (2026-08-21) — just slugs + last-updated, no content.
+ * Added specifically for app/sitemap.ts, which needs to enumerate every
+ * published page without an admin token. */
+export function listPublicPages() {
+  return apiFetch<PublicPageSummary[]>("/api/pages");
+}

@@ -397,13 +397,30 @@ export type ProductCardBlock = {
   width?: BlockWidth;
 };
 
+/** Added 2026-08-21 — an embedded business-location map (backend/maps.py's
+ * swappable provider abstraction). `query` is a plain place/address search
+ * string, resolved into an embed URL at render time by `GET /api/map-embed`
+ * — never baked into a stored embed URL, so changing the configured map
+ * provider/key later doesn't require re-editing every page that already
+ * has one. A plain "open in Google Maps" link is always rendered
+ * alongside the embed (or in place of it, when no provider is
+ * configured) — see components/theme/blocks/map-block.tsx. Owner-inserted
+ * only via CTE, never vision-generated (a vision model has no way to know
+ * a real business address from a design mockup). */
+export type MapBlock = {
+  type: "map";
+  query: string;
+  width?: BlockWidth;
+};
+
 export type Block =
   | ImageBlock
   | TextContentBlock
   | ButtonBlock
   | ContainerBlock
   | ProductListBlock
-  | ProductCardBlock;
+  | ProductCardBlock
+  | MapBlock;
 
 export type PageSection =
   | HeroSection

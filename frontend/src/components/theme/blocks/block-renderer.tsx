@@ -10,6 +10,7 @@ import { InsertGap } from "@/components/theme/cte/insert-gap";
 import { ButtonBlock } from "@/components/theme/blocks/button-block";
 import { ContainerBlock } from "@/components/theme/blocks/container-block";
 import { ImageBlock } from "@/components/theme/blocks/image-block";
+import { MapBlock } from "@/components/theme/blocks/map-block";
 import { ProductCardBlock } from "@/components/theme/blocks/product-card-block";
 import { ProductListBlock } from "@/components/theme/blocks/product-list-block";
 import { TextContentBlock } from "@/components/theme/blocks/text-content-block";
@@ -59,6 +60,8 @@ function renderBlock(block: Block, path: string, hideContainerBadge: boolean) {
       return <ProductListBlock {...block} path={path} />;
     case "product-card":
       return <ProductCardBlock {...block} path={path} />;
+    case "map":
+      return <MapBlock {...block} path={path} />;
     default:
       return null;
   }

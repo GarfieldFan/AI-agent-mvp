@@ -41,6 +41,10 @@ def main() -> None:
                     email=demo["email"],
                     hashed_password=hash_password(DEMO_PASSWORD),
                     role=demo["role"],
+                    # Admin-provisioned (this script, run manually) is a
+                    # trusted creation path, same trust bar as OAuth's
+                    # own email verification — see models.User.email_verified.
+                    email_verified=True,
                 )
             )
             print(f"created: {demo['email']} ({demo['role']})")

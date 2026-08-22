@@ -23,3 +23,11 @@ __pycache__/
 
 # personal interview-prep notes, not project content
 /interview-talking-points.md
+
+# local test/reference material (RAG test PDFs, template screenshots), not
+# project content
+/materials/
+
+# local demo video source file, not project content — the README links a
+# GitHub-hosted copy instead
+/Video Project (10mb).mp4

@@ -38,6 +38,7 @@ from apis.api import TextOverlayRequest, add_text_overlay
 from apis.deps import CurrentUser, Role, get_current_user, require_role
 from apis.model_settings import _list_image_providers, resolve_chat_provider, resolve_image_provider, resolve_vision_provider
 from apis.pages import _get_or_create_page
+from crm_retention import cleanup_stale_crm_entries
 from db import get_db
 from llm_json import parse_lenient_json
 from models import ChatMessage, ChatSession, CrmEntry, Document, OwnerAgentRun, PageVersion
@@ -335,8 +336,32 @@ class ProductCardBlock(BaseModel):
     width: BlockWidth = "auto"
 
 
+class MapBlock(BaseModel):
+    """Added 2026-08-21 — an embedded business-location map (see
+    backend/maps.py). Owner-inserted only via CTE, same posture as
+    ProductListBlock/ProductCardBlock (never vision-generated — a vision
+    model has no way to know a real business address from a design
+    mockup). `query` is a plain place/address search string (e.g. "1600
+    Amphitheatre Parkway, Mountain View, CA" or a business name), resolved
+    at render time by GET /api/map-embed — never baked into a stored
+    embed URL, so changing the configured map provider/key later doesn't
+    require re-editing every page that already has a MapBlock on it."""
+
+    type: Literal["map"] = "map"
+    query: str = ""
+    width: BlockWidth = "auto"
+
+
 Block = Annotated[
-    Union[ImageBlock, TextContentBlock, ButtonBlock, ContainerBlock, ProductListBlock, ProductCardBlock],
+    Union[
+        ImageBlock,
+        TextContentBlock,
+        ButtonBlock,
+        ContainerBlock,
+        ProductListBlock,
+        ProductCardBlock,
+        MapBlock,
+    ],
     Field(discriminator="type"),
 ]
 
@@ -923,8 +948,23 @@ def _gather_ready_document_text(db: Session, char_budget: int = 16000) -> tuple[
     summarization/retrieval — appropriate for a company-profile page,
     where "everything currently ingested" is realistically a handful of
     documents for this project's scale, not a large corpus needing
-    ranking. Returns (concatenated_text, documents_included_count)."""
-    documents = db.query(Document).filter(Document.status == "ready").order_by(Document.id).all()
+    ranking. Returns (concatenated_text, documents_included_count).
+
+    Only `is_company_material=True` documents are included (2026-08-21,
+    see models.Document's own docstring) — every caller of this function
+    (generate_geo_page, detect_business_type, propose_intent_schema,
+    business_profile.py's suggest endpoint) synthesizes "who is this
+    company" content, and a document the owner marked as background
+    reference material (a law, a regulation) isn't a fact about the
+    company itself — feeding it in here would misrepresent it as one.
+    Plain RAG retrieval for /api/chat is unaffected — that still searches
+    every ready document regardless of this flag, see retrieval.py."""
+    documents = (
+        db.query(Document)
+        .filter(Document.status == "ready", Document.is_company_material.is_(True))
+        .order_by(Document.id)
+        .all()
+    )
     parts: list[str] = []
     total_len = 0
     included = 0
@@ -932,7 +972,8 @@ def _gather_ready_document_text(db: Session, char_budget: int = 16000) -> tuple[
         full_text = "\n".join(chunk.content for chunk in doc.chunks).strip()
         if not full_text:
             continue
-        block = f"### {doc.filename}\n{full_text}\n"
+        status_line = f" (status note: {doc.status_note})" if doc.status_note else ""
+        block = f"### {doc.filename}{status_line}\n{full_text}\n"
         if included > 0 and total_len + len(block) > char_budget:
             break
         parts.append(block)
@@ -1393,6 +1434,35 @@ def cleanup_uploads(req: CleanupUploadsRequest, db: Session = Depends(get_db)) -
         db, older_than_hours=req.older_than_hours, dry_run=req.dry_run
     )
     return CleanupUploadsResponse(**result)
+
+
+class CleanupCrmEntriesRequest(BaseModel):
+    dry_run: bool = False
+
+
+class CleanupCrmEntriesResponse(BaseModel):
+    scanned: int
+    deleted: int
+    deleted_ids: list[int]
+
+
+@router.post("/agent/crm/cleanup-stale-entries", response_model=CleanupCrmEntriesResponse)
+def cleanup_stale_crm_entries_route(
+    req: CleanupCrmEntriesRequest, db: Session = Depends(get_db)
+) -> CleanupCrmEntriesResponse:
+    """Purges abandoned, never-engaged (`status == "new"`) schema-linked
+    `CrmEntry` rows past their retention window (crm_retention.py: 24h
+    for one with essentially no real data collected yet, 7 days for one
+    with real partial PII on file) — the follow-on to `apis/crm_resume.py`'s
+    OTP-based resume feature, which otherwise lets an abandoned intake sit
+    in the database forever. Never touches `ChatSession`/`ChatMessage`
+    (see crm_retention.py's own docstring for why) or any entry the owner
+    has already started working. On-demand only, same as
+    `cleanup_uploads` above — no scheduler/cron exists in this stack."""
+    result = cleanup_stale_crm_entries(db, dry_run=req.dry_run)
+    return CleanupCrmEntriesResponse(
+        scanned=result.scanned, deleted=result.deleted, deleted_ids=result.deleted_ids
+    )
 
 
 class ReportRequest(BaseModel):

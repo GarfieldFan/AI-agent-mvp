@@ -35,6 +35,11 @@ services:
       # uploads, apis/media.py), the same way COMFYUI_PUBLIC_URL does for
       # ComfyUI-served images.
       - BACKEND_PUBLIC_URL=http://${HOST:-localhost}:${BACKEND_PORT:-8000}
+      # Where to send a visitor's browser back after a hosted Stripe
+      # Checkout session (backend/payments.py) — this backend never
+      # renders that redirect itself, it just needs to tell Stripe where
+      # to send the visitor once they've paid or cancelled.
+      - FRONTEND_PUBLIC_URL=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
       # RAG document uploads (backend/apis/documents.py). Lives under the
       # existing ./backend bind mount (see volumes: below) — no separate
       # named volume needed, and backend/.dockerignore keeps uploaded
@@ -77,6 +82,13 @@ services:
       # SSR fetch involved), so only the NEXT_PUBLIC_ variant is needed —
       # see frontend/src/lib/owner-agent.ts.
       - NEXT_PUBLIC_OWNER_AGENT_URL=http://${HOST:-localhost}:${OWNER_AGENT_PORT:-8100}
+      # This site's own public origin (2026-08-21) — needed for absolute
+      # URLs in sitemap.ts/robots.ts and as the JSON-LD "url" fallback
+      # when no business_url is configured. Same composition as
+      # NEXT_PUBLIC_API_URL above and backend's own FRONTEND_PUBLIC_URL
+      # (docker-compose's backend service) — all three describe the same
+      # externally-reachable address, just consumed by different sides.
+      - NEXT_PUBLIC_SITE_URL=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
     depends_on:
       - backend
 

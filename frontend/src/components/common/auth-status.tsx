@@ -25,7 +25,9 @@ export function AuthStatus() {
 
   return (
     <div className="flex items-center gap-2">
-      <span className="hidden text-sm text-muted-foreground sm:inline">{email}</span>
+      <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/account" />} className="hidden sm:inline-flex">
+        {email}
+      </Button>
       <RoleBadge role={role} />
       <Button variant="ghost" size="icon" aria-label="Log out" onClick={clearAuth}>
         <LogOut className="size-4" />

@@ -2,8 +2,10 @@
 endpoints: `/api/chat`, `/api/chat/upload` (apis/chat.py — no `require_role`
 gate at all, see the root AGENTS.md's RBAC note), `/api/auth/login`
 (the classic brute-force target, and every other route's own front door),
-and `/api/cart/add` (apis/products.py's public_router — a real mutation,
-2026-08-19).
+`/api/cart/add` (apis/products.py's public_router — a real mutation,
+2026-08-19), and `/api/crm/resume/request`/`/api/crm/resume/verify`
+(apis/crm_resume.py, 2026-08-20 — an email-bombing target and a
+brute-force-a-code target respectively).
 
 Everything else in this backend already sits behind `require_role` — a
 stolen/guessed JWT is a much bigger problem than a fast caller, and rate-
@@ -64,6 +66,16 @@ RULES: dict[tuple[str, str], RateLimitRule] = {
     # — same tier as /api/chat/upload, not the read-only product/search
     # routes (no rule needed there, same posture as GET /pages/{slug}).
     ("POST", "/api/cart/add"): RateLimitRule(window_seconds=300, max_requests=30),
+    # apis/crm_resume.py (2026-08-20) — /request triggers a real email
+    # send, so a generous limit here directly bounds how badly this could
+    # be used to spam a stranger's inbox with codes (the per-entry
+    # resume_code_attempts cap doesn't help against THIS route, which
+    # doesn't need a correct code, just an email address). /verify is the
+    # classic brute-force-a-code target — this IP-level budget is the
+    # first line of defense; the per-entry attempt cap (survives even if
+    # a caller spreads guesses across many source IPs) is the second.
+    ("POST", "/api/crm/resume/request"): RateLimitRule(window_seconds=3600, max_requests=5),
+    ("POST", "/api/crm/resume/verify"): RateLimitRule(window_seconds=900, max_requests=15),
 }
 
 # (method, path, ip) -> recent request timestamps (monotonic clock, so a

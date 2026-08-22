@@ -26,9 +26,11 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import type { CteSelection } from "@/lib/cte";
 import { listProducts, type Product } from "@/lib/products";
 import type {
+  BlockWidth as BlockWidthValue,
   ButtonBlock as ButtonBlockValue,
   ContainerBlock as ContainerBlockValue,
   ImageBlock as ImageBlockValue,
+  MapBlock as MapBlockValue,
   ProductCardBlock as ProductCardBlockValue,
   ProductListBlock as ProductListBlockValue,
   RichText,
@@ -313,6 +315,31 @@ const BUTTON_ACTION_OPTIONS = [
   { value: "link" as const, label: "Link to a page" },
   { value: "add_to_cart" as const, label: "Add a product to cart" },
 ];
+// Added 2026-08-21 — every block-* fieldType's own `width?: BlockWidth`
+// (lib/theme.ts), only meaningful when the block being edited is a direct
+// child of a `layout: "row"` container. Shared across all seven block-*
+// fieldTypes below (one `blockWidth` draft, not seven near-identical
+// copies) rather than duplicated per fieldType — was the one field this
+// component's own 2026-08-06 doc comment explicitly deferred ("left for a
+// later increment").
+const BLOCK_WIDTH_OPTIONS = [
+  { value: "auto" as const, label: "Auto (even split)" },
+  { value: "1/4" as const, label: "1/4" },
+  { value: "1/3" as const, label: "1/3" },
+  { value: "1/2" as const, label: "1/2" },
+  { value: "2/3" as const, label: "2/3" },
+  { value: "3/4" as const, label: "3/4" },
+  { value: "full" as const, label: "Full" },
+];
+const BLOCK_FIELD_TYPES = [
+  "block-container",
+  "block-text",
+  "block-image",
+  "block-button",
+  "block-product-list",
+  "block-product-card",
+  "block-map",
+] as const;
 
 type CteEditorPopoverProps = {
   selection: CteSelection;
@@ -348,11 +375,21 @@ type CteEditorPopoverProps = {
  * fieldTypes above, which only ever edit a plain string/CTA/item. Every
  * style control here is still a constrained enum or a plain hex color
  * (via ColorField) — no free-form CSS, same principle the schema has held
- * throughout. Deliberately NOT included in this pass: editing `width`
- * (BlockWidth, only meaningful as a row child) and inserting/removing
- * blocks from a container's `children` — both left for a later increment. */
+ * throughout. `width` (BlockWidth, only meaningful as a row child) editing
+ * was originally deferred here — added 2026-08-21, see BLOCK_WIDTH_OPTIONS
+ * above. Inserting/removing blocks from a container's `children` was the
+ * other item this comment used to defer — that shipped later too (CTE
+ * part 7, BlockRenderer's own move/delete/insert machinery). */
 export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteEditorPopoverProps) {
   const { fieldType, value, mode = "edit" } = selection;
+  const isBlockFieldType = (BLOCK_FIELD_TYPES as readonly string[]).includes(fieldType);
+
+  // Shared width draft (2026-08-21) — see BLOCK_WIDTH_OPTIONS above for
+  // why this is one state shared across every block-* fieldType rather
+  // than seven near-identical copies.
+  const [blockWidth, setBlockWidth] = React.useState<BlockWidthValue | undefined>(
+    isBlockFieldType ? (value as { width?: BlockWidthValue } | undefined)?.width : undefined,
+  );
 
   const [text, setText] = React.useState(typeof value === "string" ? value : "");
   const [imageDraft, setImageDraft] = React.useState<ThemeImage>(
@@ -481,6 +518,10 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
   const productCardValue = fieldType === "block-product-card" ? (value as ProductCardBlockValue) : null;
   const [pcProductId, setPcProductId] = React.useState<number | null>(productCardValue?.product_id ?? null);
 
+  // block-map draft (2026-08-21) — just a plain address/place query string.
+  const mapValue = fieldType === "block-map" ? (value as MapBlockValue) : null;
+  const [mapQuery, setMapQuery] = React.useState(mapValue?.query ?? "");
+
   // Shared product catalog, fetched once for every fieldType with a
   // product picker (block-product-list, block-product-card,
   // block-container's link picker, block-button's add-to-cart picker) —
@@ -558,6 +599,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         border_color: cBorderColor,
         background_image: cBackgroundImage,
         link_product_id: cLinkProductId,
+        width: blockWidth,
       } satisfies ContainerBlockValue;
     } else if (fieldType === "block-text" && textBlockValue) {
       return {
@@ -567,6 +609,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         weight: tWeight,
         align: tAlign,
         color: tColor,
+        width: blockWidth,
       } satisfies TextContentBlockValue;
     } else if (fieldType === "block-image" && imageBlockValue) {
       return {
@@ -574,6 +617,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         image: biImage,
         aspect_ratio: biAspect,
         rounded: biRounded,
+        width: blockWidth,
       } satisfies ImageBlockValue;
     } else if (fieldType === "block-button" && buttonBlockValue) {
       return {
@@ -588,6 +632,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         border_width: bbBorderWidth,
         action: bbAction,
         product_id: bbProductId,
+        width: blockWidth,
       } satisfies ButtonBlockValue;
     } else if (fieldType === "block-product-list" && productListValue) {
       const parsedTags = plTags
@@ -598,9 +643,12 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
         ...productListValue,
         tags: plFilterMode === "tags" && parsedTags.length > 0 ? parsedTags : null,
         product_ids: plFilterMode === "ids" ? plProductIds : null,
+        width: blockWidth,
       } satisfies ProductListBlockValue;
     } else if (fieldType === "block-product-card" && productCardValue) {
-      return { ...productCardValue, product_id: pcProductId } satisfies ProductCardBlockValue;
+      return { ...productCardValue, product_id: pcProductId, width: blockWidth } satisfies ProductCardBlockValue;
+    } else if (fieldType === "block-map" && mapValue) {
+      return { ...mapValue, query: mapQuery, width: blockWidth } satisfies MapBlockValue;
     }
     return undefined;
   }
@@ -684,6 +732,8 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
     plTags,
     plProductIds,
     pcProductId,
+    mapQuery,
+    blockWidth,
   ]);
 
   // "create" mode's explicit Add button — the one case that still needs a
@@ -930,6 +980,28 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
 
           {fieldType === "block-product-card" ? (
             <ProductSelect label="Product" products={catalog} value={pcProductId} onChange={setPcProductId} />
+          ) : null}
+
+          {fieldType === "block-map" ? (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">Address or place</label>
+              <Input
+                value={mapQuery}
+                onChange={(event) => setMapQuery(event.target.value)}
+                placeholder="e.g. 1600 Amphitheatre Parkway, Mountain View, CA"
+                autoFocus
+              />
+            </div>
+          ) : null}
+
+          {isBlockFieldType ? (
+            <EnumField
+              label="Width (only applies as a direct child of a Row)"
+              value={blockWidth}
+              options={BLOCK_WIDTH_OPTIONS}
+              onChange={setBlockWidth}
+              allowUnset
+            />
           ) : null}
         </div>
 

@@ -251,11 +251,23 @@ export function OrderPanel() {
         {orders.map((order) => (
           <details key={order.id} className="rounded-lg border p-3">
             <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-2 text-sm">
-              <span>
+              <span className="inline-flex items-center gap-1.5">
                 <span className="font-mono text-muted-foreground">#{order.id}</span>{" "}
                 {order.contact_name || order.contact_email ? `${order.contact_name || order.contact_email} — ` : ""}$
                 {order.total_amount.toFixed(2)}
                 {order.pickup_time ? ` — pickup ${order.pickup_time}` : ""}
+                <Badge
+                  variant={
+                    order.payment_status === "paid"
+                      ? "default"
+                      : order.payment_status === "failed"
+                        ? "destructive"
+                        : "outline"
+                  }
+                  className="text-xs"
+                >
+                  {order.payment_status}
+                </Badge>
               </span>
               <span className="flex shrink-0 items-center gap-2" onClick={(e) => e.stopPropagation()}>
                 <Select value={order.status ?? undefined} onValueChange={(v) => v && handleStatusChange(order, v)}>

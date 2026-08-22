@@ -17,11 +17,14 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
 import { checkoutCart, getCart, type Cart } from "@/lib/cart";
 
-/** `/checkout` (2026-08-20) — finalizes the same session-scoped cart
- * `/cart` reads (lib/cart.ts). No real payment anywhere in this app (see
- * the root AGENTS.md) — "place order" just records contact/pickup details
- * and closes the order (`is_open: false`), the same signal the owner's
- * own dashboard already uses for "done accepting add-ons." A prefilled
+/** `/checkout` (2026-08-20, payment gate added same day — see
+ * backend/payments.py) — finalizes the same session-scoped cart
+ * `/cart` reads (lib/cart.ts). "Place order" goes through the owner's
+ * configured payment gate: the default "test" provider marks the order
+ * paid immediately with no real charge; a real Stripe provider instead
+ * redirects the visitor's browser to Stripe's own hosted Checkout page
+ * (`checkout_url` in the response) — this component's own state never
+ * renders that page, it just navigates there. A prefilled
  * `contact_email`/`contact_name` (if the cart already carries one, e.g.
  * from an earlier chat turn) is editable, never locked. */
 export function CheckoutPage() {
@@ -36,6 +39,27 @@ export function CheckoutPage() {
   const [placing, setPlacing] = React.useState(false);
   const [placeError, setPlaceError] = React.useState<string | null>(null);
   const [placedOrder, setPlacedOrder] = React.useState<Cart | null>(null);
+
+  // Set when Stripe redirects the visitor's browser back here after a
+  // real hosted-Checkout payment attempt (`success_url` carries
+  // `?paid=1`, see backend/apis/products.py's checkout_cart). Read via a
+  // lazy useState initializer (runs once, on first render) rather than
+  // an effect — an effect calling setState synchronously in its body
+  // trips the react-hooks/set-state-in-effect lint rule, and there's no
+  // real user interaction to drive this from instead (same class of
+  // constraint ImageFieldEditor's Library-tab fetch already documents).
+  // Not next/navigation's useSearchParams() either — that hook needs a
+  // Suspense boundary and would force this whole route into dynamic
+  // rendering just to read a param this component only cares about once
+  // (same reasoning SessionIdBootstrap's own doc comment gives). This is
+  // a friendly landing message only, NOT proof of payment — the real
+  // source of truth is POST /webhooks/stripe updating the order
+  // server-side, which may not have landed yet by the time this
+  // redirect completes.
+  const [returnedFromStripe] = React.useState(() => {
+    if (typeof window === "undefined") return false;
+    return new URLSearchParams(window.location.search).get("paid") === "1";
+  });
 
   React.useEffect(() => {
     getCart()
@@ -60,12 +84,33 @@ export function CheckoutPage() {
         pickup_time: pickupTime.trim() || null,
         note: note.trim() || null,
       });
-      setPlacedOrder(result);
+      if (result.checkout_url) {
+        window.location.href = result.checkout_url;
+        return;
+      }
+      setPlacedOrder(result.order);
     } catch (err) {
       setPlaceError(err instanceof ApiError ? err.message : "Couldn't place your order — please try again.");
     } finally {
       setPlacing(false);
     }
+  }
+
+  if (returnedFromStripe) {
+    return (
+      <Container className="max-w-lg py-10">
+        <EmptyState
+          icon={CheckCircle2}
+          title="Payment received"
+          description="Thanks — your payment is being confirmed and your order will show up in our system shortly."
+          action={
+            <Button render={<Link href="/" />} nativeButton={false} variant="outline">
+              Back to home
+            </Button>
+          }
+        />
+      </Container>
+    );
   }
 
   if (placedOrder) {
@@ -74,7 +119,7 @@ export function CheckoutPage() {
         <EmptyState
           icon={CheckCircle2}
           title="Order placed"
-          description={`Order #${placedOrder.id} — total $${placedOrder.total_amount.toFixed(2)}. No payment was collected; the team will follow up on ${placedOrder.contact_email ?? "the contact info you provided"}.`}
+          description={`Order #${placedOrder.id} — total $${placedOrder.total_amount.toFixed(2)}. No real payment was collected (test mode); the team will follow up on ${placedOrder.contact_email ?? "the contact info you provided"}.`}
           action={
             <Button render={<Link href="/" />} nativeButton={false} variant="outline">
               Back to home
@@ -123,7 +168,7 @@ export function CheckoutPage() {
     <Container className="max-w-2xl space-y-6 py-10">
       <PageHeader
         title="Checkout"
-        description={`Order #${cart.id} — no payment is collected here, this just confirms your order.`}
+        description={`Order #${cart.id} — review your order, then place it.`}
       />
 
       <Card>

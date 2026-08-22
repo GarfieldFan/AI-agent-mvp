@@ -296,6 +296,72 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="POST",
         path="/api/agent/storage/cleanup-uploads",
     ),
+    "cleanup_stale_crm_entries": ToolSpec(
+        name="cleanup_stale_crm_entries",
+        description=(
+            "Purges abandoned, never-engaged structured intake entries (a visitor's in-progress "
+            'insurance claim, project inquiry, etc. that they never came back to finish) — only ever '
+            'touches an entry whose status is still "new" (the owner hasn\'t started working it) and '
+            "whose underlying conversation has gone cold past its own retention window (24h if almost "
+            "nothing was collected yet, 7 days if real data was). Never touches an entry the owner has "
+            'already contacted/closed, and never touches chat session/message history itself — only '
+            'this app\'s own resumable-request rows. Args (optional): {"dry_run": <true to preview what '
+            "would be deleted without actually deleting anything, default false>}."
+        ),
+        method="POST",
+        path="/api/agent/crm/cleanup-stale-entries",
+    ),
+    "ingest_documents_from_url": ToolSpec(
+        name="ingest_documents_from_url",
+        description=(
+            "Fetches one or more URLs and ingests each as a RAG knowledge-base document — a webpage's "
+            "own main text is extracted automatically (ads/navigation/footers stripped), or a URL "
+            "pointing directly at a PDF/DOCX is parsed the same way an upload would be. Runs in the "
+            'background; each URL becomes its own document with pending/processing/ready/error status, '
+            'visible in the dashboard\'s Document manager, not immediately in this call\'s own result. '
+            'Args: {"url": "<a single URL>"} or {"url": ["<URL>", "<URL>", ...]} for a batch — both '
+            "shapes are accepted. Use this when the owner wants to add a page/document by link instead "
+            "of uploading a file themselves (e.g. a government regulation page). Optional: "
+            '"is_company_material": <true/false, default true — false marks this as background '
+            "reference material the business doesn't own (a law, a regulation), not a fact about the "
+            'business itself>, "suggest_status_note": <true to have the model draft a short status '
+            "note (e.g. \"repealed 2024, replaced by SB-123\") ONLY when the source text explicitly "
+            "states its own status — never a guess; default false>."
+        ),
+        method="POST",
+        path="/api/agent/documents/ingest-from-url",
+    ),
+    "list_scheduled_tasks": ToolSpec(
+        name="list_scheduled_tasks",
+        description=(
+            "Lists every currently configured recurring scheduled task (name, task_type, cron_expression, "
+            "enabled, last run result) — call this before manage_scheduled_task if the owner refers to an "
+            'existing schedule ("change that daily sync to weekly instead") so you know its exact name '
+            "rather than guessing."
+        ),
+        method="GET",
+        path="/api/agent/scheduled-tasks",
+    ),
+    "manage_scheduled_task": ToolSpec(
+        name="manage_scheduled_task",
+        description=(
+            "Creates or updates a recurring scheduled task by name — calling this again with the same "
+            '"name" updates that same task in place rather than creating a duplicate, so a follow-up '
+            'command like "run it every Monday instead" just works. Args: {"name": "<short label>", '
+            '"task_type": "<one of: resync_url_document, reembed_all_documents, cleanup_chat_uploads, '
+            'cleanup_stale_crm_entries>", "task_args": {<args that task_type needs — resync_url_document '
+            'needs {"document_id": <int, from ingest_documents_from_url\'s or the Document manager\'s own '
+            'result>, "suggest_status_note": <optional, true to re-run the status-note classification on '
+            "every recurring re-sync, not just once>}; the other three take no required args, though "
+            'cleanup_chat_uploads accepts an optional "older_than_hours">}, "cron_expression": '
+            '"<standard 5-field cron, e.g. \'0 3 * * *\' '
+            'for daily at 3am>", "enabled": <true/false, default true>}. If the owner doesn\'t specify a '
+            "time, default to a reasonable off-peak hour (e.g. 3am) and say so plainly in your final "
+            "answer rather than asking — this run can't pause for a follow-up question."
+        ),
+        method="POST",
+        path="/api/agent/scheduled-tasks",
+    ),
 }
 
 

@@ -177,6 +177,26 @@ def delete_page(slug: str, db: Session = Depends(get_db)) -> None:
     db.commit()
 
 
+class PublicPageSummary(BaseModel):
+    slug: str
+    updated_at: datetime
+
+
+@public_router.get("/pages", response_model=list[PublicPageSummary])
+def list_public_pages(db: Session = Depends(get_db)) -> list[PublicPageSummary]:
+    """Public, no-auth — just slugs + last-updated, no content (unlike
+    admin_router's list_pages above). Added 2026-08-21 specifically for
+    frontend/src/app/sitemap.ts, which needs to enumerate every published
+    page without an admin token — a page's own slug isn't sensitive, the
+    whole point of publishing one is being publicly reachable."""
+    pages = db.scalars(select(Page).order_by(Page.created_at.desc())).all()
+    return [
+        PublicPageSummary(slug=page.slug, updated_at=page.versions[0].created_at)
+        for page in pages
+        if page.versions
+    ]
+
+
 @public_router.get("/pages/{slug}")
 def get_current_page(slug: str, db: Session = Depends(get_db)) -> dict:
     """Public: the current (latest) content for `slug`, or 404 if nothing's

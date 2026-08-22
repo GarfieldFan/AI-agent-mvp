@@ -51,6 +51,13 @@ export type Cart = {
   pickup_time: string | null;
   note: string | null;
   total_amount: number;
+  /** Payment gate (2026-08-20, backend/payments.py) — "unpaid" (default)
+   * -> "paid" | "failed"; "refunded" is a valid value but nothing sets it
+   * yet, no refund flow exists. Separate from `status` above, which is a
+   * free-text label owner-agent can set to anything — never a
+   * trustworthy payment signal. */
+  payment_status: string;
+  payment_provider: string | null;
   items: CartItem[];
   created_at: string;
 };
@@ -90,11 +97,25 @@ export type CheckoutInput = {
   note?: string | null;
 };
 
-/** Finalizes the cart — no real payment (see the root AGENTS.md), just
- * records contact/pickup details and flips the order closed (is_open:
- * false, mirrors the owner dashboard's own "no more add-ons" toggle). */
+export type CheckoutResult = {
+  order: Cart;
+  /** Set only when the owner's configured payment provider needs the
+   * visitor's browser to go pay somewhere else (Stripe's own hosted
+   * Checkout page, 2026-08-20 — see backend/payments.py). Null means
+   * payment already resolved synchronously (the default "test"
+   * provider) — the caller should show the normal confirmation screen
+   * instead of redirecting. */
+  checkout_url: string | null;
+};
+
+/** Finalizes the cart through the owner's configured payment gate
+ * (2026-08-20, backend/payments.py) — records contact/pickup details,
+ * then either closes the order immediately as paid (the default "test"
+ * provider, no real charge) or hands back a `checkout_url` to redirect
+ * the visitor's browser to for a real Stripe payment; the order only
+ * actually closes once that payment is confirmed via a webhook. */
 export function checkoutCart(input: CheckoutInput) {
-  return apiFetch<Cart>("/api/cart/checkout", {
+  return apiFetch<CheckoutResult>("/api/cart/checkout", {
     method: "POST",
     body: { session_id: getChatSessionId(), ...input },
   });

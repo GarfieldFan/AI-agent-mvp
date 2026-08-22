@@ -56,6 +56,19 @@ async def get_current_role(current: CurrentUser = Depends(get_current_user)) -> 
     return current.role
 
 
+async def require_authenticated_user(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """401s unless a real, valid JWT was presented — unlike get_current_user
+    (which never rejects, so the public/tool-free chat path keeps working
+    for anonymous visitors), this is for a NEW class of route (2026-08-22,
+    apis/my_account.py) that isn't gated by role at all — any logged-in
+    account (user/admin/owner) can see their OWN data — but does require
+    someone to actually be logged in, since "your own data" is
+    meaningless for an anonymous caller."""
+    if current.email is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return current
+
+
 def require_role(*allowed: Role):
     """FastAPI dependency factory: raises 403 unless the resolved role is
     one of `allowed`. Usage: `Depends(require_role(Role.admin, Role.owner))`."""

@@ -1,5 +1,6 @@
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -11,20 +12,48 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from apis.agent import router as agent_router
 from apis.api import router as image_router
 from apis.auth import router as auth_router
+from apis.business_profile import admin_router as business_profile_admin_router
+from apis.business_profile import public_router as business_profile_public_router
 from apis.chat import router as chat_router
+from apis.chat_sessions import router as chat_sessions_router
+from apis.chat_settings import router as chat_settings_router
 from apis.documents import router as documents_router
 from apis.intent_schemas import router as intent_schemas_router
 from apis.media import MEDIA_UPLOAD_DIR
 from apis.media import router as media_router
+from apis.crm_resume import router as crm_resume_router
+from apis.maps import admin_router as maps_admin_router
+from apis.maps import public_router as maps_public_router
 from apis.model_settings import router as model_settings_router
+from apis.my_account import router as my_account_router
+from apis.notifications import router as notifications_router
+from apis.oauth import admin_router as oauth_admin_router
+from apis.oauth import public_router as oauth_public_router
 from apis.pages import admin_router as pages_admin_router
 from apis.pages import public_router as pages_public_router
+from apis.payments import admin_router as payments_admin_router
+from apis.payments import public_router as payments_public_router
 from apis.products import admin_router as products_admin_router
 from apis.products import public_router as products_public_router
+from apis.scheduled_tasks import router as scheduled_tasks_router
+from apis.users import router as users_router
 from chat_attachments import CHAT_UPLOAD_DIR
 from rate_limit import RateLimitMiddleware
+from scheduler import start_scheduler, stop_scheduler
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Starts scheduler.py's in-process APScheduler (2026-08-21) — loads
+    # every enabled ScheduledTask row and registers its cron job. See
+    # scheduler.py's own module docstring for the full design, including
+    # the dev-mode --reload restart note.
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+
+app = FastAPI(lifespan=lifespan)
 
 # The frontend runs on a different port (:3000 vs :8000) so browser calls
 # from it are cross-origin. Comma-separated so a deployed frontend origin
@@ -61,6 +90,21 @@ app.include_router(products_admin_router, prefix="/api")
 app.include_router(products_public_router, prefix="/api")
 app.include_router(model_settings_router, prefix="/api")
 app.include_router(media_router, prefix="/api")
+app.include_router(payments_admin_router, prefix="/api")
+app.include_router(payments_public_router, prefix="/api")
+app.include_router(notifications_router, prefix="/api")
+app.include_router(crm_resume_router, prefix="/api")
+app.include_router(maps_admin_router, prefix="/api")
+app.include_router(maps_public_router, prefix="/api")
+app.include_router(business_profile_admin_router, prefix="/api")
+app.include_router(business_profile_public_router, prefix="/api")
+app.include_router(chat_sessions_router, prefix="/api")
+app.include_router(chat_settings_router, prefix="/api")
+app.include_router(oauth_admin_router, prefix="/api")
+app.include_router(oauth_public_router, prefix="/api")
+app.include_router(my_account_router, prefix="/api")
+app.include_router(scheduled_tasks_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 
 # Serves apis/media.py's uploaded images back out — publicly readable by
 # filename (no RBAC), same as ComfyUI's own /view endpoint for generated

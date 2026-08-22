@@ -763,10 +763,9 @@ facts only.
     decision, not an oversight): a **recommendation** feature ("suggest
     the right policy/dish/product from embedded documents" — layers on
     top of already-working RAG retrieval + chat, doesn't block proving
-    the collection mechanism); **URL-based auto-embed** (owner pastes a
-    law/regulation URL, gets fetched+chunked+embedded automatically — an
-    extension of `apis/documents.py`'s existing ingestion pipeline);
-    other verticals beyond the insurance validation above. Schema
+    the collection mechanism); other verticals beyond the insurance
+    validation above. ~~URL-based auto-embed~~ — built 2026-08-21, see
+    "URL-based document ingestion + scheduled tasks" below. Schema
     *creation* stays dashboard-form-
     only by the user's own explicit confirmation — see the next bullet
     for what IS now owner-agent-driven (a deliberate split: defining
@@ -1553,6 +1552,1314 @@ not e-commerce checkout.
   link, not inline cards) — plus the cart-add/chat cross-surface test
   and the custom-fields/image/bundle round-trip described above.
 
+### Payment gate (`backend/payments.py`, `backend/apis/payments.py`)
+
+Added 2026-08-20, on the user's own explicit ask: "接一个pay gate接口，可以接
+stripe等api key，但是现在还是用测试跳过payment process" — a real, swappable
+payment provider abstraction, same "swappable, not hardcoded" pattern
+already applied to every AI capability (`backend/providers/`), extended
+to a genuinely new capability domain: actually taking money for an
+`Order`. Deliberately a separate top-level module from `providers/` —
+that package is specifically AI providers, and payment isn't one.
+
+- **Two providers**: `TestPaymentProvider` (the default, `payment_provider`
+  null/`"test"`) — no real charge, immediately reports the order paid, so
+  `/checkout` works with zero configuration out of the box, same "give
+  the owner choices, don't force config before anything works" default
+  every AI provider already has. `StripePaymentProvider` — a real Stripe
+  Checkout Session, using Stripe's own official Python SDK (not
+  hand-rolled HTTP calls, unlike this project's other vendor
+  integrations) specifically because webhook signature verification is
+  security-critical: `stripe.Webhook.construct_event` is a vetted HMAC
+  check, not something worth reimplementing by hand for a
+  payment-forgery-adjacent code path. Checkout itself is Stripe-*hosted*
+  (the visitor's browser is redirected to a Stripe-owned page to enter
+  card details) — the simplest, safest integration shape available: card
+  data never touches this app's own server at all, sidestepping PCI
+  scope entirely.
+- **Payment confirmation is always asynchronous, never trusted from the
+  redirect itself** — `create_checkout()` either reports `already_paid`
+  synchronously (test provider only) or hands back a `redirect_url`;
+  either way, the actual "mark this order paid" write only ever happens
+  in `checkout_cart` itself (test) or `POST /webhooks/stripe` (Stripe,
+  verified event). The visitor's own return trip to `/checkout?paid=1`
+  (Stripe's `success_url`) is a friendly landing message only, never
+  proof of payment — `CheckoutPage`'s own doc comment says so
+  explicitly: a visitor can close the tab right after paying, before
+  Stripe's redirect even completes, and the order must still end up
+  marked paid from the webhook alone.
+- **`Order.payment_status`/`payment_provider`/`payment_reference` are
+  deliberately separate columns from `Order.status`**, not values
+  reused from that existing free-text field — `status` is a label
+  owner-agent (via `set_order_status_options`) or the owner can set to
+  literally anything, so it can never be a trustworthy signal for "did a
+  real payment actually succeed." `payment_status` is never
+  owner-agent-writable; only `checkout_cart` (test provider) and the
+  verified Stripe webhook ever set it. `payment_reference` holds
+  Stripe's own Checkout Session id — what the webhook matches an
+  incoming event back to the right `Order` by (via
+  `client_reference_id`, set at session-creation time), never anything
+  the browser itself supplies.
+- **`AppSettings` gained the same write-only-secret pattern
+  `custom_api_key` already has** — `stripe_secret_key`/
+  `stripe_webhook_secret` are never echoed back by `GET
+  /agent/payment-settings`, only a `*_set` boolean says whether one is
+  saved; `PUT` with the field omitted leaves the previously-saved value
+  alone (there is currently no way to explicitly clear a saved key back
+  to null through this endpoint, the same limitation `custom_api_key`
+  already has — a deliberate, pre-existing tradeoff, not a new gap).
+  `stripe_publishable_key` is the one exception, safe to echo back —
+  Stripe's own publishable key is meant to be public.
+- **`FRONTEND_PUBLIC_URL`** (new env var, `docker-compose.yml`, same
+  `${HOST}:${FRONTEND_PORT}` composition as every other public-URL env
+  var) — what `checkout_cart` builds Stripe's `success_url`/`cancel_url`
+  from; this backend never renders that redirect itself, it just needs
+  to tell Stripe where to send the visitor's browser back to.
+- **`PaymentSettingsPanel`** (frontend, in the "Products & orders"
+  accordion group alongside `ProductPanel`/`OrderPanel`) — provider
+  picker + Stripe key inputs, mirrors `ModelSettingsPanel`'s
+  `CustomEndpointBlock` UX (password-type inputs, a "Saved" badge, a
+  placeholder telling the owner blank means "keep the saved key"). Also
+  surfaces the exact webhook URL to paste into Stripe's own dashboard.
+  `OrderPanel`'s summary row gained a `payment_status` `Badge`
+  (paid/unpaid/failed) next to the total, visible without expanding.
+- **Verified end-to-end**: default test-mode checkout closes the order
+  as `paid`/`test` with no configuration; switching to `stripe` with no
+  secret key set correctly 503s with a clear message instead of
+  crashing; the write-only secret-key round-trip (set → never echoed →
+  updating an unrelated field leaves it intact); and — the one genuinely
+  security-sensitive path — a forged webhook request with a bad
+  signature is correctly rejected with a real HMAC verification failure
+  (`stripe.error.SignatureVerificationError`), not just a header-presence
+  check. No real Stripe account was available this session, so the full
+  hosted-Checkout redirect → webhook → paid-order round trip was not
+  exercised against Stripe's actual servers — only every piece on this
+  app's own side of that boundary.
+
+### Email + SMS gate (`backend/notifications.py`, `backend/apis/notifications.py`)
+
+Added 2026-08-20, same session as the payment gate above, on the user's
+own direct follow-up: "现在把email接口和手机接口也做一下，这样就可以用mailgun等
+第三方服务商了" — the identical "swappable, not hardcoded" pattern extended
+to a third capability domain: sending a real message to a real inbox/
+phone. Deliberately its own module, not folded into `payments.py` —
+messaging and payment are different concerns that happen to share a
+design pattern, not the same concern.
+
+- **Two independent provider families, same "test is the default" shape
+  as payment**: `EmailProvider` (`TestEmailProvider`, a pure no-op /
+  `MailgunEmailProvider`, real Mailgun HTTP API) and `SMSProvider`
+  (`TestSMSProvider` / `TwilioSMSProvider`, real Twilio HTTP API). Both
+  real providers use plain `httpx` calls, not either vendor's official
+  SDK — unlike Stripe, where the SDK's webhook-signature verification
+  was worth the dependency for its security properties, there's no
+  equivalent inbound-webhook-trust concern here (this module only ever
+  sends, never receives and verifies anything from these vendors).
+- **This module builds the send capability, it does NOT decide when to
+  send anything** — no caller wires it into a business trigger (an
+  order-confirmation email, a lead-notification text, ...); that's a
+  separate, later decision about what to send, to whom, and with what
+  copy, deliberately out of scope for this round. The only current
+  callers are `apis/notifications.py`'s test-send endpoints — an owner
+  configures a provider and proves the credentials actually work before
+  anything real depends on it.
+- **`AppSettings` gained the same write-only-secret pattern as
+  `stripe_secret_key`** — `mailgun_api_key`/`twilio_auth_token` are
+  never echoed back by `GET /agent/notification-settings`, only
+  `mailgun_api_key_set`/`twilio_auth_token_set` booleans; `PUT` with the
+  field omitted leaves the previously-saved value alone. Every other
+  field (`mailgun_domain`/`mailgun_from_address`/`twilio_account_sid`/
+  `twilio_from_number`) isn't a secret — a Twilio Account SID is a
+  public identifier, the same way a Stripe publishable key is — so
+  those echo back normally.
+- **`NotificationSettingsPanel`** (frontend, same "Products & orders"
+  accordion group as `PaymentSettingsPanel` — third-party service
+  credentials living together for now, revisit if a dedicated
+  "Integrations" group becomes warranted later) — two sections (Email,
+  SMS), each a provider `Select` + that provider's config fields +
+  a "Send test email"/"Send test SMS" button with its own target-address
+  input. The test-send result names which provider actually handled the
+  call (`"test"` vs `"mailgun"`/`"twilio"`) so a no-op is never mistaken
+  for a real delivery.
+- **Verified end-to-end against the real vendor APIs, not just this
+  app's own side**: default test-mode send returns `{"provider": "test"}`
+  with zero configuration; selecting `mailgun`/`twilio` with no
+  credentials set correctly 503s with a clear message; the write-only
+  secret round-trip (set → never echoed → updating an unrelated field
+  leaves it intact); and — genuinely hitting Mailgun's and Twilio's real
+  production endpoints with fake credentials — both correctly rejected
+  the request (Mailgun: 403 Forbidden; Twilio: error 20003,
+  "Authentication Error - invalid username"), and this app's own code
+  correctly turned that into a clean 503 rather than crashing or
+  claiming success. No real (non-fake) Mailgun/Twilio account was
+  available this session, so an actual successful delivery was not
+  exercised — only that a real, reachable vendor API correctly rejects
+  bad credentials and this app handles that rejection gracefully.
+
+### Map embed gate (`backend/maps.py`, `backend/apis/maps.py`)
+
+Added 2026-08-21, on the user's own direct ask ("map component") — the
+same "swappable, not hardcoded" pattern extended to a fourth capability
+domain: showing a business location. The design question going in was
+whether a real embedded map was worth building at all versus just a
+plain "redirect to Google Maps" link (the user's own starting question);
+resolved by observing that a genuinely useful Image+Link combo would
+need a real static-map image anyway, which requires the same class of
+API integration a live embed does — so the embed was judged worth
+building, with the redirect link kept as an **unconditional** floor
+regardless of configuration, not a fallback that goes away once a
+provider is set.
+
+- **`MapProvider` is narrower than payment/notification's provider
+  matrix on purpose** — there's no "does nothing" action to skip the way
+  `TestPaymentProvider`/`TestEmailProvider` skip a charge/send; a map
+  provider only ever builds a URL string, nothing to no-op. `TestMapProvider`
+  (default) returns no embed at all; `GoogleMapsProvider` is the only real
+  implementation — Google's Maps Embed API needs nothing but a key and a
+  place/address query string (no client-side JS SDK, no tile-styling
+  config), unlike a genuine multi-vendor map matrix (Mapbox, OpenStreetMap)
+  that would need real per-vendor embed mechanics. A second real provider
+  can be added the same way `providers/custom.py` was added for chat, once
+  there's an actual second need — not preemptively.
+- **The redirect-only floor is unconditional, not provider-gated** — a
+  `MapBlock` always renders a real "Open in Google Maps" link built from
+  its own `query` text, regardless of whether any map provider is
+  configured at all. This directly answers the user's original framing
+  question (map vs. just redirect): the redirect always exists; a real
+  Google Maps API key layers a live in-page iframe on top of it, never
+  replaces it.
+- **The Google Maps Embed API key is kept write-only server-side anyway,
+  even though it doesn't strictly need to be** — Google's own Embed API
+  key is *designed* to sit in a browser-loaded iframe `src` (restricted
+  via Google Cloud Console's own HTTP-referrer allowlist, not treated as
+  a bearer-style secret the way a Stripe secret key or Mailgun API key
+  is). Still, `GET /agent/map-settings` never echoes the raw key back
+  (only `google_maps_api_key_set`), and the frontend never receives it at
+  all — `GET /api/map-embed?query=...` (public, no-auth, mirrors `GET
+  /api/product-fields`'s public-but-not-sensitive posture) resolves the
+  provider server-side and returns the already-assembled `embed_url`, so
+  the key never has to round-trip through this app's own frontend code or
+  React state, even though the vendor itself would tolerate it.
+- **`query` lives on the `MapBlock` itself, not baked into a stored embed
+  URL** — `GET /api/map-embed` is called at render time, every time, so
+  switching the configured map provider/key later (or turning it on for
+  the first time) makes every existing `MapBlock` on every saved page
+  start showing a live embed with zero page edits needed, the same
+  "settings are global and apply retroactively" posture as the AI model
+  picker.
+- **`MapBlock` (frontend, `components/theme/blocks/map-block.tsx`)** —
+  owner-inserted only via CTE (`BlockInsertMenu`, `lib/block-registry.ts`),
+  never vision-generated (matches `ProductListBlock`/`ProductCardBlock`'s
+  own precedent — a vision model has no way to know a real business
+  address from a design mockup; `map` is simply never mentioned in
+  `_VISION_SYSTEM_PROMPT`'s section catalog, the same mechanism that
+  already excludes those two). Fetches client-side (`useEffect` +
+  `getMapEmbed`), same reasoning as `ProductCardBlock` — `BlockRenderer`
+  (the recursive dispatcher rendering every Block type) is a Client
+  Component, and `query` is owner-authored content only known once the
+  block actually renders. Editable via a new `"block-map"` `EditableFieldType`
+  (`lib/cte.ts`) — a single plain-text address/place field in
+  `CteEditorPopover`, the simplest of the `block-*` fieldTypes so far
+  (no style knobs — a map embed has nothing analogous to color/size/
+  weight to expose).
+- **`MapSettingsPanel`** (frontend, in the "Products & orders" accordion
+  group alongside `PaymentSettingsPanel`/`NotificationSettingsPanel` —
+  continuing that group's already-acknowledged provisional role as the
+  home for third-party service credentials, not because a map is
+  products/orders-specific) — provider `Select` (no live embed / Google
+  Maps) + the same write-only-secret `Input`/`Badge` UX as the other two
+  panels, no test-send equivalent (there's nothing to "send" — the panel
+  copy itself explains a `MapBlock` always links out regardless of what's
+  configured here).
+- **Verified end-to-end**: default test-mode `GET /api/map-embed` returns
+  `embed_url: null` plus a working `maps_url` for an arbitrary query
+  string with zero configuration; setting `map_provider: "google"` with a
+  key correctly returns a `embed_url` with that key and the query
+  correctly assembled into the Maps Embed API URL shape; `GET
+  /agent/map-settings` never echoes the raw key back before or after
+  saving (only the `_set` boolean flips); an invalid `map_provider` value
+  correctly 400s; a page version saved with a `MapBlock` section
+  round-tripped byte-for-byte through save → public read. `tsc`/full-
+  source `eslint`/`pytest`/a real production build all clean — one real
+  lint catch during this pass: `MapBlock`'s effect originally called
+  `setResult(undefined)` synchronously for the empty-query case, tripping
+  `react-hooks/set-state-in-effect` (same class of bug this project has
+  hit before, see "Known gotchas"'s pattern) — fixed by just returning
+  early with no state reset, since the render path already checks
+  `!query.trim()` before ever reading `result`, so a stale value from a
+  previous non-empty query is harmless.
+
+### GEO / business profile — structured data, robots.txt, sitemap.xml
+
+Added 2026-08-21, immediately after the map embed gate above, on a real
+user report: asking ChatGPT/Gemini something like "I need a plumber"
+surfaced a *different* business's name and contact info in the answer —
+this app had nothing published anywhere that would let an AI system
+answer that kind of question about *this* business at all. The user's
+own framing was explicit: "以后所有的AI都可以抓取这个系统的信息并且可以上列表"
+(any AI should be able to crawl this system's info and get listed) — not
+blog posts or comments (considered and rejected, see below), a real GEO
+(Generative Engine Optimization) push. The user does not know this space
+well and asked me to design and build the whole thing.
+
+- **Why not blog posts/comments** — the user's first instinct was content
+  marketing (posts) or review volume (comments), which I talked through
+  and the user agreed wasn't the right lever: posts/comments help
+  *traditional* SEO ranking, but the actual reported failure ("AI didn't
+  know who we are at all") is a *discoverability/entity-recognition*
+  problem — an AI system needs machine-readable facts (name, address,
+  phone, hours) to cite accurately, not more prose to summarize. This app
+  already had a prose half of this (`generate_geo_page`, see "RAG"
+  above); what it never had was structured data or basic crawler
+  configuration at all.
+- **Three real, concrete pieces, not one**: (1) `backend/apis/
+  business_profile.py` — an owner-entered structured "who/where/how to
+  reach us" fact base; (2) `frontend/src/app/robots.ts` — explicit
+  crawl permission for AI crawlers, not just traditional search; (3)
+  `frontend/src/app/sitemap.ts` — makes sure crawlers can actually find
+  every public URL. All three exist because a missing business fact base
+  meant there was nothing to publish, a missing robots.txt meant crawlers
+  had no explicit signal either way, and a missing sitemap meant even a
+  permitted crawler had no reliable way to discover `/products/{id}`/
+  `/p/{slug}` URLs beyond following on-page links.
+- **`AppSettings` gained 14 business-profile columns** (`backend/
+  models.py`) — name, description, a free-text schema.org type (e.g.
+  "Plumber", "Restaurant" — not a closed enum; schema.org has hundreds of
+  subtypes and this app has no reason to maintain its own copy), email,
+  phone, a 5-part address, url, logo_url, `business_hours` (JSONB
+  `list[str]`, one schema.org openingHours-format string per entry, e.g.
+  `"Mo-Fr 09:00-17:00"` — a deliberate v1 scope cut: one owner-typed line
+  per range, not a day-by-day time-picker UI, same "simplest thing that
+  produces valid structured data" posture as `Order.pickup_time` staying
+  free text elsewhere in this app), and `business_social_links` (JSONB
+  `list[str]`, schema.org `sameAs` — Google Business Profile/Yelp/
+  Facebook URLs that corroborate entity identity, same shape as
+  `Product.tags`'s existing JSONB-list-of-strings precedent). No secrets
+  here at all — every field is safe to echo back and, in fact, meant to
+  be publicly crawlable; `GET /api/business-profile` (public, no-auth)
+  is the whole point.
+- **Deliberately owner-entered/confirmed, never LLM-written directly** —
+  the same "misread real-world fact has real consequences" posture
+  already established for Product pricing and IntentSchema definitions:
+  a wrong phone number in a JSON-LD block an AI system then repeats to a
+  real customer is a worse failure mode than a wrong price, not a
+  better one. `POST /agent/business-profile/suggest` mirrors
+  `detect_business_type`/`propose_intent_schema`'s existing precedent
+  exactly — an LLM drafts values from ingested RAG documents (a
+  deliberately conservative prompt: "extract ONLY facts explicitly
+  present... do NOT invent, guess, or infer... leave a field null if the
+  source text doesn't clearly state it"), returns them as a suggestion,
+  and never saves anything itself; the owner reviews the pre-filled
+  `BusinessProfilePanel` form and explicitly clicks Save. Verified live
+  against this app's own real ingested real-estate document: correctly
+  extracted `business_name`/`business_description`/`business_type`
+  ("RealEstateAgent") from prose that stated them, and correctly left
+  phone/email/address/hours null since the source document never stated
+  those — exactly the intended "don't invent" behavior, not just a
+  hopeful prompt instruction.
+- **`buildLocalBusinessJsonLd` (`frontend/src/lib/business-profile.ts`)**
+  — pure formatting (profile → schema.org `LocalBusiness` object), no
+  network I/O, shared by `BusinessProfileJsonLd`. Returns `null` (renders
+  nothing at all, not even an empty script tag) when there's no
+  `business_name` set — an empty "LocalBusiness" entity with no name
+  would be worse than publishing nothing. Every optional field (email,
+  phone, address, logo, hours, sameAs) is individually omitted from the
+  JSON-LD object when unset, rather than emitted as `null`/empty — a
+  smaller, honest JSON-LD block over a padded one with empty fields.
+- **`SiteJsonLd` (`components/layout/site-json-ld.tsx`, renamed from
+  `BusinessProfileJsonLd` the same day it shipped, once its scope
+  broadened)** — a Server Component mounted once in the root layout,
+  fetches the public profile and renders one JSON-LD `<script>` tag on
+  every page site-wide (a business's identity isn't page-specific).
+  Fetch failures are swallowed — a business-profile outage must never
+  take down page rendering.
+  - **`buildSiteJsonLd` (`lib/business-profile.ts`) always includes a
+    `WebSite` node, never gated on a business profile existing** — a
+    `WebSite` entry (site identity + a `potentialAction: SearchAction`
+    pointing at this app's real `/search?q=` route) is what Google's own
+    structured-data guidelines use to decide whether to offer a
+    sitelinks search box, and it has real value from day one, before any
+    GEO setup is finished. Once a business profile exists,
+    `buildLocalBusinessJsonLd`'s output is folded into the SAME `@graph`
+    alongside the `WebSite` node (one `<script>` tag, one top-level
+    `@context` — each `@graph` entry's own `@context` is stripped before
+    nesting, matching Google's own JSON-LD examples, which never repeat
+    `@context` per graph node), linked via `WebSite.publisher` →
+    `LocalBusiness`'s `@id` — the standard schema.org pattern for saying
+    "this website is published by this organization." Verified live:
+    zero-config renders a `WebSite`-only graph with a working
+    `SearchAction`; a configured profile renders both nodes correctly
+    linked, with `@context` appearing exactly once.
+- **Root layout's `metadata` became `generateMetadata()`** (was a static
+  `export const metadata`) — once a business profile is configured, the
+  site's own `<title>`/meta description reflect the actual configured
+  business instead of this portfolio project's placeholder copy ("AI
+  MVP..."), a real, honest fix beyond just JSON-LD: the previous
+  hardcoded copy was visibly wrong for any real deployment of this app.
+  Falls back to the original static text with zero configuration.
+  **Real, deliberate build-output tradeoff found during verification**:
+  since `generateMetadata` now does a live per-request fetch, every route
+  under the root layout changed from statically prerendered (`○`) to
+  dynamic/server-rendered-on-demand (`ƒ`) in the production build output
+  — including previously-static routes like `/login`/`/dashboard` that
+  have no data dependency of their own. Accepted, not treated as a
+  regression: this app already runs every service server-side per
+  request in Docker (no static export/CDN deployment target exists), the
+  fetch itself is a cheap local DB read through the backend, and the
+  whole point of dynamic metadata is reflecting live-configured business
+  data rather than a build-time snapshot.
+- **`frontend/src/app/robots.ts`** — explicitly names common AI crawlers
+  (GPTBot, ChatGPT-User, OAI-SearchBot, ClaudeBot, anthropic-ai,
+  Claude-Web, PerplexityBot, Google-Extended, Applebot-Extended, CCBot,
+  Bytespider) alongside the bare `*` rule, rather than relying on the `*`
+  rule alone to implicitly cover them — a bare `Allow: /` for `*` already
+  permits every one of these by default, but naming them makes the
+  intent unambiguous to a human reading this file and future-proofs
+  against any of these vendors ever defaulting to a stricter posture for
+  an unlisted-but-not-explicitly-allowed agent. Disallows `/dashboard`,
+  `/editor`, `/login`, `/checkout`, `/cart` — owner-only or per-visitor
+  pages with zero SEO/GEO value, so crawl budget goes toward the
+  actually-public content instead.
+- **`frontend/src/app/sitemap.ts`** — enumerates `/`, `/about`, every
+  saved page (`GET /api/pages`, a new public no-auth endpoint added to
+  `apis/pages.py` specifically for this — the existing `list_pages` is
+  admin-gated), and every available product (`GET /api/products`, no
+  args = every available product, already public). `/` and `/about` are
+  hardcoded, always present, since those two routes always resolve to
+  *something* (a saved page or the hand-authored default template).
+  Best-effort per section — a `listPublicPages()`/`listPublicProducts()`
+  failure omits that section rather than failing the whole sitemap.
+  Verified live: correctly excludes the `"home"`/`"about"` slugs from the
+  `/p/{slug}` list (they map to the two hardcoded fixed-route entries
+  instead, per `app/page.tsx`/`app/about/page.tsx`'s own slug
+  convention) and correctly lists real saved pages/products.
+- **`NEXT_PUBLIC_SITE_URL`** (new env var, `docker-compose.yml`'s
+  frontend service) — this deployment's own public origin, same
+  `${HOST}:${FRONTEND_PORT}` composition as `NEXT_PUBLIC_API_URL` and the
+  backend's own `FRONTEND_PUBLIC_URL`; needed for the absolute URLs
+  `sitemap.ts`/`robots.ts` require and as `buildLocalBusinessJsonLd`'s
+  fallback when no `business_url` is configured (the backend already
+  applies the equivalent `FRONTEND_PUBLIC_URL` fallback server-side —
+  this is a second, harmless belt-and-suspenders fallback for whatever
+  reaches the frontend function).
+- **`BusinessProfilePanel`** (frontend, new "SEO & AI discoverability"
+  accordion group — a dedicated top-level group, not folded into
+  "Content generation" alongside `GeoPagePanel`, given the weight the
+  user placed on this being "未来的核心") — a plain form (name/type/
+  description/email/phone/address/url/logo via the reused
+  `ImageFieldEditor`/hours/social links, the last two as one-line-per-
+  entry `Textarea`s) plus the "Suggest from documents" button described
+  above. Saves via `PUT /agent/business-profile`, no write-only-secret
+  UX needed (nothing here is a credential).
+- **Verified end-to-end**: `GET /api/business-profile` (public) round-
+  trips a full save correctly; an invalid `business_hours` type (a plain
+  string instead of a list) correctly 422s; `POST /agent/business-profile/
+  suggest` against a real ingested document correctly extracted only
+  explicitly-stated facts and left the rest null; a live page render with
+  no profile configured produced zero `<script type="application/ld+json">`
+  tags; a live page render with a configured profile produced a correct,
+  minimal (unset fields fully omitted, not emitted empty) schema.org
+  `LocalBusiness` block AND a `<title>`/meta description reflecting the
+  configured name/description; `robots.txt` and `sitemap.xml` both
+  render real, correct content in production (`docker compose run --rm
+  frontend npm run build` shows both as real routes). `tsc`/full-source
+  `eslint`/`pytest`/a real production build all clean.
+- **Deliberate v1 scope cuts**: no day-by-day opening-hours UI (one
+  owner-typed schema.org-format line per range instead); no automatic
+  submission to Google Search Console/Bing Webmaster Tools (an owner
+  action outside this app's own scope, same "we build the interface, the
+  owner does the account-level step" posture as the payment/notification
+  gates' own vendor-dashboard steps); `business_hours`/
+  `business_social_links` have no dedicated per-item add/remove UI (a
+  plain multi-line `Textarea`, parsed at the save boundary) — matches
+  this app's existing "simplest thing that produces valid structured
+  data" posture rather than building a repeatable-field-row editor for
+  what's realistically a handful of lines.
+
+### Owner-configurable public-chat system prompt (`backend/apis/chat_settings.py`)
+
+Added 2026-08-21, same day as the GEO push above, off a direct user
+request: the owner should have real control over the public chatbot's
+tone/persona/behavior rules, not just its underlying model — those were
+already swappable (see "AI provider is swappable"), but `SYSTEM_PROMPT`
+itself was still a hardcoded constant in `apis/chat.py`.
+
+- **A confirmed, deliberate design decision: FULL replacement, not an
+  append-only override.** I raised the safer alternative (owner can only
+  add extra rules on top of a locked safety core) directly with the user
+  before building; the user chose full replacement instead. This is
+  safe enough to allow specifically because of how `apis/chat.py` is
+  actually structured, confirmed by reading the real code path rather
+  than assumed: every dynamic per-turn fact this app injects — RAG
+  excerpts, visitor identity (`_build_visitor_context`), in-progress
+  intake state (`_in_progress_context_block`), which request types are
+  configured (`_available_request_types_block`), cart/order state
+  (`_in_progress_order_block`/`_order_turn_context_block`) — is folded
+  into the **user** message (`user_content`) on every turn, never into
+  the **system** string. And the two classification calls that actually
+  drive business logic — `_lead_extraction_call` (what gets captured
+  into a `CrmEntry`) and `_order_extraction_call` (what gets added to an
+  `Order`) — run against their own separate, fixed system prompts
+  (`_lead_extraction_system_prompt`/`_order_extraction_system_prompt`)
+  that this setting never touches at all. So a full replacement here
+  only ever changes the main reply's tone/persona/framing — it cannot
+  disable RAG grounding, break lead capture, or corrupt an order total,
+  because none of those mechanics read this field.
+- **`AppSettings.chat_system_prompt: str | None`** — null/empty means
+  "use the built-in `SYSTEM_PROMPT` default," same fallback posture as
+  every other owner-config field in this app.
+  `apis/chat.py`'s new `_resolve_system_prompt(db)` is the one place
+  that decides which prompt actually gets sent — `chat()`'s own
+  `provider.chat(messages, system=SYSTEM_PROMPT)` call became
+  `system=_resolve_system_prompt(db)`, a one-line change at the actual
+  call site.
+- **`GET/PUT /agent/chat-settings`** (`apis/chat_settings.py`, a new
+  small dedicated file — same "one concern, one file" precedent as
+  every other settings router added this session) — `GET` returns both
+  the current override (`chat_system_prompt`, null if unset) AND the
+  built-in constant (`default_chat_system_prompt`, always present) so
+  the dashboard can show/diff against it without a second hardcoded copy
+  of that text living in the frontend. `PUT` with `chat_system_prompt:
+  null` (or blank) resets to the default.
+- **`ChatPromptSettingsPanel`** (frontend, "AI & knowledge base"
+  accordion group, alongside `ModelSettingsPanel`) — a large `Textarea`
+  prefilled with the current effective prompt (custom or default), a
+  "Customized"/"Default" `Badge` showing which is active, Save, and a
+  "Reset to default" button (disabled when already on the default) —
+  the recoverability path that matters given the full-replace design:
+  an owner who breaks their own prompt always has one click back to the
+  known-good original.
+- **Verified end-to-end**: default state returns `chat_system_prompt:
+  null` and the real full built-in prompt text under
+  `default_chat_system_prompt`; saving a custom prompt (a deliberately
+  silly pirate-persona test string) round-trips correctly; resetting to
+  null correctly restores `null`. The actual `/chat` reply path change
+  is a one-line substitution already covered by this app's own existing,
+  already-verified `resolve_chat_provider`/`provider.chat()` call shape
+  — not re-verified against a live model response this round (the
+  configured local `custom` chat provider was intermittently unreachable
+  this session, a known external-dependency gap, not a code issue — see
+  "Known gotchas").
+
+### URL-based document ingestion + scheduled tasks (`backend/scheduler.py`, `backend/apis/scheduled_tasks.py`)
+
+Added 2026-08-21, same day as the chat-prompt feature above, off a real
+scenario the user posed directly: a lawyer wants the system to know
+every local law/regulation, too many to upload one file at a time — give
+it a government URL (or a batch of them) and let it fetch and embed
+automatically, ideally re-checked daily since regulations change. Two
+genuinely separate pieces, deliberately built as two separate pieces:
+fetching-and-embedding a URL, and running something on a recurring
+schedule. The second one generalizes far beyond documents — the user's
+own framing, unprompted: "需要cron的可能不单单是embed，还有可能是email，crm等
+其他事项" (things that need a schedule aren't just embedding — could be
+email, CRM, other things too) — so `ScheduledTask` was built as a
+generic mechanism from the start, not a document-specific timer bolted
+onto `apis/documents.py`.
+
+- **Scope, confirmed directly with the user before building**: one URL =
+  one document (`str | list[str]`, auto-detected server-side — the exact
+  shape the user asked for, "code自己分析是str还是array"), never a full
+  site crawler. A generic web crawler (follow links, handle pagination/
+  search UIs, respect robots.txt, rate-limit itself) is a fundamentally
+  different, much larger feature with real legal/ToS risk when aimed at
+  a government site at scale — explicitly ruled out; the owner (or
+  owner-agent, on their behalf) adds each specific regulation URL
+  individually, the same granularity as adding a file. Repealed/
+  proposed-but-not-passed law status was raised by the user as a real
+  concern but explicitly left unresolved ("我还在构想这部分应该怎么做") — no
+  schema decision was forced; `Document.tags` (mirroring `Product.tags`)
+  is the natural extension point whenever that design lands.
+- **`_fetch_url_content` (`apis/documents.py`)** — a PDF/DOCX response is
+  passed through as raw bytes into the exact same `ingest.parse_document`
+  an upload uses; anything else is treated as HTML and run through
+  `trafilatura.extract(favor_recall=True, include_tables=True)` first,
+  since `parse_document` has no HTML support of its own (a new
+  dependency — `trafilatura`, which pulls in a real transitive tree:
+  `courlan`/`dateparser`/`htmldate`/`justext`; accepted as the right
+  tradeoff over hand-rolling HTML content extraction). **Real, load-
+  bearing finding from live testing, not a hypothetical**: the default
+  httpx User-Agent (`python-httpx/x.x.x`) got a flat 403 from Wikipedia
+  — a real site, not an edge case — while a plain browser-shaped
+  `User-Agent` string worked immediately; government/legal-database
+  sites commonly run similar WAF-level bot filtering, so
+  `_FETCH_USER_AGENT` is set explicitly rather than left at httpx's
+  default. The extracted text (not the raw HTML) is what gets saved to
+  `STORAGE_DIR` as the document's own "raw file" (content_type
+  `text/plain`) — a deliberate choice: it lets `reembed_all_documents`'s
+  already-existing generic re-parse-from-disk logic work completely
+  unchanged for a URL-sourced document too, with zero special-casing.
+- **Runs as a background task, not synchronously like `ingest_document`**
+  — `ingest_document`'s own docstring already flagged synchronous
+  ingestion as a scaling limit ("a real background job queue would be
+  the next step for anything large enough to time out a request");
+  large/many legal documents is exactly that case. `POST .../ingest-from-
+  url` creates each `Document` row immediately (`status: pending`) and
+  returns right away; `_run_url_ingest` (fetch → parse → chunk → embed →
+  `status: ready`/`error`) runs via FastAPI's `BackgroundTasks`, with its
+  own `SessionLocal()` session (the request's own `db` is already closed
+  by the time a background task runs). This matters specifically because
+  this app runs a single uvicorn worker (`rate_limit.py`'s own
+  docstring) — a long synchronous request here would have blocked that
+  worker, including the public `/api/chat` path, the same class of
+  concern `resource_broker.py` already protects against elsewhere.
+  Progress is watched via the exact same `pending → processing →
+  ready/error` status `DocumentManager` already renders — no new
+  progress UI needed. Embedding itself is already batched per document
+  (`EmbeddingProvider.embed(texts: list[str])` takes the whole chunk
+  list in one call, confirmed by reading the interface, not assumed) —
+  speed for a large corpus is bounded by the embedding provider's own
+  throughput, not per-chunk round-trips.
+- **`POST /agent/documents/{id}/resync`** — manual on-demand re-fetch for
+  an existing URL-sourced document (400s on a plain upload, which has no
+  `source_url`); same background-task mechanism, and what
+  `resync_url_document`'s scheduled-task type calls under the hood.
+- **`ScheduledTask` (`models.py`) — a generic recurring-task table, not
+  embed-specific**, the direct response to the user's own generalization.
+  `task_type` is a dispatch key into `scheduler.TASK_REGISTRY`; the four
+  registered this round (`resync_url_document`, `reembed_all_documents`,
+  `cleanup_chat_uploads`, `cleanup_stale_crm_entries`) are all thin
+  adapters over functions that already existed — adding a future
+  schedulable action (an eventual scheduled email, say) is a small
+  registry entry, not new logic. `cron_expression` is standard 5-field
+  cron syntax, validated via APScheduler's own `CronTrigger.from_crontab`
+  — no custom scheduling DSL invented.
+- **The first background-job infrastructure this project has needed** —
+  every prior "maintenance action" in this app (`cleanup_orphaned_
+  uploads`, `crm_retention.cleanup_stale_crm_entries`, `reembed_all_
+  documents`) was manually-triggered-only specifically because no
+  scheduler existed (see those features' own AGENTS.md entries). An
+  in-process `AsyncIOScheduler` (`backend/scheduler.py`) now runs inside
+  the backend container itself — no separate worker process/container —
+  started via `main.py`'s `lifespan` context manager (replacing the
+  bare `FastAPI()` this project had used until now), loaded from every
+  `enabled=True` `ScheduledTask` row at startup. The CRUD API calls
+  `scheduler.sync_job`/`remove_job` after every create/update/delete so
+  a change takes effect immediately, without an app restart. Dev-mode
+  `--reload` restarts the whole worker (and therefore the scheduler) on
+  every code change — harmless, jobs reload fresh from the DB on the
+  next startup, worth knowing if `last_run_at` looks like it skipped a
+  beat during active development.
+- **Two independent, equally-authoritative interfaces onto the same
+  table** — directly satisfies what the user actually asked for
+  ("可以给owner让agent去安排和写code，有或者做一个cron的api可以修改和显示的" — these
+  read as two competing options but resolve to one mechanism with two
+  front doors): `POST /agent/scheduled-tasks` (the CRUD API,
+  `ScheduledTasksPanel` in the dashboard) and owner-agent's new
+  `manage_scheduled_task` tool (owner-agent's tool count now 20, up from
+  17 — also gained `ingest_documents_from_url` and `list_scheduled_
+  tasks`, the latter so the model checks what already exists before
+  guessing, same `list_intent_schemas` precedent). **`POST
+  /agent/scheduled-tasks` is create-or-update BY NAME, not a plain
+  create** — the exact same `upsert_intent_view` precedent
+  `apis/intent_schemas.py`'s `POST /agent/intent-views` already
+  established: owner-agent has no memory of a numeric id across separate
+  `/run` calls, so "actually run that every Monday instead" needs to
+  find and update the SAME row by the name the owner already gave it,
+  never create a duplicate. The dashboard's own `PUT .../{id}` stays
+  id-based, for editing a row it already has in hand.
+- **`POST /agent/scheduled-tasks/{id}/run-now`** — bypasses the cron
+  schedule entirely for an immediate, awaited (not backgrounded) run, so
+  the response reflects the real `last_run_status`/`last_run_error`
+  rather than an unverifiable "started" — lets an owner confirm a
+  newly-created task actually works without waiting for its next
+  scheduled fire. Same "budget minutes, not seconds" tradeoff this app
+  already accepts for `generate_landing_page`/ComfyUI generation when the
+  underlying task type is slow.
+- **`ScheduledTasksPanel`** (frontend, "AI & knowledge base" accordion
+  group, alongside `DocumentManager` — its motivating use case, though
+  the mechanism itself is generic) — `task_args` is a plain JSON
+  `Textarea`, not a dynamic per-task_type form; the simplest thing that
+  works at this app's current task-type count, same posture as
+  `business_hours`'s own plain-`Textarea` editor elsewhere in this app.
+- **`DocumentManager` gained an "Add from URL" `Textarea`** (one URL per
+  line, `ingestFromUrl` accepts either shape directly) and, per document,
+  a source-URL link + a "Re-sync" icon button shown only when
+  `source_url` is set.
+- **Verified end-to-end against real external sites, not mocked** — a
+  real Wikipedia article (22KB extracted, 32 chunks) and `example.com`
+  both correctly fetched, extracted, chunked, and embedded to `status:
+  ready` via a real local embedding provider; manual re-sync and the
+  `resync_url_document` scheduled-task path (create → run-now → verify
+  `last_run_status: "success"`) both confirmed live; the 403-then-fixed
+  User-Agent finding above was caught this way, not assumed. Scheduled-
+  task CRUD verified end-to-end: invalid cron and unknown task_type both
+  400 with a clear message, `run-now` against a real `cleanup_chat_
+  uploads` task correctly executed and recorded `last_run_status:
+  "success"`, delete correctly removes both the DB row and its
+  APScheduler job. `tsc`/full-source `eslint`/`pytest`/a real production
+  build all clean.
+
+### Document classification: company material vs. reference (`Document.is_company_material`)
+
+Added 2026-08-21, same day and same conversation as the URL ingestion
+work above — a direct follow-up question from the user ("我在想要不要给embed
+分类") that turned into a concrete, motivating example: for a lawyer's
+practice, a jurisdiction's own constitution/statutes are documents the
+chatbot genuinely needs to know about, but they are NOT facts about the
+lawyer's own business — very different from a service-description
+document, which is. The user's own framing was explicit about the
+intended chatbot behavior too: the public chatbot should "知法" (know the
+law, at a general level) but not give the kind of precise detail a real
+consultation would ("llm没有律师证，律师也需要赚钱" — the LLM doesn't hold a law
+license, and the lawyer needs to earn a living too) — "断章" (excerpted/
+general, novel-style), never a substitute for a real consultation. But
+this restraint is specifically for the PUBLIC chatbot; the user was
+explicit that owner-agent should keep trying to fully answer whatever
+the owner (the lawyer themselves) actually asks it.
+
+- **`Document.is_company_material: bool`** (default `True` — every
+  existing and future document behaves exactly as before unless
+  explicitly marked otherwise) — a boolean flag, not free-text tags,
+  same "one hard signal, not inferred from free text" posture already
+  used for `Order.is_open`/`OrderItem.served` elsewhere in this app.
+  `True` means "this document states facts about the business itself";
+  `False` means "background reference material the business operates
+  within but doesn't own" (a law, a regulation — the motivating case).
+- **Two real, different consumers of the same flag — a genuine split,
+  not one behavior applied twice**:
+  1. **`_gather_ready_document_text` (`apis/agent.py`) now only includes
+     `is_company_material=True` documents.** This function feeds
+     `generate_geo_page`, `detect_business_type`, `propose_intent_schema`,
+     and `business_profile.py`'s suggest endpoint — all four synthesize
+     "who is this company" content, and a reference document like a
+     statute isn't a company fact; feeding it in would have let the GEO
+     page or the business-type detector represent the law's own content
+     as if it were something about the business. Verified directly (not
+     assumed): with one real company-material document and one
+     reference-only document both `ready`, `_gather_ready_document_text`
+     correctly returned only the company-material one, and its text
+     correctly excluded the reference document's own content.
+  2. **Ordinary RAG retrieval (`retrieval.py`'s `retrieve()`, feeding
+     `/api/chat`) is completely unaffected — still searches every ready
+     document regardless of this flag.** A visitor can still legitimately
+     ask about the referenced law; the flag doesn't hide it from
+     retrieval, it changes how the excerpt is *framed* to the model:
+     `apis/chat.py`'s context-block formatting appends "— background
+     reference material, not a fact about this business" to a
+     non-company-material excerpt's own citation line, and `SYSTEM_PROMPT`
+     gained an explicit clause telling the model what that marker means
+     — usable for a general, accurate answer, never presented as the
+     business's own claim, and for anything needing precise/professional-
+     level detail, say plainly that a qualified professional should
+     confirm the specifics rather than answering with full certainty.
+     Deliberately generic wording (not "consult a lawyer" hardcoded into
+     the built-in default) — this default prompt serves any business
+     type, not just legal practices; a lawyer-owner who wants stricter or
+     domain-specific wording has the already-built
+     `chat_system_prompt` override (see "Owner-configurable public-chat
+     system prompt" above) to say exactly that.
+  3. **Owner-agent needs no changes at all for "should still answer the
+     owner fully"** — its own "brain" prompt (`owner-agent/agent_loop.py`)
+     has never shared anything with `apis/chat.py`'s `SYSTEM_PROMPT`/
+     `_resolve_system_prompt` to begin with, so the public-chat-specific
+     restraint above was never something owner-agent inherited in the
+     first place. Worth stating plainly since it wasn't obvious without
+     tracing the actual code path — confirmed by reading both prompt
+     paths, not assumed from the architecture alone.
+- **Settable at ingest time** (`IngestDocumentRequest.is_company_material`/
+  `IngestFromUrlRequest.is_company_material`, both default `True`) **and
+  toggleable after the fact** (`PATCH /agent/documents/{id}`, mirrors
+  `OrderItem`'s own `served` PATCH-toggle pattern) — a document doesn't
+  have to be re-ingested just because its classification was wrong the
+  first time.
+- **`DocumentManager` gained a `Switch` in both the upload form and the
+  "Add from URL" form** ("This states facts about the business itself"),
+  plus a clickable per-document `Badge` ("Company info"/"Reference
+  material") that toggles the flag via the new PATCH endpoint — no
+  separate edit form needed for a single boolean.
+- **Verified end-to-end**: `_gather_ready_document_text`'s filtering
+  confirmed directly via a real Python call inside the container (not
+  just code review) against real ingested documents; `retrieve()`
+  confirmed to still return a reference-only document's chunks with
+  `is_company_material: False` correctly attached; the PATCH toggle
+  round-trips correctly. `tsc`/full-source `eslint`/`pytest`/a real
+  production build all clean.
+
+### Document status notes — an industry-agnostic framework (`Document.status_note`)
+
+Added 2026-08-21, same conversation, one more turn past
+`is_company_material` above. The user explicitly generalized the
+motivating legal example first ("法律只是一个例子，但是世上行业太多") and asked
+to design the framework together rather than have me guess at a legal-
+specific taxonomy — a real, deliberate design discussion, not a rubber-
+stamped feature.
+
+- **The framework decision**: free text, not a fixed enum, and NOT
+  scoped to legal status specifically. This mirrors a pattern this app
+  already leans on repeatedly for exactly this "every owner's vocabulary
+  is different" problem — `CrmEntry.status`/`Order.status`/
+  `IntentView.status_options` are all owner-defined free text, never a
+  hardcoded per-industry enum. A rigid `"repealed"|"in-force"|"proposed"`
+  enum would only fit law; a different owner might need
+  `"discontinued"`/`"superseded form"`/`"experimental"` for an entirely
+  different industry, and a fixed enum would need re-litigating every
+  time a new vertical showed up. `Document.status_note: str | None` —
+  the owner (or an LLM draft, see below) writes whatever sentence
+  actually matters ("Repealed 2024-01-01, replaced by SB-123",
+  "Discontinued policy form, still applies to policies issued before
+  2020"), and the model reads it directly rather than this app trying to
+  encode what any particular status word means.
+- **Two ways to set it, same posture as everywhere else propose-vs-
+  direct-write matters in this app**: owner-typed directly (upload form,
+  URL-ingest form, or edited after the fact via the same `PATCH
+  /agent/documents/{id}` `is_company_material` already uses, both now
+  optional-independent fields — omit a field to leave it untouched,
+  an explicitly empty string clears `status_note`, same "blank clears"
+  convention as `chat_system_prompt`), or an opt-in LLM-suggested draft
+  (`suggest_status_note` on `IngestDocumentRequest`/`IngestFromUrlRequest`/
+  `resync_document`, and `resync_url_document`'s own `task_args`) via
+  `_suggest_status_note` (`apis/documents.py`) — **deliberately
+  conservative**, mirroring `business_profile.py`'s `suggest_business_
+  profile`'s "don't invent facts" discipline exactly: the prompt tells
+  the model to respond with the literal word `NONE` unless the source
+  text explicitly states its own status, never to guess one. Per-URL,
+  not per-batch, for the URL-ingest case — a batch of statutes
+  plausibly has a genuine mix of current/repealed/proposed sources, so
+  each gets classified independently against its own text.
+- **Where it surfaces**: `apis/chat.py`'s new `_chunk_source_note`
+  composes `is_company_material`'s marker and `status_note` into one
+  citation-line qualifier (both can apply to the same chunk
+  independently); `SYSTEM_PROMPT` gained a clause telling the model to
+  factor a status note directly into its answer — don't state a
+  repealed/superseded/withdrawn rule as still in effect, mention the
+  status when it's relevant — rather than treating every excerpt as
+  unconditionally current. `_gather_ready_document_text` (feeding
+  `generate_geo_page`/etc.) also includes the note in each document's
+  block header, for consistency.
+- **Real, live end-to-end test — not just a code-review check, per the
+  user's own explicit ask to verify the actual hypothesis**: ingested a
+  synthetic municipal ordinance whose own text explicitly states "This
+  ordinance was REPEALED effective January 1, 2024, and replaced by
+  Ordinance 55-C" with `suggest_status_note: true` — the model correctly
+  extracted "Repealed effective January 1, 2024, and replaced by
+  Ordinance 55-C." A second ordinance with NO status statement in its
+  text correctly came back with `status_note: null` (confirming the
+  "never guess" discipline holds, not just the "correctly detects a
+  real one" half). Then a REAL `/api/chat` call asking specifically
+  about the repealed ordinance's own fee got the correct number
+  ($2.00/hour) **and proactively surfaced the repealed status and
+  replacement ordinance's new fee ($3.50/hour)**, unprompted — direct
+  confirmation that the status note changes actual model behavior, not
+  just stored metadata. A control call asking about the still-current
+  ordinance got a clean, direct answer with no unnecessary hedging —
+  confirming the mechanism doesn't over-apply caution when there's
+  nothing to flag. `tsc`/full-source `eslint`/`pytest`/a real production
+  build all clean; test documents cleaned up after.
+
+### Social login (Google/Facebook/X OAuth) + self-service account view + user management (`backend/apis/oauth.py`, `backend/apis/my_account.py`, `backend/apis/users.py`)
+
+Added 2026-08-22, off a direct user ask: real user management, admin
+permissions, and a way for ordinary visitors to sign in via a big-tech
+OAuth provider (Google/Facebook/X) instead of a password. The user
+raised one real open question themselves — should admin/owner also use
+OAuth — which I raised back with a recommendation before building
+anything, and the user confirmed it: **admin/owner stay on the existing
+password+JWT system, forever; OAuth is for the public `user` tier
+only.**
+
+- **Why admin/owner never use OAuth, confirmed directly with the user**:
+  admin/owner accounts hold real privilege (the whole agent console +
+  owner-agent) — tying them to a third-party identity provider means
+  their account security AND recovery now depends on that provider (a
+  locked/compromised/deleted Google account could mean losing access to
+  this app's own admin panel with no independent recovery path). This
+  app's own password+JWT system is already fully self-controlled
+  (`JWT_SECRET` rotation, `backend/auth.py`'s own signing) — realistically
+  there are only 1-2 admin/owner operators, so password management isn't
+  the friction problem OAuth actually solves. OAuth's real value is for
+  potentially many one-time public visitors who don't want to create yet
+  another password — exactly the `user` role's own scope, which is
+  where it was built.
+- **Google first, as the reference implementation, then Facebook and X
+  the same day** (2026-08-22, on a direct follow-up ask: "把FB和X也准备
+  好接口"). Facebook turned out to be almost exactly the predicted "same
+  shape once Google's proven" — same authorization-code grant, only real
+  difference is Facebook's token exchange is a GET with query params
+  where Google's is a POST body. **X was NOT a drop-in**, confirmed
+  correct in advance: X requires OAuth 2.0 with PKCE (an extra
+  `code_verifier` generated per attempt and stashed in its own
+  short-lived cookie alongside the CSRF `state` one, `S256`-challenged),
+  and — the real, load-bearing constraint — **X's standard API does not
+  reliably return an email address at all**. Getting one needs an
+  elevated permission from X's own Developer Portal that X does not
+  guarantee approving, entirely outside this app's control. Built and
+  wired up anyway, since the user explicitly asked for the interface to
+  exist and be ready, but disclosed honestly in three places rather than
+  silently assumed to work: `apis/oauth.py`'s own module docstring,
+  `OAuthSettingsPanel`'s X block (a warning paragraph, not just a form),
+  and `_x_fetch_email`'s own error message when the userinfo response
+  really does come back with no `confirmed_email`.
+- **Shared `_finish_oauth_login(db, email, provider)` helper** — factored
+  out once a second provider existed, so the `email_verified`
+  reclaim-vs-merge logic (see below) lives in exactly one place instead
+  of being copy-pasted three times with a real risk of the copies
+  drifting apart. Every provider's callback ends by calling this one
+  function with whatever email it resolved and its own provider name
+  string (`"google"`/`"facebook"`/`"x"`) — the only thing that varies
+  across providers is how that email gets resolved in the first place.
+- **`backend/apis/oauth.py` — the actual flow** (standard OAuth2
+  authorization-code grant, no new pip dependency, plain `httpx` calls
+  to Google's own token/userinfo endpoints):
+  1. `GET /api/auth/oauth/google/start` — 503s with a clear message if
+     unconfigured; otherwise builds Google's own authorize URL (with
+     `prompt=select_account` so a returning visitor gets a real account
+     picker rather than being silently re-logged-in as whoever they used
+     last) and redirects the browser there, stashing a random CSRF
+     `state` nonce in a short-lived httponly cookie (a plain unguessable
+     value is sufficient — its only job is proving the callback belongs
+     to a redirect this backend itself just issued, no need to sign it).
+  2. `GET /api/auth/oauth/google/callback` — verifies the returned
+     `state` matches the cookie, exchanges the code for an access token,
+     fetches the verified email from Google's userinfo endpoint (refuses
+     an explicitly `email_verified: false` response), finds-or-creates a
+     `User` row **by email**, **always with `role: "user"` for a new
+     account** — this path can never create or promote an admin/owner,
+     a hard rule enforced in code, not just an unset default — then
+     issues this app's own JWT via the exact same `create_access_token`
+     the password login already uses. OAuth is genuinely just an
+     alternate way to prove identity before this app takes over session
+     management with its own token, never a replacement of the JWT
+     system itself.
+  3. Redirects back to `/login?oauth_token=...` (or `?oauth_error=1`) —
+     mirrors the `?sid=` cart-recovery query-param-handoff pattern
+     already established in this app (`SessionIdBootstrap`); `LoginForm`
+     picks up the token, calls `GET /auth/me` with it to resolve
+     email/role (deliberately NOT stuffed into the same URL — a
+     bookmarked/shared login link shouldn't leak a readable profile
+     summary alongside the token), then `setAuth` + redirect to
+     `/dashboard`.
+  - **Every failure in the callback redirects to a clean
+    `?oauth_error=1`, never a raw 500** — the visitor is mid-browser-
+    redirect at this point, not making a fetch call a frontend error
+    handler could catch.
+- **`AppSettings.google_oauth_client_id`/`google_oauth_client_secret`**
+  — same owner-configured-credentials pattern as Stripe/Mailgun/Twilio/
+  Maps: `client_secret` write-only (never echoed by `GET
+  /agent/oauth-settings`), `client_id` safe to echo (it's embedded in
+  the browser-visible authorize-URL redirect anyway, same posture as
+  Stripe's own publishable key). No separate "enabled" flag — derived
+  from both being set, same posture as `is_email_configured`.
+  `OAuthSettingsPanel` (frontend, new "Users & access" accordion group —
+  didn't fit any existing group, and this is the first real
+  user-management-adjacent admin feature, likely to grow) shows the
+  exact callback URL to paste into Google Cloud Console, mirroring
+  `PaymentSettingsPanel`'s own webhook-URL display.
+- **`User.hashed_password` widened to nullable, `User.oauth_provider`
+  added** — an OAuth-only account has no local password at all;
+  `apis/auth.py`'s password login now explicitly guards against a null
+  `hashed_password` (always fails that path for an OAuth-only account,
+  correctly — its only real login path is OAuth). Identity matching
+  across a re-login is by **email alone**, not a stored per-provider
+  subject id — a deliberate v1 scope decision for this app's
+  single-tenant scale, not a rejected-then-reconsidered design.
+- **A genuinely new gate: `apis/deps.py`'s `require_authenticated_user`**
+  — distinct from both `get_current_user` (never rejects, so the
+  tool-free public chat keeps working anonymously) and `require_role`
+  (admin/owner only). 401s unless a real JWT was presented, for **any**
+  role — the exact shape "user isolation" needed: not "admin sees
+  everything," not "fully public," but "any logged-in account sees only
+  ITS OWN data."
+- **`backend/apis/my_account.py` — "user isolation," the self-service
+  half, directly motivated by the OAuth work** ("a social login only
+  really matters if there's somewhere to see your own history
+  afterward"): `GET /my/orders` (paginated, `Order.contact_email ==
+  current.email`), `GET /my/crm-entries` (unpaginated — one visitor's own
+  lead/claim history is realistically a handful of rows, unlike the
+  admin-facing equivalent), `GET /my/chat-sessions` +
+  `GET /my/chat-sessions/{id}/messages` — the last one 404s (not 403) on
+  a session that exists but isn't the caller's own, same "don't confirm
+  existence of something that isn't yours" posture as
+  `apis/crm_resume.py`'s generic response. Every query filters by the
+  caller's own email server-side — never a caller-supplied id trusted on
+  its own. Reuses `apis/products.py`'s `OrderSummary`/`_to_order_summary`
+  and `apis/agent.py`'s `CrmEntryResponse`/`_crm_entry_response` directly
+  (the underscore-prefixed-import-across-modules pattern this codebase
+  already established for `_gather_ready_document_text`) rather than
+  duplicating those shapes.
+- **`AccountPage` (`/account`, frontend)** — orders, requests (CRM
+  entries), and chat history (expandable transcript, reusing
+  `ChatMessageBubble` so a saved conversation reads exactly like it did
+  live). Prompts to log in if not authenticated — not role-gated at all,
+  since "see your own data" is meaningful for a `user`, `admin`, or
+  `owner` account alike. `AuthStatus` (header widget) now links the
+  visible email to this page when logged in.
+- **Real, live end-to-end verification against the actual `/my/*`
+  endpoints and real historical data**, not synthetic: unauthenticated
+  calls to all three `/my/*` list endpoints correctly 401; logged in as
+  the real `user@example.com` seeded account, `GET /my/chat-sessions`
+  correctly surfaced its two genuinely pre-existing sessions from
+  2026-08-08 testing (real historical data, not fixtures) with zero
+  orders/CRM entries (accurate — none exist for that email); the
+  transcript endpoint correctly served the caller's own session and
+  correctly 404'd on both someone else's real session id and a
+  nonexistent one, identically (no leak). OAuth settings CRUD, write-
+  only-secret round-trip, and the unconfigured-503/configured-redirect
+  transition all verified live; the `/start` redirect was confirmed to
+  build a syntactically correct real Google authorize URL with the
+  state cookie properly set (`HttpOnly`, `SameSite=lax`); the
+  `/callback` route was confirmed to redirect cleanly to
+  `?oauth_error=1` (never a raw 500) both for a CSRF state mismatch and
+  for a fake authorization code that Google's own real token endpoint
+  correctly rejected — the genuine-rejection-path verification pattern
+  already established for Stripe/Mailgun/Twilio. **The one thing this
+  session could not verify**: an actual successful "click through
+  Google's real consent screen and land back logged in" round trip —
+  that needs a real registered Google Cloud Console app, which only the
+  user can set up; test credentials were used only to prove the
+  mechanism reaches Google's real servers and handles both success-path
+  construction and failure paths correctly, then cleared afterward.
+  `tsc`/full-source `eslint`/`pytest`/a real production build all clean.
+- **A real lint catch during this pass, same recurring class as before**:
+  `LoginForm`'s OAuth-callback-handling effect originally called
+  `setStatus`/`setError` directly in the effect body (both for the
+  immediate-error branch and as an unconditional call before the async
+  work started) — `react-hooks/set-state-in-effect` flagged both,
+  even though the async branch's own `.then()`/`.catch()` callbacks were
+  already fine. Fixed by moving every state update (including the
+  "loading" one at the very top) inside a locally-defined async function
+  that the effect merely calls — confirms the linter's actual heuristic
+  is about lexical placement (is a setState call written directly in the
+  effect's own body vs. inside a separately-defined function it invokes),
+  not real runtime synchronicity, useful to know for the next time this
+  class of warning shows up.
+
+**`User.email_verified` — closed pre-emptively, same session, off the
+user's own direct follow-up question**: "如果有人自己用邮件创建了账号，然后后来
+又使用了google oauth，怎么办" (what happens if someone creates a password
+account with an email, then later uses Google OAuth with the same
+email). Traced the actual merge code and confirmed the real risk: this
+app has no public password self-signup today (`apis/auth.py`'s own
+docstring says so plainly), so the specific attack — an attacker
+pre-registers a victim's email with a password *before* the real owner
+ever tries Google, then silently retains access once OAuth's
+find-by-email merge attaches to that same row — isn't exploitable yet.
+The user's own call, explicit and direct: close it now anyway rather
+than risk forgetting once self-signup eventually gets built. Added
+`User.email_verified: bool` (default `False`, the cautious state for
+any *future* account-creation path that doesn't explicitly reason about
+this) — `True` only for a path with real proof of email ownership:
+`seed.py`'s admin-provisioned demo accounts, and `apis/oauth.py`'s
+Google callback for a brand-new row (Google itself verifies the email).
+The callback's existing-user branch now checks it: an already-verified
+row merges exactly as before (`oauth_provider` updated, password left
+alone); an **un**verified row gets reclaimed — `hashed_password` wiped
+entirely and `email_verified` flipped to `True` — Google's real
+verification outranks whatever unverified password was sitting there,
+and whoever set that old password loses access outright, not just
+gains a second way in. The migration backfills `email_verified = true`
+for every pre-existing row (all three seeded demo accounts, the only
+users that exist as of this migration), so the fix doesn't accidentally
+wipe a real seeded account's own password the first time its email is
+used with Google. **Verified directly at the DB/logic level** (no real
+Google credentials needed to prove this): seeded a simulated "landmine"
+account (`email_verified=False`, a real password set) and replicated
+the callback's exact merge branch — confirmed the password was wiped
+and the account correctly reclaimed; then ran the identical logic
+against the real, already-verified `owner@example.com` account and
+confirmed its password was left completely untouched, plus a live
+regression check that password login still works afterward. Test data
+cleaned up; `pytest`/`tsc`/`eslint` all clean, no frontend changes
+needed for this fix — pure backend logic.
+
+**Facebook and X OAuth (2026-08-22, same session as the fix above)** —
+`AppSettings` gained `facebook_oauth_client_id`/`_client_secret` and
+`x_oauth_client_id`/`_client_secret`, same write-only-secret pattern as
+Google's own fields. `OAuthProvidersResponse`/`OAuthSettings` widened to
+report all three; `OAuthSettingsPanel` now renders three stacked blocks
+(Google/Facebook/X) sharing one Save button, mirroring
+`NotificationSettingsPanel`'s existing Email/SMS shape exactly rather
+than inventing a new multi-provider layout. `LoginForm` now shows a
+button per configured provider (was a single Google-only conditional) —
+its OAuth-callback-handling effect and error message are both now
+provider-agnostic ("Social sign-in failed" rather than "Google sign-in
+failed"), since the same `/login?oauth_token=...`/`?oauth_error=1`
+redirect now lands here from any of the three. Verified live end-to-end:
+`GET /agent/oauth-settings` and `GET /auth/oauth-providers` both
+correctly report all three providers; a PUT with test Facebook/X
+credentials round-tripped correctly (client_id echoed, secret never
+echoed, only a `*_client_secret_set` boolean); test credentials cleared
+afterward. `tsc`/full-source `eslint`/`pytest`/a real production build
+all clean.
+
+### User management (`backend/apis/users.py`)
+
+Added 2026-08-22, same session, the second half of "把FB和X也准备好接口，
+然后做user的用户管理版面" — the admin/owner-facing counterpart to
+`apis/my_account.py`'s self-service `/my/*` routes: instead of "my own
+data," this is "every account in the system."
+
+- **Listing is admin+owner** (`GET /agent/users`, paginated — matches
+  this app's usual read-access bar; most of `agent-console-section.tsx`'s
+  panels are already admin+owner-viewable), **every write (create, role
+  change, delete) is owner-only** — a role change or account deletion is
+  a genuinely higher-stakes action than anything an admin panel
+  elsewhere in this app lets an admin do alone, the same trust split
+  `owner-agent`'s schema-proposal flow already established for "this
+  changes what data/access looks like going forward." `UserManagementPanel`
+  (frontend) reflects this directly: an admin sees a read-only list
+  (role shown as a plain `RoleBadge`, no create button, no delete), an
+  owner sees the full create form + a per-row role `Select` + delete.
+- **Creating a user here is a real, trusted account-provisioning path**
+  (`POST /agent/users`) — mirrors `seed.py`'s own reasoning exactly: an
+  owner personally setting a password for a new account is proof enough
+  of intent/ownership to mark `email_verified=True` immediately, skipping
+  the "first login reclaims an unverified password" dance `apis/oauth.py`
+  has to handle for a self-service signup this app doesn't even have.
+  This is NOT a public signup endpoint — no route in this module is
+  reachable without an owner's own JWT.
+- **Two safety guards, both enforced server-side, never just hidden in
+  the UI (though the UI also disables the matching controls as a
+  nicety)**: an owner can never change their own role or delete their
+  own account (`PATCH .../role`/`DELETE` both 400 on `user.email ==
+  current.email` — closes the "the only owner locks themselves out"
+  failure mode), and the system can never be left with zero
+  `role == "owner"` accounts (`_remaining_owner_count`, a fresh `COUNT`
+  query on every single role-change/delete call, never cached — checked
+  against the DB as it stands right now, not against any JWT's own role
+  claim). Either guard alone would still leave a real footgun the other
+  one catches (self-modification alone doesn't stop a *different* owner
+  from demoting the last remaining one; the last-owner count alone
+  doesn't stop the sole owner from demoting themselves).
+- **A real bug caught and fixed during verification, worth remembering
+  for the next owner-only write route that also needs the caller's own
+  identity**: the three write routes were originally typed as `current:
+  CurrentUser = Depends(require_role(Role.owner))` — but
+  `apis/deps.py`'s `require_role(...)` dependency resolves to just the
+  matched `Role` enum (see its own return type), not a `CurrentUser`.
+  Calling `current.email` on a bare `Role` raised `AttributeError`,
+  turning every write into a 500 — caught immediately via live testing
+  (the very first role-change call), not left for later. Fixed with a
+  new `_require_owner(current: CurrentUser = Depends(get_current_user))`
+  dependency that checks `current.role != Role.owner` itself and returns
+  the real `CurrentUser`, giving the route both the role gate AND the
+  caller's own identity it actually needs for the self-modification
+  checks above.
+- **Verified live with a full, real permission/safety-guard chain, not
+  just individual calls in isolation**: admin token 200s on list, 403s on
+  create; owner token creates a real test user, promotes it to owner,
+  logs in AS that new owner and successfully demotes the original owner
+  (2 owners existed, allowed); the now-demoted original owner (still
+  holding its OLD, stale JWT claiming `role: owner` — a real, expected
+  consequence of this app's stateless-JWT design, not a bug: a role
+  change only takes effect on the affected account's *next* login/token
+  issuance, same as `JWT_SECRET` rotation invalidating old tokens)
+  correctly gets blocked from demoting the new owner by the **live DB
+  count**, not by its own stale token claim, confirming the last-owner
+  guard reads real current state rather than trusting anything JWT-
+  encoded; self-role-change and self-delete both correctly 400 on their
+  own account; the test owner is restored to the original role
+  afterward, the temporary account deleted, and the final `GET
+  /agent/users` list confirmed to exactly match the original 3 seeded
+  accounts. `tsc`/full-source `eslint`/`pytest`/a real production build
+  all clean; `UserManagementPanel` wired into `agent-console-section.tsx`'s
+  existing "Users & access" accordion group, above `OAuthSettingsPanel`.
+
+### Cross-session CRM resume via emailed code (`backend/apis/crm_resume.py`)
+
+Added 2026-08-20, immediately after the email gate above, closing a real
+gap flagged much earlier this session (see "Chat lead capture"'s
+"Cross-session continuity is a known, deliberately deferred gap" bullet)
+and explicitly unblocked by the user once email existed: "现在可以接起来的，
+但是需要有识别，是否有效smtp或具备发邮件功能，才能够启动这个功能" — build it, but
+gate it on real, working email actually being configured.
+
+- **The gap this closes**: `apis/chat.py`'s `_find_active_entry` is
+  deliberately scoped to one `chat_session_id` only (see that function's
+  own docstring) — a visitor who abandons a multi-turn structured intake
+  (an insurance claim mid-fill, say) in one browser session and returns
+  in a new one (incognito closed, different device, cleared
+  `localStorage`) previously had no way back to their own in-progress
+  entry at all, even though it still existed in the DB. Trusting a
+  re-typed email alone to reconnect them was explicitly ruled out back
+  then — real PII sits behind this (incident details, phone, an
+  attached photo) — hence the OTP requirement.
+- **`apis/notifications.py`'s `is_email_configured(db)`** is the gate —
+  `True` only when a real provider (not `"test"`) is selected AND has
+  every credential it needs. Deliberately a cheap DB-only check, not a
+  live connectivity probe on every call: the owner's own "Send test
+  email" button is the real verification step for whether credentials
+  actually work; this just checks the same config that button already
+  validates. `POST /api/crm/resume/request` 503s immediately if this is
+  `False` — there is no way to deliver a code otherwise, so the whole
+  feature is correctly inert on a fresh install until an owner sets up
+  a real email provider.
+- **`CrmEntry.resume_code_hash`/`resume_code_expires_at`/
+  `resume_code_attempts`** — added directly to the existing row, not a
+  new table, matching the user's own explicit "改现有的，别开新表"
+  preference from the dine-in kitchen-ticket feature earlier this
+  session. The code itself is SHA-256 hashed at rest, never stored
+  plaintext — held in memory only long enough to email it. A 6-digit
+  code has just a million possibilities regardless of hash strength, so
+  the real defense is the 10-minute expiry plus a hard 5-attempt cap
+  (`MAX_RESUME_ATTEMPTS`), not the hash algorithm.
+- **Two public, no-auth endpoints** (a visitor filing a claim was never
+  asked to create an account, so this can't require one either):
+  - `POST /api/crm/resume/request` — looks up the visitor's own most
+    recent schema-linked `CrmEntry` by `contact_email` alone (see below
+    — no `schema_key` needed), generates and emails a code if found.
+    Returns the **identical, generic response whether or not a match was
+    found** — a response that differed would let anyone probe "does this
+    email have a request on file," a real enumeration/privacy leak.
+    Verified live: a matching email and a made-up one produced
+    byte-identical responses.
+  - `POST /api/crm/resume/verify` — checks the submitted code against
+    the stored hash, expiry, and attempt cap; on success, **rebinds
+    `CrmEntry.chat_session_id` to the visitor's new session** — the one
+    piece of real integration work, and it needed no changes to
+    `apis/chat.py` at all: `_find_active_entry` already looks up by
+    `chat_session_id`, so the very next chat turn in that new session
+    picks the entry back up automatically, `_in_progress_context_block`
+    and all. The code is single-use, cleared immediately on success.
+    Verified live end-to-end: a wrong code correctly fails without
+    consuming the real one; the correct code succeeds and returns the
+    entry's real `collected_fields`; re-submitting that same
+    (now-cleared) code afterward correctly fails; 5 wrong guesses lock
+    the entry out even from the *correct* code on the 6th attempt
+    (confirmed by directly inspecting the DB row); and the rebind itself
+    was confirmed by querying the row afterward — `chat_session_id`
+    pointed at the new session, matching the `session_id` the request
+    carried.
+- **Rate-limited at both steps** (`rate_limit.py`) — `/request` (5/hour)
+  bounds how badly this could be used to spam a stranger's inbox with
+  codes (the per-entry attempt cap doesn't help against this route,
+  which needs no correct code, just an email address); `/verify`
+  (15/15min) is the first line of defense against brute-forcing a code
+  from one IP, with the per-entry attempt cap as the second line — one
+  that survives even if a caller spreads guesses across many source IPs.
+- **No `schema_key` needed — simplified 2026-08-20, same day as the
+  original build.** The original cut required the caller to pass which
+  schema (`insurance_claim` vs. `insurance_application`, say) alongside
+  the email — but a real visitor-facing UI has no reasonable way to ask
+  someone "which kind of request was it, by its internal key" (that key
+  isn't even shown anywhere on the public site). `_find_resumable_entry`
+  now just looks up the visitor's own most recent schema-linked
+  `CrmEntry` by `contact_email` alone, across every schema — a visitor
+  only ever has one thing in flight in practice, and the entry's own
+  `collected_fields` make it obvious what it was once resumed. Both
+  `ResumeRequestBody`/`ResumeVerifyBody` dropped the field entirely, a
+  breaking (but pre-frontend-integration, so harmless) change to the
+  request shape.
+- **Deliberately NOT wired into the chat pipeline's own LLM-driven flow**
+  — `apis/chat.py`'s lead-extraction logic still has no idea this
+  exists, and that's by design, not a gap: the user's own original
+  framing was explicit that the LLM doesn't need to know about this
+  mechanism at all ("我觉得这一步没有必要让llm知道"). The frontend UI below
+  calls both endpoints as plain REST, never through `sendChatMessage`.
+- **Frontend UI, `frontend/src/lib/crm-resume.ts` +
+  `chat/chat-panel.tsx`** — a collapsed "Continuing a previous request?
+  Enter your code" link sits above the message composer; expanding it
+  reveals a two-step inline form (email → code, each with its own
+  Cancel). On successful verify, the entry's `collected_fields` are
+  formatted into a short summary and pushed into the visible transcript
+  as an assistant message (`pushMessage`) before the form collapses —
+  this is the "compact summary, not full transcript copy" the user
+  asked for; no RAG/embedding/retrieval infrastructure was needed for
+  it, since `collected_fields` (the structured intent-schema data) was
+  already exactly that compact summary — the resumed session never sees
+  the old session's raw `ChatMessage` history.
+- **Why a typed code, not a magic link** — considered and rejected: a
+  clickable link mailed to the visitor is vulnerable to corporate email
+  security scanners (Microsoft Defender and similar) that pre-fetch/
+  pre-click links in incoming mail before a human ever opens it, which
+  would silently burn a single-use resume link before the real visitor
+  gets to it. A typed code sidesteps this entirely — nothing but the
+  visitor themselves ever "clicks" it. This was the deciding factor in
+  keeping the already-built typed-code flow instead of switching to a
+  URL-based one (a `?sid=`-style link, matching cart recovery's own
+  pattern, was considered and explicitly passed over for this reason).
+- **Retention cleanup, `backend/crm_retention.py`** (2026-08-20, closes
+  the retention question raised when this feature was first discussed —
+  "这个离开的session留多长时间也是个问题，太多session怕造成攻击、负荷，不安全")
+  — `cleanup_stale_crm_entries(db, dry_run)` purges abandoned,
+  never-engaged (`status == "new"`) schema-linked `CrmEntry` rows past
+  their own retention window. The user's own explicit split, confirmed
+  directly: an entry with real `collected_fields` gets a 7-day grace
+  period; one with essentially nothing collected yet gets only 24 hours
+  (mirrors `chat_attachments.cleanup_orphaned_uploads`'s existing 24h
+  precedent for the same "abandoned, nothing real lost" case). Both
+  windows are **rolling from last activity** (`ChatSession.last_seen_at`,
+  falling back to `CrmEntry.created_at` if the session row is gone), not
+  a fixed deadline from creation — a visitor spread out over several
+  days isn't cut off arbitrarily.
+  - **Deliberately scoped to ONLY the `CrmEntry` row — never
+    `ChatSession`/`ChatMessage`.** Those persist for `ReportPanel`'s own
+    chat-volume reporting (session/message counts over time); deleting
+    session rows here would silently corrupt that report. A real,
+    considered scope boundary, resolved the same way the "should this
+    also touch sessions" tension was explicitly reasoned through, not
+    just narrowed silently.
+  - Only ever touches an entry the owner has never engaged with
+    (`status` still the default `"new"`) — anything already contacted/
+    closed is a real business record `CrmPanel`/`ReviewQueuePanel`
+    depend on, untouched by this.
+  - No automatic scheduling (this project has no background job queue,
+    same constraint `chat_attachments.py` already documents) — manually
+    triggered only, via `POST /agent/crm/cleanup-stale-entries`
+    (`dry_run` supported) or owner-agent's new `cleanup_stale_crm_entries`
+    tool, same posture as `cleanup_chat_uploads`.
+  - Verified live by seeding 4 synthetic `CrmEntry`/`ChatSession` pairs
+    covering all 4 combinations of (empty/has-data) × (just-under/
+    just-over threshold) directly into the DB, then running the cleanup
+    endpoint in `dry_run` and for real: exactly the two past-threshold
+    entries were deleted, the two under-threshold ones survived, and —
+    confirming the scope boundary above — all 4 `ChatSession` rows
+    remained fully intact afterward. Test data cleaned up after.
+
+### Chat session/transcript viewer (`backend/apis/chat_sessions.py`)
+
+Added 2026-08-21, off a direct user ask to close a long-standing,
+explicitly-flagged gap: `ChatSession`/`ChatMessage` have persisted every
+`/api/chat` turn since the very first session-logging work, but nothing
+in the dashboard ever let an owner actually read one — only
+`ReportPanel`'s own aggregate day-by-day counts existed. Purely a reader,
+same "market research" posture `ChatSession`'s own docstring already
+describes — nothing in the live chat path depends on this router, and
+nothing in it writes anything.
+
+- **`GET /agent/chat-sessions`** — paginated (`{items, total}`,
+  most-recently-active-first), each row carrying a `message_count`
+  computed via one grouped `COUNT` query across the current page's
+  session ids (not N+1 per-session queries). `q` (optional) matches
+  `session_key`/`user_email` — a real full-text search over message
+  *content* would need its own index at any real scale and was
+  deliberately left for later; this covers "find the session for a known
+  visitor" today, the case that actually matters for reviewing a
+  specific lead's conversation.
+- **`GET /agent/chat-sessions/{id}/messages`** — paginated
+  **oldest-first**, the opposite direction from every other paginated
+  list in this app (which page backward from "most recent") — "page 1"
+  of a transcript means "the beginning of the conversation," not "the
+  latest activity," so pagination has to move forward through it instead.
+  404s on an unknown session id.
+- **`ChatSessionViewerPanel`** (frontend, "CRM & reporting" accordion
+  group, alongside `ReportPanel`) — a paginated, searchable session list;
+  "View transcript" opens a `Sheet` reusing `ChatMessageBubble` (the same
+  component the real `/chat` page renders with) for each message, so a
+  transcript reads exactly like the real conversation looked to the
+  visitor, not a stripped-down log view. The transcript `Sheet` has its
+  own independent pagination from the session list.
+- **Real lint catch during this pass**: the search-box debounce
+  originally used two separate effects — one to debounce `searchInput`
+  into `searchText`, a second watching `searchText` purely to reset
+  `page` back to 1 — mirroring `OrderPanel`'s own existing two-effect
+  pattern. The second effect tripped `react-hooks/set-state-in-effect`
+  here even though the identical-looking pattern in `order-panel.tsx`
+  doesn't (a real, unexplained inconsistency in the lint rule's own
+  heuristic, not a difference in the two files' logic — confirmed by
+  running eslint on both files with an unrelated fresh flag to rule out
+  a stale cache). Rather than chase the rule's exact trigger condition,
+  fixed by removing the two-effect pattern entirely: `setPage(1)` now
+  fires inside the SAME debounce `setTimeout` callback that updates
+  `searchText`, so there's no longer a second effect watching derived
+  state at all — the fix that's actually more correct anyway (page reset
+  happens exactly when the debounced search value would change, not from
+  a separately-reactive watcher).
+- **Verified end-to-end**: session list pagination/search all correct
+  against real logged sessions from earlier in this project's history;
+  a real transcript (`quick-test` session) rendered its exact 2 messages
+  in order via a direct API call; an unknown session id 404s.
+
 ## Testing (`backend/tests/`)
 
 Added 2026-08-20 — the first automated test suite in this project.
@@ -1738,7 +3045,19 @@ specific design choice):
   for real headline sizes), full color/spacing/layout/typography editing
   for the generic Block system (`block-container`/`block-text`/
   `block-image`/`block-button` fieldTypes), button params (rounded/size/
-  border width) on both `ThemeCta` and `ButtonBlock`.
+  border width) on both `ThemeCta` and `ButtonBlock`. **`width`
+  (`BlockWidth`) editing, 2026-08-21** — every `block-*` fieldType (7 of
+  them by now: container/text/image/button/product-list/product-card/map)
+  shares one `blockWidth` draft/control (`BLOCK_WIDTH_OPTIONS`,
+  `CteEditorPopover`) rather than seven near-identical copies, since the
+  field is identical in shape and meaning across all of them — only
+  meaningful when the block being edited is a direct child of a
+  `layout: "row"` container, shown unconditionally regardless of the
+  block's actual current parent (same posture as every other style field
+  in this popover, e.g. `justify`/`align` showing even for a `grid`
+  layout where they don't currently apply). `ContainerBlock.min_height`
+  was already editable before this round (`MIN_HEIGHT_OPTIONS`) — the
+  "Suggested next step" note below calling it still-shelved was stale.
 - **"Current value" hints**: `RichText` fields show the field's actual
   *rendered* size/weight/color (read via `getComputedStyle` at click
   time) as the popover's starting value, not a blank "Default" — there's
@@ -1762,8 +3081,9 @@ specific design choice):
 - **Explicitly out of scope, confirmed with the user, not oversights**:
   fixed sections' own single optional fields (Hero's `image`/`eyebrow`)
   don't support delete-then-reinsert (only array-based content does);
-  carousel slide editing; width/height editing on individual blocks
-  (discussed, shelved, not rejected — see "Suggested next step").
+  carousel slide editing. Width/height editing on individual blocks
+  (previously listed here as shelved) shipped 2026-08-21 — see "Style
+  editing" above.
 
 **Verification gap, unresolved all session**: no working Chrome browser
 extension connection existed for any part of the CTE work above — every
@@ -1779,6 +3099,13 @@ before considering it fully settled.
   a local-demo MVP, not a real deployment; don't push toward Firebase/
   cloud deploy unless asked). 3 seeded demo accounts, password `0000`
   for all: `owner@example.com`, `admin@example.com`, `user@example.com`.
+  **2026-08-22**: real Google OAuth added for the public `user` tier
+  (`backend/apis/oauth.py`) — still self-issued JWTs underneath, not
+  Firebase; OAuth is just a second way to prove identity before this
+  app's own token takes over, confirmed with the user as in-scope and
+  distinct from the standing "no Firebase" call. admin/owner stay
+  password-only, a deliberate, confirmed design boundary — see "Social
+  login" below.
 - **Phase 2 — RAG core**: done. See "RAG" above.
 - **Phase 3 — Chatbot**: mostly done. `POST /api/chat` real, provider-
   abstracted, RAG-merged, with automatic lead capture and optional
@@ -1820,14 +3147,18 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 16 tools (`generate_poster`,
+  envelope: either call one of 20 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
-  `scan_crm_attachment`, `cleanup_chat_uploads`, `list_intent_schemas`,
+  `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
+  `list_intent_schemas`,
   `manage_review_queue`, `detect_business_type`, `propose_intent_schema`,
-  `list_products`, `propose_products`, `set_order_status_options` — each
+  `list_products`, `propose_products`, `set_order_status_options`,
+  `ingest_documents_from_url`, `list_scheduled_tasks`,
+  `manage_scheduled_task` — each
   a thin HTTP call onto an already-real `backend/apis/agent.py`/
-  `apis/intent_schemas.py`/`apis/products.py` endpoint) or give a final
+  `apis/intent_schemas.py`/`apis/products.py`/`apis/documents.py`/
+  `apis/scheduled_tasks.py` endpoint) or give a final
   answer. Up to 6 turns, a 300s overall budget. The full step trace
   (tool, args, result, ok/error) is returned to the frontend and
   rendered, not just the final answer.
@@ -2005,6 +3336,16 @@ this is the one place the model itself decides which action(s) to take.
   (`resolve_chat_provider`) if you're testing or demoing attachment
   analysis — the owner-facing model picker (`/dashboard`) sets this
   globally, see "Owner-facing model picker" above.
+- **An outbound `httpx` fetch to a real external site can 403 on
+  httpx's own default User-Agent alone** (2026-08-21, found building
+  URL-based document ingestion, `apis/documents.py`'s
+  `_fetch_url_content`) — confirmed live against Wikipedia: the default
+  `python-httpx/x.x.x` UA got a flat 403, a plain browser-shaped
+  `User-Agent` string worked immediately with no other change. Not a
+  hypothetical edge case — government/legal sites (this feature's own
+  target use case) commonly run similar WAF-level bot filtering. Any
+  future feature that fetches an arbitrary external URL should set a
+  real `User-Agent` from the start rather than rediscovering this.
 - **A corrupted/stale `.next` dev cache can make working pages
   404/500/serve-stale-content with no corresponding code change** — the
   single most-recurring issue this whole project. First try: `docker
@@ -2317,10 +3658,9 @@ already says — none of this got a live click-through.
   open-ended `>=`. See "Known gotchas" below for the real file-permission
   issues this surfaced and how they were fixed — non-trivial, exactly the
   care this was originally flagged as needing.
-- A `/dashboard` viewer for the chat sessions/messages already being
-  persisted (session list + per-session transcript) — deliberately
-  deferred out of the original persistence work to keep that change
-  small, still not built.
+- ~~A `/dashboard` viewer for the chat sessions/messages already being
+  persisted~~ — built 2026-08-21, see "Chat session/transcript viewer"
+  above (`ChatSessionViewerPanel`).
 - Whether the vision model can reliably generate the Container/Block
   schema's *deeper nesting* patterns from a real design image — still
   genuinely open. A 2026-08-19 end-to-end test (synthetic mockup,
@@ -2330,15 +3670,33 @@ already says — none of this got a live click-through.
   everything CTE supports editing at the nested-container level was
   still hand-authored via curl, never generated by the model on its own.
 - Phase 6 (agent security layer) — `owner-agent/` now has a real
-  tool-calling loop over 16 tools, a queryable DB-backed action-log
+  tool-calling loop over 20 tools, a queryable DB-backed action-log
   (2026-08-19, alongside the JSONL file, see "Owner agent" above),
   `generate_landing_page` is wired in as a tool, and both schema
   changes and product-catalog changes now go through an explicit
   propose-then-owner-applies flow rather than being written directly;
   still open: a red-team pass, openclaw permission-boundary docs beyond
   the existing paragraph.
-- Smaller unstarted items: chat streaming, real LLM-driven intent
-  recognition, GSAP/ScrollTrigger, Swiper carousel content.
+- Smaller unstarted items: chat streaming (2026-08-21 scoping note from
+  the user: if/when built, this is for `owner-agent`'s own run output
+  only — the public `/api/chat` path should NOT get streaming; don't
+  propose it there), real LLM-driven intent recognition (see "real LLM-
+  driven intent recognition" below for what this phrase actually means),
+  GSAP/ScrollTrigger, Swiper carousel content.
+  - **"Real LLM-driven intent recognition" explained** (2026-08-21,
+    clarified after the user asked what this meant): `chat-panel.tsx`'s
+    steps 0-2 (category → tags → channel, before a visitor's first free-
+    text turn) are a **hand-authored, fixed decision tree** — a scripted
+    sequence of hardcoded prompts/options, not the LLM classifying what
+    the visitor wants. Only step 3 ("anything else?") and every turn
+    after it actually call `POST /api/chat` and get a real model-
+    generated answer. This flow exists to demonstrate the `{type,
+    options}` structured-control rendering contract
+    (`ChatControlRenderer`) end-to-end, not to be a real intent-
+    classification system — an LLM-driven version would have the model
+    itself decide, from the visitor's own free-text first message, which
+    category/follow-up questions actually apply, rather than always
+    walking the same fixed 3-step wizard regardless of what was typed.
 - Local resource coordination (`resource_broker.py`, above) is
   deliberately v1-scoped: the standalone embedding server isn't part of
   it yet (fix would be a one-line `--sleep-idle-seconds` in
@@ -2359,5 +3717,341 @@ already says — none of this got a live click-through.
   arriving just after an unload-and-reload cycle already started isn't
   protected — closing that needs real request queueing, judged
   out of scope for now.
+
+**2026-08-20/21, continued — closing out the cross-session resume
+feature's own deferred follow-ups.** Off the user's own two-part
+question (simplify the resume trigger design, and pick sane retention
+timing), landed three things in one pass: (1) dropped `schema_key` from
+both resume endpoints — a real visitor-facing UI has no reasonable way
+to ask someone for their request's internal schema key, so
+`_find_resumable_entry` now resolves by `contact_email` alone across
+every schema; (2) built `backend/crm_retention.py`'s
+`cleanup_stale_crm_entries` (24h/7-day rolling thresholds, scoped to only
+never-engaged, schema-linked `CrmEntry` rows — deliberately never
+`ChatSession`/`ChatMessage`, which `ReportPanel` depends on), wired into
+both a new admin endpoint and a new owner-agent tool
+(`cleanup_stale_crm_entries`, owner-agent's tool count now 17); (3) built
+the actual frontend UI this feature had been missing since it first
+shipped — a collapsed "Continuing a previous request?" link in
+`chat/chat-panel.tsx` that expands into an email→code form
+(`lib/crm-resume.ts`), deliberately bypassing the chat/LLM pipeline
+entirely (both calls are plain REST) per the user's own explicit framing
+that the LLM doesn't need to know this mechanism exists. Recommended,
+and the user approved without changes ("可以按照你的想法去做"): keep the
+typed-code approach rather than switch to a magic link, since corporate
+email security scanners commonly pre-click links in incoming mail and
+would silently burn a single-use link before the real visitor opens it —
+a typed code has no equivalent failure mode. Verified the retention
+thresholds live by seeding 4 synthetic DB rows covering every
+(empty/has-data) × (under/over-threshold) combination and confirming
+exactly the two past-threshold entries were purged while all 4
+`ChatSession` rows stayed untouched; verified the full frontend build
+(`tsc`, `eslint` full-source sweep, `npm run build`) and a live
+`/dashboard`+`/chat` smoke check after a frontend restart.
+
+**2026-08-21**: a map embed gate, off the user's own design question —
+whether a real map component was worth building versus just redirecting
+to Google Maps. Landed on: keep the redirect as an unconditional floor
+(always present, no configuration needed), and build a real embed on top
+of it, because a genuinely useful "image + link" alternative would need a
+static-map image anyway, which needs the same class of API integration a
+live embed does. Built `backend/maps.py` (a narrower provider abstraction
+than payment/notification's — a map only ever builds a URL string, no
+action to no-op) + `backend/apis/maps.py` (owner settings, write-only
+Google Maps API key even though Google's own key is designed for
+client-side use, plus a public `GET /api/map-embed` that resolves the
+provider server-side so the key never reaches the frontend at all) + a
+new CTE-insertable `MapBlock` (owner-inserted only, never vision-
+generated, same posture as `ProductListBlock`/`ProductCardBlock`) +
+`MapSettingsPanel` (joins `PaymentSettingsPanel`/`NotificationSettingsPanel`
+in "Products & orders"). See "Map embed gate" above for the full design.
+Verified end-to-end via direct API calls (zero-config redirect works,
+configuring a key produces a correct embed URL, the key round-trips
+write-only, an invalid provider 400s, a `MapBlock` page section
+round-trips through save/read) plus `tsc`/full-source `eslint`/`pytest`/a
+real production build, all clean — one real lint catch fixed along the
+way (`react-hooks/set-state-in-effect` in `MapBlock`'s fetch effect, see
+above for the fix).
+
+**2026-08-21, continued — GEO/business profile**, off a real user report:
+asking ChatGPT/Gemini "I need a plumber" surfaced someone else's business
+info, because this app had nothing published anywhere for an AI system to
+answer that question about THIS business at all. The user's first
+instinct was blog posts/comments; talked through why that's the wrong
+lever (traditional-SEO content vs. this app's actual gap — a missing
+machine-readable fact base, not a content-volume problem) and the user
+agreed, then asked me to design and build the real fix end-to-end
+("这是未来的核心...我对这方面也不是很熟悉，所以只能靠你去完成"). Built three
+pieces: `backend/apis/business_profile.py` (14 new owner-entered
+`AppSettings` columns — name/type/description/contact/address/hours/
+sameAs — deliberately never LLM-written directly, same posture as
+Product pricing/IntentSchema; an LLM CAN suggest a draft from ingested
+documents via `POST .../suggest`, mirroring `detect_business_type`'s
+propose-then-owner-confirms precedent, verified live to correctly leave
+unstated facts null rather than inventing them), `frontend/src/app/
+robots.ts` (explicit AI-crawler allowlist: GPTBot/ClaudeBot/
+Google-Extended/PerplexityBot/etc., not just a bare `*` rule), and
+`frontend/src/app/sitemap.ts` (enumerates every real page/product URL,
+backed by a new public `GET /api/pages` endpoint). A `BusinessProfileJsonLd`
+Server Component renders a schema.org `LocalBusiness` JSON-LD block
+site-wide from that fact base, and the root layout's metadata went from
+a static portfolio-project placeholder to `generateMetadata()` reflecting
+the real configured business. See "GEO / business profile" above for the
+full design, including the accepted static→dynamic build-output tradeoff
+this caused. Verified end-to-end: zero-config renders no JSON-LD at all
+(never an empty/dishonest entity), a configured profile renders a
+correct minimal JSON-LD block plus a matching page title, `robots.txt`/
+`sitemap.xml` both serve real content in a production build, and the
+suggest endpoint's "don't invent facts" instruction held up against a
+real ingested document. `tsc`/full-source `eslint`/`pytest`/a real
+production build all clean.
+
+**2026-08-21, continued — closed three items off a direct "what's still
+missing" gap review with the user.** After I listed the project's known
+open gaps, the user gave four pieces of direct feedback in one message:
+(1) chat streaming, if ever built, should be scoped to `owner-agent`'s
+own run output only, never the public `/api/chat` path — recorded above
+under "Smaller unstarted items" so this doesn't get re-proposed for the
+wrong surface later; (2) asked what "real LLM-driven intent recognition"
+actually meant — explained and recorded above (it's about
+`chat-panel.tsx`'s scripted 3-step wizard, not the main `/api/chat` reply
+path, which already is real LLM output); (3) asked for the chat-session
+viewer to be built — done, `backend/apis/chat_sessions.py` +
+`ChatSessionViewerPanel`, see "Chat session/transcript viewer" above;
+(4) asked for CTE `width`/`height` editing to be completed — `min_height`
+turned out to already be done from an earlier session (the standing gap
+note was stale), so only `width` (`BlockWidth`) needed building; added
+as one shared control across all 7 `block-*` fieldTypes, see "CTE" above.
+Verified end-to-end: a real page save/read round-trip with `width` set
+on two row children; the chat-session viewer against real historical
+session data (list, search, a real 2-message transcript, a 404 on an
+unknown id). One real, unexplained lint-rule inconsistency hit and
+resolved along the way (`react-hooks/set-state-in-effect` firing on a
+pattern identical to `OrderPanel`'s own already-clean code — worked
+around by removing the two-effect pattern entirely rather than chasing
+the rule's exact trigger, see "Chat session/transcript viewer" above).
+`tsc`/full-source `eslint`/`pytest`/a real production build all clean.
+
+**2026-08-21, continued — GEO ranking explainer + two more requested
+pieces.** The user asked what actually drives "GEO ranking" since
+traditional SEO leans on post/comment activity — explained that GEO has
+no ranking list to sort (an AI reply is one synthesized answer, not ten
+blue links), so the real levers are different in kind: retrieval
+reliability (most AI answer engines are RAG-based, often riding on
+Bing's own index, so classic SEO signals still matter upstream),
+extractability (clean factual statements beat marketing prose), NAP
+consistency across the business's own site and third-party directories
+(what `business_social_links`/`sameAs` corroborates), and third-party
+authority (off-platform, outside this app's scope) — deliberately
+distinct from topic-authority content marketing (posts/comments), which
+targets a different question ("how do I fix a leaky pipe") than entity
+citation accuracy ("is this a real plumber, how do I reach them"), the
+problem the user's original report was actually about. Then landed two
+more pieces from the same conversation: (1) `buildSiteJsonLd`/`SiteJsonLd`
+(renamed from `BusinessProfileJsonLd`) — added a `WebSite` +
+`SearchAction` node to the JSON-LD graph, always present (not gated on a
+business profile existing, since `/search` sitelinks-search-box
+eligibility has value from day one), linked to the `LocalBusiness` node
+via `publisher` when one exists; (2) owner-configurable public-chat
+system prompt (`apis/chat_settings.py`, `ChatPromptSettingsPanel`) — a
+full replacement, not append-only, a real design choice I flagged and
+the user confirmed directly, judged safe specifically because every
+dynamic per-turn fact and both classification calls (lead capture, order
+extraction) run independently of this one string — see "Owner-
+configurable public-chat system prompt" above for the full reasoning.
+Business profile itself is still empty — the user chose to provide real
+values directly rather than a demo placeholder or an LLM-suggested
+draft, but hadn't supplied them yet as of this entry. Verified end-to-end:
+zero-config JSON-LD renders a working `WebSite`/`SearchAction` block, a
+configured profile correctly links both graph nodes with `@context`
+appearing exactly once; the chat-prompt override round-trips correctly
+(set → get → reset to null), though the actual live-reply behavior
+change wasn't re-verified against a real model response this round (the
+locally-configured `custom` chat provider was intermittently unreachable
+this session — a known external-dependency gap, not a code issue).
+`tsc`/full-source `eslint`/`pytest`/a real production build all clean.
+
+**2026-08-21, continued — URL document ingestion + a generic scheduler,
+off a real scenario the user posed: a lawyer wanting the system to know
+every local law/regulation, too many to upload by hand, ideally
+re-checked daily.** The user's own follow-up clarifications shaped the
+final design directly: URL input should accept `str | list[str]`
+(code auto-detects which), and — the more significant call — cron
+scheduling shouldn't be embed-specific at all, since "需要cron的可能不单单是
+embed，还有可能是email，crm等其他事项." Built `ScheduledTask` (`models.py`)
+as a generic recurring-task table from the start, dispatched by
+`task_type` through a small registry (`backend/scheduler.py`) — the
+first background-job infrastructure this project has needed, an
+in-process `AsyncIOScheduler` wired into `main.py` via a new `lifespan`
+context manager. Two interfaces write to the same table, matching what
+the user described as two options that are really one mechanism: a CRUD
+API/`ScheduledTasksPanel` and owner-agent's new `manage_scheduled_task`
+tool (upsert-by-name, mirroring `apis/intent_schemas.py`'s
+`upsert_intent_view` precedent). URL ingestion itself
+(`apis/documents.py`'s `_run_url_ingest`, using `trafilatura` for HTML
+and the existing `parse_document` for a direct PDF/DOCX link) runs as a
+background task, not synchronously — `ingest_document`'s own docstring
+had already flagged synchronous ingestion as a scaling limit, and bulk
+legal documents is exactly that case. A real, load-bearing finding from
+live testing: the default httpx User-Agent got 403'd by Wikipedia
+outright, fixed with a proper browser-shaped UA — directly relevant
+since government/legal sites commonly run similar bot filtering. Scope
+was deliberately narrowed to "one URL = one document," explicitly not a
+site crawler (real legal/ToS risk at scale against a government site,
+confirmed with the user as out of scope); repealed/proposed-law status
+was raised by the user as a real concern but explicitly left unresolved
+per their own "还在构想" — no schema decision was forced. See "URL-based
+document ingestion + scheduled tasks" above for the full design.
+Verified end-to-end against real external sites (a live Wikipedia
+article and example.com both fetched/extracted/chunked/embedded to
+`ready` via a real local embedding provider), the full scheduled-task
+CRUD + run-now + validation (bad cron, unknown task_type) round-trip,
+and the `resync_url_document` task type dispatching correctly end-to-end
+through a real scheduled-task row. `tsc`/full-source `eslint`/`pytest`/a
+real production build all clean.
+
+**2026-08-21, continued — document classification (company material vs.
+reference), off the user's own direct follow-up ("我在想要不要给embed分类")**
+right after the URL-ingestion work above. The user's own example crystallized
+the real design: a lawyer's practice needs the chatbot to know local
+statutes, but a statute isn't a fact ABOUT the lawyer's business the way
+a service description is — and separately, the public chatbot should
+stay general on legal specifics ("llm没有律师证，律师也需要赚钱") while owner-
+agent should keep trying to fully answer the owner. Landed as
+`Document.is_company_material: bool` (default `True`, so nothing
+existing changes behavior) with two genuinely different downstream
+effects: it filters what feeds `generate_geo_page`/`detect_business_type`/
+`business_profile.py`'s suggest endpoint (all four synthesize "who is
+this company" content — a statute isn't that), while ordinary `/api/chat`
+RAG retrieval stays completely unaffected and just labels a
+reference-material excerpt to the model as background context, not an
+authoritative company claim (a new `SYSTEM_PROMPT` clause, generic
+wording since this default prompt isn't law-specific — a lawyer-owner
+gets there via the already-built `chat_system_prompt` override instead).
+The "owner-agent should answer fully" half needed zero code changes —
+confirmed by tracing the actual prompt paths that owner-agent's own
+"brain" prompt has never shared anything with `apis/chat.py`'s
+`SYSTEM_PROMPT` to begin with, so the public-chat-specific restraint was
+never something it inherited. See "Document classification" above for
+the full design. Verified end-to-end: `_gather_ready_document_text`'s
+filtering confirmed via a real Python call against real ingested
+documents (not just code review), `retrieve()` confirmed to still
+surface a reference-only document's chunks with the flag correctly
+attached, the PATCH toggle round-trips. `tsc`/full-source `eslint`/
+`pytest`/a real production build all clean.
+
+**2026-08-21, continued — generalized the legal status example into an
+industry-agnostic `Document.status_note` framework, then actually
+verified it changes real model behavior, not just that it saves
+correctly.** The user pushed back on my own earlier framing directly:
+"法律只是一个例子，但是世上行业太多" — asked to design the framework together
+rather than have me build a legal-specific taxonomy. Landed on free
+text, not an enum, mirroring `CrmEntry.status`/`Order.status`'s own
+"owner defines their own vocabulary" precedent already established in
+this app — a fixed `"repealed"|"in-force"|"proposed"` enum only fits
+law. Built manual entry, an opt-in conservative LLM-suggested draft
+(`_suggest_status_note`, "respond NONE unless the text explicitly states
+its own status" — same discipline as `suggest_business_profile`), and
+surfaced it to the model both in RAG context (`_chunk_source_note`) and
+in `SYSTEM_PROMPT`. The user was explicit up front that they can't
+evaluate LLM/RAG behavior themselves ("因为llm和rag的架构我也不熟，所以只能是我
+提出构思和要求，你来完成方案，然后你测试一下是否达到预期猜想") — so instead of stopping
+at "the field saves and the citation line shows it," ran a real,
+adversarial two-sided live test: a synthetic ordinance whose text
+explicitly states it was repealed (model correctly extracted the exact
+status), a second ordinance with no status statement at all (model
+correctly returned null, not a guess), then two real `/api/chat` calls —
+asking about the repealed one got the correct historical answer AND an
+unprompted mention of the repeal and its replacement's new fee; asking
+about the still-current one got a clean answer with no unnecessary
+hedging. Both outcomes matched the actual hypothesis, confirmed live,
+not assumed from the prompt wording alone. See "Document status notes"
+above for the full design. `tsc`/full-source `eslint`/`pytest`/a real
+production build all clean; test data cleaned up after.
+
+**2026-08-22 — social login (Google OAuth) + self-service "my account"
+view.** The user asked for user isolation/user management/admin
+permissions and OAuth (Google/Facebook/X) for regular users, but was
+upfront about not being sure whether admin/owner should also use OAuth.
+Gave a direct recommendation before building anything (raised, not
+assumed): admin/owner accounts hold real privilege and this app's own
+password+JWT system is already fully self-controlled, so tying the
+highest-stakes accounts to a third-party identity provider trades away
+independent account recovery for a convenience win (fewer passwords)
+that mainly matters for the OTHER side — a public visitor who doesn't
+want to create yet another account. The user confirmed this directly,
+and separately confirmed building the "user isolation" self-service view
+in the same round, and confirmed the owner should be able to configure
+Google's own client id/secret from the dashboard (the same pattern
+already used for Stripe/Mailgun/Twilio) rather than an env-var-only
+setup. Built Google as the reference implementation (a real
+authorization-code OAuth2 flow — `apis/oauth.py`), flagged to the user
+that Facebook can likely reuse the same shape but X's own OAuth
+genuinely can't (PKCE/OAuth 1.0a, not this flow), and built
+`apis/my_account.py` — a genuinely new class of gate
+(`require_authenticated_user`: any role, but must be logged in, then
+every query filtered to the caller's own email) — plus a `/account`
+page showing a visitor's own orders/requests/chat history. Verified
+end-to-end against real data (the real `user@example.com` seeded
+account's genuine chat history from 2026-08-08 testing correctly
+surfaced via `/my/chat-sessions`, ownership checks correctly 404 on
+someone else's session), the OAuth settings CRUD/write-only-secret
+round-trip, and — genuinely reaching Google's real token endpoint with
+fake credentials — both a CSRF state mismatch and a rejected fake
+authorization code correctly redirected to a clean error rather than a
+raw 500, the same "prove it reaches the real vendor and handles
+rejection gracefully" pattern already established for Stripe/Mailgun/
+Twilio earlier in this project. Flagged honestly what couldn't be
+verified this session: an actual successful Google login round-trip,
+which needs a real registered OAuth app only the user can set up.
+`tsc`/full-source `eslint`/`pytest`/a real production build all clean;
+test credentials cleared afterward. See "Social login" above for the
+full design.
+
+**2026-08-22, continued — the user asked a sharp follow-up question
+immediately after**: what happens if someone creates a password account
+with an email, then later signs in with Google using that same email?
+Traced the actual merge code and confirmed the specific risk (an
+attacker pre-registering a victim's email before the real owner ever
+uses Google) isn't exploitable today, since this app has no public
+password self-signup at all — but the user's own explicit call was to
+close it now rather than risk forgetting once self-signup eventually
+ships. Added `User.email_verified`, defaulting to the cautious `False`
+for any future account-creation path; `apis/oauth.py`'s merge logic now
+reclaims an unverified existing row (wipes its password, marks it
+verified) instead of silently trusting whatever was already there,
+while an already-trusted row (every account that exists today) merges
+exactly as before. Verified the actual DB-level behavior directly — a
+simulated landmine account's password was correctly wiped on "login,"
+while the real `owner@example.com` account's password was confirmed
+completely untouched by the same code path, plus a live regression
+check that password login still works. See "`User.email_verified`"
+above (right after the Social login section) for the full design.
+
+2026-08-22, continued, "prepare Facebook and X interfaces, then build a
+user management page": extended OAuth from Google-only to all three
+requested providers (Facebook following Google's own authorization-code
+shape almost exactly; X needed real OAuth 2.0 + PKCE and came with an
+honestly-disclosed, real limitation -- X's standard API doesn't reliably
+return an email address without an elevated Developer Portal permission
+this app has no control over, flagged in the backend module docstring,
+the settings panel, and the error message a real failed attempt would
+hit), then built the user-management panel the same request asked for
+(backend/apis/users.py, UserManagementPanel) -- list is admin+owner,
+every write (create/role-change/delete) is owner-only, with two
+server-enforced safety guards (can't touch your own account, can't leave
+zero owners). Caught and fixed a real bug during live verification: the
+three write routes originally depended on require_role(Role.owner) for
+the caller's own identity, but that dependency resolves to just the
+matched Role enum, not a CurrentUser -- every write 500'd on
+AttributeError until a small _require_owner dependency replaced it.
+Verified the full permission/safety-guard chain live, including a real
+demote-the-original-owner-from-a-second-owner-account round trip and
+confirming the last-owner guard checks live DB state rather than a
+JWT's own (potentially stale) role claim. tsc/full-source eslint/pytest/
+a real production build all clean throughout; every test account/
+credential created during verification was cleaned up afterward. See
+"Social login" and "User management" above for the full design -- not
+repeated here.
 
 Ask the user which, if anything, to pick back up.
