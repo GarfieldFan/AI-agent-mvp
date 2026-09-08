@@ -647,6 +647,14 @@ async def update_settings(
         req.embedding_provider,
         req.embedding_model,
     )
+    # Added 2026-09-08, alongside the "custom" branches below — a real gap
+    # the user hit directly: changing *only* the base URL (same model id
+    # re-picked from the refreshed list) wasn't covered by chat_changed/
+    # vision_changed/embedding_changed above (those only compare provider+
+    # model, never the URL), so switching endpoints while keeping the same
+    # model name wouldn't have forced a re-probe.
+    custom_endpoint_changed = req.custom_base_url != (row.custom_base_url if row else None)
+    embedding_endpoint_changed = req.embedding_base_url != (row.embedding_base_url if row else None)
 
     raw_ollama = await _query_ollama_models()
     ollama_chat = _ollama_chat_options(raw_ollama)
@@ -656,11 +664,23 @@ async def update_settings(
     # own, separate one (2026-08-18 — see AppSettings.embedding_base_url's
     # comment for why: a real setup this was built against runs chat/vision
     # and embedding as two different llama.cpp processes). Probe whichever
-    # endpoint(s) are actually needed, up front.
+    # endpoint(s) are ACTUALLY being changed — 2026-09-08 fix, a real gap
+    # the user hit directly: this used to probe live the instant EITHER
+    # capability's provider was "custom", with no "unless unchanged" guard
+    # (unlike the non-custom `elif chat_changed`/etc. branches below, which
+    # already had one) — so saving an unrelated field (e.g. fixing the chat
+    # model) while the embedding endpoint merely happened to be unreachable
+    # right now still 400'd the WHOLE save. Every capability but chat is
+    # meant to be independently optional (nothing else is load-bearing for
+    # the app to run at all — see this module's own docstring on graceful
+    # degradation); this is what actually makes that true for saving
+    # settings, not just for runtime behavior.
     custom_api_key: str | None = None
     custom_model_ids: list[str] = []
     custom_vision_ids: set[str] = set()
-    needs_custom_chatvision = req.chat_provider == "custom" or req.vision_provider == "custom"
+    needs_custom_chatvision = (req.chat_provider == "custom" and (chat_changed or custom_endpoint_changed)) or (
+        req.vision_provider == "custom" and (vision_changed or custom_endpoint_changed)
+    )
     if needs_custom_chatvision:
         if not req.custom_base_url:
             raise HTTPException(
@@ -682,7 +702,7 @@ async def update_settings(
 
     embedding_api_key: str | None = None
     embedding_custom_model_ids: list[str] = []
-    needs_custom_embedding = req.embedding_provider == "custom"
+    needs_custom_embedding = req.embedding_provider == "custom" and (embedding_changed or embedding_endpoint_changed)
     if needs_custom_embedding:
         if not req.embedding_base_url:
             raise HTTPException(
@@ -702,7 +722,12 @@ async def update_settings(
         embedding_custom_model_ids = [model_id for model_id, _ in embedding_results]
 
     if req.chat_provider == "custom":
-        if req.chat_model not in custom_model_ids:
+        # Only enforced when we actually re-probed above (chat_changed or
+        # custom_endpoint_changed) — an unchanged custom pick is trusted
+        # as-is, matching the non-custom `elif chat_changed` branch's own
+        # "don't require the endpoint to be live just to save something
+        # unrelated" reasoning.
+        if (chat_changed or custom_endpoint_changed) and req.chat_model not in custom_model_ids:
             raise HTTPException(
                 status_code=400,
                 detail=f"{req.chat_model} isn't a model reported by that custom endpoint right now.",
@@ -722,7 +747,7 @@ async def update_settings(
     # field, e.g. switching only the embedding model while Ollama is down.
 
     if req.vision_provider == "custom":
-        if req.vision_model not in custom_vision_ids:
+        if (vision_changed or custom_endpoint_changed) and req.vision_model not in custom_vision_ids:
             raise HTTPException(
                 status_code=400,
                 detail=f"{req.vision_model} isn't a vision-capable model reported by that custom endpoint right now.",
@@ -738,7 +763,7 @@ async def update_settings(
             )
 
     if req.embedding_provider == "custom":
-        if req.embedding_model not in embedding_custom_model_ids:
+        if (embedding_changed or embedding_endpoint_changed) and req.embedding_model not in embedding_custom_model_ids:
             raise HTTPException(
                 status_code=400,
                 detail=f"{req.embedding_model} isn't a model reported by that custom endpoint right now.",

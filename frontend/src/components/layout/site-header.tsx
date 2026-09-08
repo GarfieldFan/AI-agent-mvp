@@ -11,7 +11,20 @@ import { primaryNav } from "@/config/nav";
 
 export function SiteHeader() {
   return (
-    <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur supports-backdrop-filter:bg-background/60">
+    // z-50 (2026-09-08, was z-40) — this header is the one persistent,
+    // global piece of chrome every route sits under; it needs to
+    // outrank anything a page itself renders, not just tie with it. It
+    // was tied with /editor's own per-section hover toolbar (also
+    // z-40) — CSS resolves an exact z-index tie by DOM order, and that
+    // toolbar renders later in the tree, so on a tie it was winning and
+    // painting over this header whenever the two visually coincided
+    // (the same class of bug fixed in cte-editor-panel.tsx's own sticky
+    // toolbar just above this — see the root AGENTS.md's CTE section).
+    // Now ties with Sheet's own z-50 (shadcn/ui) instead — an open Sheet
+    // is portalled near the end of <body>, so it still wins that tie and
+    // correctly covers the header too while it's open, which is the
+    // actually-wanted behavior for a modal-style editor panel.
+    <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur supports-backdrop-filter:bg-background/60">
       <Container className="flex h-14 items-center justify-between gap-4">
         <Link href="/" className="flex items-center gap-2 font-semibold">
           <Sparkles className="size-5 text-primary" />

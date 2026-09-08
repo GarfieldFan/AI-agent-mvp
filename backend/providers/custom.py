@@ -86,21 +86,41 @@ async def list_custom_models(base_url: str, api_key: str | None) -> list[tuple[s
     [] fallback when just enriching the settings list).
 
     Returns `(id, vision)` pairs, not bare ids — llama.cpp's router mode
-    reports `architecture.input_modalities` per model (confirmed via a
-    real request this session: a vision-capable entry reports
-    `["text","image"]`, a text-only one just `["text"]`), which is real
-    capability metadata, not a guess — same spirit as
-    apis/model_settings.py's Ollama listing using `ollama show`'s
-    `capabilities` instead of assuming. `vision` defaults to `False` when
-    a server doesn't report `architecture` at all (vLLM/LM Studio might
-    not) — conservative, matching this project's posture everywhere else
-    a capability can't be positively confirmed."""
+    reports `architecture.input_modalities` per model in the OpenAI-shaped
+    `data` array (confirmed via a real request this session: a
+    vision-capable entry reports `["text","image"]`, a text-only one just
+    `["text"]`), which is real capability metadata, not a guess — same
+    spirit as apis/model_settings.py's Ollama listing using `ollama
+    show`'s `capabilities` instead of assuming.
+
+    **Second signal, added 2026-09-08 — a real false negative the user
+    hit**: some `llama-server` builds respond to `GET /models` with BOTH
+    an OpenAI-shaped `data` array (checked above) AND an Ollama-shaped
+    `models` array in the SAME response — confirmed live against the
+    user's own server, whose `data` entries carried no `architecture`
+    field at all (so the check above alone always fell through to
+    `False`), while its `models` array reported `"capabilities":
+    ["completion", "multimodal"]` for the exact same model. Matched by
+    id/name (the two arrays describe the same models under the same
+    string) — a model counts as vision-capable if EITHER signal says so,
+    never downgraded by the other being silent. `vision` only defaults to
+    `False` when NEITHER signal is present at all (vLLM/LM Studio might
+    report neither) — still conservative, matching this project's posture
+    everywhere else a capability can't be positively confirmed."""
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(f"{normalize_loopback_host(base_url)}/models", headers=headers)
         resp.raise_for_status()
         data = resp.json()
+    multimodal_ids = {
+        m["model"]
+        for m in data.get("models", [])
+        if isinstance(m, dict) and "multimodal" in (m.get("capabilities") or [])
+    }
     return [
-        (m["id"], "image" in m.get("architecture", {}).get("input_modalities", []))
+        (
+            m["id"],
+            "image" in m.get("architecture", {}).get("input_modalities", []) or m["id"] in multimodal_ids,
+        )
         for m in data.get("data", [])
     ]

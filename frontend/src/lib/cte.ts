@@ -37,7 +37,11 @@ function setRecursive(node: unknown, keys: string[], value: unknown): unknown {
   throw new Error(`setByPath: cannot descend into path segment "${key}" of a non-object/array node`);
 }
 
-function getByPath(node: unknown, keys: string[]): unknown {
+/** Exported (2026-09-08) for the AI-fill assistant — applying a generated
+ * image needs to read the field's *current* `alt` text before overwriting
+ * just `url`, since setByPath always replaces the whole value at a path
+ * and a `ThemeImage` is `{url, alt}`, not a bare string. */
+export function getByPath(node: unknown, keys: string[]): unknown {
   return keys.reduce<unknown>((acc, key) => {
     if (Array.isArray(acc)) return acc[Number(key)];
     if (acc && typeof acc === "object") return (acc as Record<string, unknown>)[key];

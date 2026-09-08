@@ -268,7 +268,24 @@ by design — no paid keys provided).
   OpenAI-compatible shape straight through). Every vision-capable
   provider (Ollama live-queried, custom live-queried, cloud providers
   assumed vision-capable on their default flagship model) is selectable,
-  not just shown for roadmap visibility. **Embedding model selection is a
+  not just shown for roadmap visibility.
+  - **Custom-endpoint vision detection gained a second signal, 2026-09-08
+    — a real false negative the user hit directly**: `providers/
+    custom.py`'s `list_custom_models` only ever checked the OpenAI-shaped
+    `data` array's `architecture.input_modalities` field for vision
+    capability. The user's own `llama-server` build responds to `GET
+    /models` with BOTH that OpenAI-shaped `data` array AND an
+    Ollama-shaped `models` array in the same response — and on their
+    server, `data` entries carried no `architecture` field at all (so the
+    check always fell through to `False`) while `models` reported
+    `"capabilities": ["completion", "multimodal"]` for the identical
+    model. Fixed by also checking that second array (matched by id/name)
+    — a model now counts as vision-capable if EITHER signal says so;
+    `vision` only defaults to `False` when NEITHER is present. Verified
+    live against the real server: `list_custom_models` and `GET
+    /agent/models`'s `vision_models` both now correctly report the user's
+    `Qwen3.8-27B-Uncensored` model as vision-capable.
+  **Embedding model selection is a
   third, independent picker** (2026-08-18) — see the `EmbeddingProvider`
   bullet above for what changing it actually does. Two independent
   "Custom endpoint" blocks sit in this panel, not one (2026-08-18 split —
@@ -313,6 +330,33 @@ by design — no paid keys provided).
   couldn't be freshly re-verified — hit for real this session once chat
   moved off Ollama entirely while Ollama itself wasn't running. Actually
   changing a capability whose source is unreachable still correctly 400s.
+  **Real gap in this "only if changing" guard, fixed 2026-09-08, hit for
+  real by the user**: the guard above only ever covered the non-`custom`
+  branches (`elif chat_changed`/`elif vision_changed`/
+  `elif embedding_changed`) — the `if req.xxx_provider == "custom":`
+  branches had NO such guard at all, so with chat/vision/embedding all
+  configured as `custom` (a real local setup: one llama.cpp endpoint for
+  chat+vision, a second, separate one for embedding), saving settings
+  ALWAYS re-probed every configured custom endpoint on every single save,
+  regardless of whether that capability was the thing actually being
+  changed. Hit for real: the embedding endpoint was down, and this
+  blocked saving an unrelated chat-model fix with a 400 from the
+  embedding probe — the exact opposite of "every capability but chat is
+  independently optional" this app's providers are supposed to embody.
+  Fixed by extending the same changed-guard to the custom branches too
+  (`needs_custom_chatvision`/`needs_custom_embedding` now require
+  `chat_changed`/`vision_changed`/`embedding_changed` — or a new
+  `custom_endpoint_changed`/`embedding_endpoint_changed`, added the same
+  round to catch a URL-only change re-picking the identical model name,
+  which the provider+model comparison alone would've missed) — an
+  unchanged `custom` pick is now trusted as-is, same as the non-custom
+  branches already did. Verified live against the real, partially-broken
+  setup this was found in: re-submitting the exact current settings
+  succeeded (200) while the embedding endpoint stayed genuinely
+  unreachable; deliberately changing `embedding_model` to a bogus value
+  under the same broken endpoint still correctly 400'd — the strictness
+  is preserved for an actual change, only unrelated saves stopped being
+  blocked.
 - **Image generation is a fourth, independent picker** (2026-08-18,
   `AppSettings.image_provider`/`image_comfyui_url`) — shaped differently
   from the other three: it's a plain 3-way **provider** choice
@@ -3085,12 +3129,103 @@ specific design choice):
   (previously listed here as shelved) shipped 2026-08-21 — see "Style
   editing" above.
 
+**AI content assistant — "AI fill content"** (2026-09-08,
+`components/theme/cte/ai-content-assistant.tsx`,
+`backend/apis/agent.py`'s `POST /agent/pages/ai-fill-content`,
+`frontend/src/lib/page-ai-fill.ts`). Closes the gap between
+`generate_landing_page` (AI decides structure AND content, from a design
+image) and plain CTE (a human decides both, field by field): the owner
+arranges a page's sections/blocks by hand first, then hands that
+**already-decided layout** to the AI with a plain-language description
+of what the content should be about, and gets copy — and, separately,
+images — written into it. Confirmed design (`AskUserQuestion`):
+- **AI never touches structure, only content** — `lib/page-ai-fill.ts`'s
+  `collectFillableFields(sections)` walks the current `sections` tree for
+  every text/text-list/image slot (recursing into
+  `ContainerBlock.children`), skipping anything structural/functional/
+  factual-and-owner-entered (a `MapBlock`'s address, `href`s, product
+  bindings) — the same "code guarantees structure, the LLM only supplies
+  content" split `_coerce_sections` already relies on elsewhere. The
+  backend never sees the page schema at all, only this flat manifest, and
+  re-validates every path the model echoes back against the exact
+  requested set before returning anything.
+- **One whole-page prompt** (`resolve_chat_provider`, optionally grounded
+  in ingested company-material documents) fills every text field in one
+  pass, applied directly into the live unsaved CTE editing state — same
+  "apply immediately, still hand-editable, Save is separate" posture as
+  every other CTE edit. A `RichText`-object field keeps its existing
+  color/size/weight; only `content` is replaced.
+- **Images are never auto-generated** — the text pass also returns a
+  short image-generation-prompt *suggestion* per slot (never an actual
+  image); each slot gets its own row, appearing only once the text pass
+  has run, with its own "Generate" button that enqueues (never generates
+  inline) into a real one-at-a-time client-side queue
+  (`AiContentAssistant`'s `queue`/`processingPath`) reusing the existing
+  `POST /agent/poster/generate`. A queued (not-yet-running) row can be
+  bumped to the front ("Generate next") or cancelled. A finished job's
+  URL applies straight into that image field, preserving its existing
+  `alt` text (`lib/cte.ts`'s exported `getByPath`).
+- Deliberately text + images only this round, not per-field color/style
+  generation — a confirmed scope cut (existing CTE style editors still
+  cover that by hand), not a gap.
+- Always mounted regardless of `editModeOn` — an `active` prop gates only
+  the trigger button and the Sheet's `open={open && active}` (a derived
+  value, no effect needed). Fixes a real state-loss bug found this
+  session (toggling edit mode off to preview a result used to unmount the
+  whole component, wiping its image queue/reasoning) — full story in
+  `HISTORY.md`'s 2026-09-08 entry.
+
+**"Ask AI to adjust this container's layout"** (`backend/apis/agent.py`'s
+`POST /agent/pages/ai-adjust-layout`, `frontend/src/lib/layout-adjust.ts`,
+a new section inside `CteEditorPopover`'s `block-container` form) — the
+local-area counterpart, built after a blanket CSS fix for a row's uneven
+child heights (`ContainerBlock` gaining unconditional `h-full`) regressed
+a *different* container's own intentional design elsewhere on the same
+page (a full-bleed `background_image` + `min_height` banner whose short
+colored panels are meant to leave most of the photo visible — see
+`HISTORY.md` for the full story of that regression and the reverted
+fix). Two scope decisions confirmed with the user (`AskUserQuestion`),
+both the more conservative option offered:
+- **Local area only** — an optional-instruction block inside the SAME
+  popover that already edits a container's style fields by hand (no new
+  top-level UI). Sends this ONE container's current style fields
+  (including whether it has a background image/color) plus a one-level,
+  non-recursive summary of each direct child (`lib/layout-adjust.ts`'s
+  `summarizeChild` — kind + a short content snippet, never the child's
+  full object). The response applies straight into the popover's
+  existing draft state (`setCLayout`/etc., which already live-applies) —
+  zero new apply-plumbing. A `reasoning` string always renders, including
+  an honest "these fields alone can't fix this" when the real ask needs
+  restructuring instead of a misleading partial fix.
+- **Style knobs only, no restructuring** — `layout`/`gap`/`padding`/
+  `margin`/`align`/`justify`/`min_height`; never add/remove/reorder/nest
+  a child, never `columns` (not exposed by the manual form either).
+  Known, confirmed limitation: this can't fix a case that genuinely needs
+  an extra nested container (the banner-panel-height case above) — the
+  model says so via `reasoning` rather than faking a fix. Its system
+  prompt explicitly teaches it the `align: "stretch"` + tall `min_height`
+  + a background image → children cover the photo entirely failure mode
+  found above, so it doesn't recommend the same mistake back.
+
+Two more real, unrelated bugs the user caught by screenshot during this
+same pass, both fixed — full root-cause story in `HISTORY.md`'s
+2026-09-08 entry: a `width`-sized row child overflowing past its own row
+in edit mode only (`block-renderer.tsx`'s `WIDTH_CLASS` — a `shrink-0`
+conflicting with edit mode's own extra `InsertGap` flex items in the same
+row; fixed by dropping `shrink-0`, keeping `grow-0`), and a z-index
+ordering mistake where the CTE sticky toolbar's "Edit mode" `Switch` (and
+separately, `SiteHeader`) could get painted over by a section's own
+hover-revealed toolbar. Current z-index order for `/editor`: `Sheet` (50)
+≈ `SiteHeader` (50, loses the DOM-order tie to Sheet) >
+`CteEditorPanel`'s sticky toolbar (`z-[45]`) > section-level hover
+toolbar (40) > `ArrayItemToolbar` (20).
+
 **Verification gap, unresolved all session**: no working Chrome browser
 extension connection existed for any part of the CTE work above — every
-fix was verified via `tsc`/`eslint`/curl/backend-Pydantic checks plus the
-user's own screenshots, never a live click-through by this session's own
-tools. Treat any CTE-adjacent change as needing a real browser check
-before considering it fully settled.
+fix was verified via `tsc`/`eslint`/curl/backend checks and the user's
+own screenshots, never a live click-through by this session's own tools.
+Treat any CTE-adjacent change as needing a real browser check before
+considering it fully settled.
 
 ## Progress against the plan's phases (四、开发顺序建议)
 
@@ -4053,5 +4188,42 @@ a real production build all clean throughout; every test account/
 credential created during verification was cleaned up afterward. See
 "Social login" and "User management" above for the full design -- not
 repeated here.
+
+**2026-09-08 — CTE "AI fill content" + "Ask AI to adjust layout", plus a
+run of real bugs the user caught live against their own local setup.**
+Built the AI-content-assistant pair described in "CTE" above: a
+whole-page AI-fill step (text + a real, owner-triggered image-generation
+queue) that fills in content for a layout the owner already arranged by
+hand, and a narrower per-container "adjust my layout" action built after
+a first attempt at a universal CSS fix (`h-full` on every container)
+regressed a different container's own intentional design — reverted, not
+special-cased, once it was clear "should this container's children fill
+100% height" is a genuine per-container decision, not a bug with one
+right answer. Fixed several more real, unrelated issues surfaced by the
+user's own screenshots/live testing in the same pass: an edit-mode-only
+row-overflow bug (`BlockRenderer`'s `WIDTH_CLASS` `shrink-0` fighting
+edit mode's own extra flex items), two z-index ordering mistakes (the CTE
+sticky toolbar and `SiteHeader` both losing to a section's own hover
+toolbar), a real independence bug in `update_settings` (saving one AI
+model capability was blocked by a DIFFERENT, unrelated capability's
+custom endpoint merely being unreachable — fixed by extending the
+existing "only re-validate what's actually changing" guard to the
+`custom` branches, which had been missing it entirely), a custom-endpoint
+vision-detection false negative (`providers/custom.py` only checked one
+of two capability signals a real `llama-server` response can carry), and
+the AI-fill assistant's own state getting wiped by toggling edit mode
+off to preview a result (fixed the same way `ChatBubbleWidget` already
+had to — stay mounted, hide via a prop, don't conditionally render the
+whole subtree). Every fix in this session was verified against the
+user's own real, partially-broken local setup (their `llama-server` on
+custom endpoints, one of which was genuinely down) via direct API
+calls/DB queries/container network tests, not just `tsc`/`eslint` —
+the Chrome extension still never connected, so no fix got an actual
+visual click-through; treat the whole CTE section as still needing one.
+Full narrative (every root-cause trace, every screenshot-driven
+diagnosis, the exact commands used to verify each fix live) is in
+`HISTORY.md`'s 2026-09-08 entry — this file was trimmed down to
+current-state facts only as part of the same session, per the user's own
+"tidy up the docs" ask.
 
 Ask the user which, if anything, to pick back up.

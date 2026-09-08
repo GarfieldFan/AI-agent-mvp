@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { AiContentAssistant } from "@/components/theme/cte/ai-content-assistant";
 import { CteEditorPopover } from "@/components/theme/cte/cte-editor-popover";
 import { CteProvider } from "@/components/theme/cte/cte-context";
 import { InsertGap } from "@/components/theme/cte/insert-gap";
@@ -17,10 +18,19 @@ import { SectionInsertMenu } from "@/components/theme/cte/section-insert-menu";
 import { SectionRenderer } from "@/components/theme/section-renderer";
 import { ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { appendByPath, insertByPath, moveByPath, removeByPath, setByPath, type CteSelection } from "@/lib/cte";
+import {
+  appendByPath,
+  getByPath,
+  insertByPath,
+  moveByPath,
+  removeByPath,
+  setByPath,
+  type CteSelection,
+} from "@/lib/cte";
 import { getPublicPage, listPages, savePageVersion, type PageSummary } from "@/lib/pages";
+import type { FillableField } from "@/lib/page-ai-fill";
 import { slugify } from "@/lib/slug";
-import type { GeneratedPage, PageSection } from "@/lib/theme";
+import type { GeneratedPage, PageSection, ThemeImage } from "@/lib/theme";
 
 /** The real `/editor` UI (replaced the GrapesJS-shaped placeholder,
  * 2026-08-04 — see the root AGENTS.md's CTE section for why GrapesJS
@@ -211,6 +221,42 @@ export function CteEditorPanel() {
     setSaveStatus("idle");
   }
 
+  // AI-fill assistant handlers (2026-09-08) — apply a generated value
+  // straight into the same `sections` state every other CTE edit writes
+  // through, via the same setByPath helper. See
+  // components/theme/cte/ai-content-assistant.tsx's own doc comment for
+  // the full design.
+  function handleAiApplyText(path: string, value: string, richText?: FillableField["richText"]) {
+    setSections((prev) => {
+      if (!prev) return prev;
+      const next = richText ? { ...richText, content: value } : value;
+      return setByPath(prev, path, next) as PageSection[];
+    });
+    setDirty(true);
+    setSaveStatus("idle");
+  }
+
+  function handleAiApplyTextList(path: string, values: string[]) {
+    setSections((prev) => (prev ? (setByPath(prev, path, values) as PageSection[]) : prev));
+    setDirty(true);
+    setSaveStatus("idle");
+  }
+
+  function handleAiApplyImage(path: string, url: string) {
+    setSections((prev) => {
+      if (!prev) return prev;
+      // Preserves the field's existing alt text — setByPath replaces the
+      // whole value at `path`, and a ThemeImage is {url, alt}, not a bare
+      // string, so overwriting without reading the current alt first
+      // would silently blank it out.
+      const current = getByPath(prev, path.split(".")) as ThemeImage | undefined;
+      const next: ThemeImage = { url, alt: current?.alt ?? "" };
+      return setByPath(prev, path, next) as PageSection[];
+    });
+    setDirty(true);
+    setSaveStatus("idle");
+  }
+
   async function handleSaveVersion() {
     if (!loadedSlug || !sections) return;
     setSaveStatus("saving");
@@ -300,11 +346,25 @@ export function CteEditorPanel() {
                user request) — a long page used to mean scrolling all the
                way back up just to toggle edit mode or hit Save. `top-14`
                sits it directly below SiteHeader's own sticky h-14 bar
-               (see layout/site-header.tsx) rather than overlapping it;
-               `z-30` stays under that header's `z-40` for the same
-               reason. Solid-ish background (not the old bg-muted/30) so
-               scrolled-past section content doesn't show through. */}
-            <div className="sticky top-14 z-30 flex flex-wrap items-center justify-between gap-2 rounded-t-xl border-b bg-background/95 px-4 py-2 backdrop-blur supports-backdrop-filter:bg-background/80">
+               (see layout/site-header.tsx) rather than overlapping it.
+               Solid-ish background (not the old bg-muted/30) so
+               scrolled-past section content doesn't show through.
+
+               `z-[45]` (2026-09-08, was `z-30`) — a real regression the
+               user caught: this toolbar's own "Edit mode" Switch sat
+               BELOW a section's hover-revealed move/delete/edit toolbar
+               (`z-40`, immediately below), so hovering the very first
+               section (which renders right underneath this bar) painted
+               that toolbar right on top of the Switch, blocking it. The
+               section toolbar's own `z-40` exists for a real reason too
+               (see its doc comment two blocks down — without it, that
+               badge disappears UNDER this sticky bar instead) — the fix
+               is this bar needing to outrank it, not the other way
+               around, since this bar's own controls (Edit mode, Save,
+               Reload) must always stay clickable. Kept below `Sheet`'s
+               `z-50` (shadcn/ui's `sheet.tsx`) so the field-editor popover
+               still always wins over everything in this preview. */}
+            <div className="sticky top-14 z-[45] flex flex-wrap items-center justify-between gap-2 rounded-t-xl border-b bg-background/95 px-4 py-2 backdrop-blur supports-backdrop-filter:bg-background/80">
               <div className="flex items-center gap-2">
                 <Switch id="cte-edit-mode" checked={editModeOn} onCheckedChange={setEditModeOn} />
                 <Label htmlFor="cte-edit-mode" className="text-sm">
@@ -438,6 +498,20 @@ export function CteEditorPanel() {
               ))}
             </CteProvider>
           </div>
+
+          {/* Always mounted regardless of editModeOn (2026-09-08 fix) — see
+             AiContentAssistant's own `active` prop doc comment for the
+             real bug this closes: toggling edit mode off to preview the
+             result used to unmount this component entirely, silently
+             discarding its own generation state (image queue, reasoning)
+             even though the applied page content itself survived fine. */}
+          <AiContentAssistant
+            sections={sections}
+            onApplyText={handleAiApplyText}
+            onApplyTextList={handleAiApplyTextList}
+            onApplyImage={handleAiApplyImage}
+            active={editModeOn}
+          />
         </div>
       ) : null}
 

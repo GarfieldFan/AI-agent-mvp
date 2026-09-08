@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { Sparkles } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,7 +23,10 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { ColorField } from "@/components/theme/cte/color-field";
 import { ImageFieldEditor } from "@/components/theme/cte/image-field-editor";
+import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { ApiError } from "@/lib/api";
+import { requestLayoutAdjust } from "@/lib/layout-adjust";
 import type { CteSelection } from "@/lib/cte";
 import { listProducts, type Product } from "@/lib/products";
 import type {
@@ -470,6 +474,49 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
     containerValue?.link_product_id ?? null,
   );
 
+  // "Ask AI to adjust this container's layout" (2026-09-08) — the "local
+  // area" layout action, see lib/layout-adjust.ts's own doc comment for
+  // the full design. Only meaningful for block-container; kept alongside
+  // that fieldType's other draft state.
+  const [layoutInstruction, setLayoutInstruction] = React.useState("");
+  const [layoutAdjustStatus, setLayoutAdjustStatus] = React.useState<"idle" | "loading" | "error">("idle");
+  const [layoutAdjustError, setLayoutAdjustError] = React.useState<string | null>(null);
+  const [layoutAdjustReasoning, setLayoutAdjustReasoning] = React.useState<string | null>(null);
+
+  async function handleAskAiLayout() {
+    if (!containerValue) return;
+    setLayoutAdjustStatus("loading");
+    setLayoutAdjustError(null);
+    try {
+      const currentContainer: ContainerBlockValue = {
+        ...containerValue,
+        layout: cLayout,
+        gap: cGap,
+        padding: cPadding,
+        margin: cMargin,
+        align: cAlign,
+        justify: cJustify,
+        min_height: cMinHeight,
+        full_bleed: cFullBleed,
+        background_color: cBackgroundColor,
+        background_image: cBackgroundImage,
+      };
+      const result = await requestLayoutAdjust(currentContainer, layoutInstruction);
+      setCLayout(result.layout);
+      setCGap(result.gap);
+      setCPadding(result.padding);
+      setCMargin(result.margin);
+      setCAlign(result.align);
+      setCJustify(result.justify ?? undefined);
+      setCMinHeight(result.min_height ?? undefined);
+      setLayoutAdjustReasoning(result.reasoning || null);
+      setLayoutAdjustStatus("idle");
+    } catch (err) {
+      setLayoutAdjustError(err instanceof ApiError ? err.message : "Could not reach the backend.");
+      setLayoutAdjustStatus("error");
+    }
+  }
+
   // block-text draft
   const textBlockValue = fieldType === "block-text" ? (value as TextContentBlockValue) : null;
   const [tContent, setTContent] = React.useState(textBlockValue?.content ?? "");
@@ -816,6 +863,32 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
 
           {fieldType === "block-container" ? (
             <div className="space-y-3">
+              <div className="space-y-2 rounded-lg border border-dashed p-3">
+                <div className="flex items-center gap-1.5 text-xs font-medium">
+                  <Sparkles className="size-3.5" />
+                  Ask AI to adjust this container&apos;s layout
+                </div>
+                <Textarea
+                  value={layoutInstruction}
+                  onChange={(event) => setLayoutInstruction(event.target.value)}
+                  placeholder="Optional — describe what looks off, or leave blank and let it use its own judgment…"
+                  rows={2}
+                  disabled={layoutAdjustStatus === "loading"}
+                />
+                <Button size="sm" variant="outline" onClick={handleAskAiLayout} disabled={layoutAdjustStatus === "loading"}>
+                  {layoutAdjustStatus === "loading" ? "Thinking…" : "Suggest layout"}
+                </Button>
+                {layoutAdjustStatus === "loading" ? <LoadingSpinner label="Looking at this container…" /> : null}
+                {layoutAdjustStatus === "error" && layoutAdjustError ? (
+                  <ErrorMessage description={layoutAdjustError} onRetry={() => setLayoutAdjustStatus("idle")} />
+                ) : null}
+                {layoutAdjustReasoning ? <p className="text-xs text-muted-foreground">{layoutAdjustReasoning}</p> : null}
+                <p className="text-xs text-muted-foreground">
+                  Only adjusts this container&apos;s own layout/spacing fields below — never touches its content, and
+                  never adds/removes/reorders anything inside it. If the fix actually needs restructuring, it&apos;ll
+                  say so above instead of guessing.
+                </p>
+              </div>
               <EnumField label="Layout" value={cLayout} options={LAYOUT_OPTIONS} onChange={(v) => v && setCLayout(v)} />
               {cLayout !== "grid" ? (
                 <>

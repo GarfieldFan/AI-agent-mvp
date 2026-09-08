@@ -144,6 +144,17 @@ export function ContainerBlock({
         children,
       }}
       className={cn(
+        // 2026-09-08: a blanket `h-full` here was tried and reverted —
+        // real regression, caught by the user, not hypothetical. This
+        // container is also used as a `background_image` + `min_height`
+        // "hero band" (see MIN_HEIGHT_CLASS above), which deliberately
+        // controls its own footprint; forcing `height: 100%` whenever an
+        // ancestor happens to hand down a definite height (e.g. this
+        // container sitting inside a stretched `row`) fought that
+        // intentional sizing instead of just fixing the row/column
+        // equal-height case it was aimed at. Reverted — see the root
+        // AGENTS.md's CTE section for the real fix direction (an
+        // AI/owner-adjustable layout action, not a blanket CSS rule).
         "relative w-full",
         layoutClass,
         GAP_CLASS[gap],

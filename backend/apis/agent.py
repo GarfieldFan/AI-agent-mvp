@@ -24,6 +24,7 @@ permission-boundary work that has to land first, before that day comes.
 """
 
 import base64
+import json
 from datetime import date, datetime, timedelta
 from typing import Annotated, Literal, Union
 
@@ -1055,6 +1056,274 @@ async def generate_geo_page(db: Session = Depends(get_db)) -> GenerateGeoPageRes
         document_count=doc_count,
         version_id=version.id,
     )
+
+
+# Added 2026-09-08 — CTE's "AI fill content" assistant. The owner arranges
+# a page's sections/blocks by hand (or from a generated draft), then hands
+# the ALREADY-DECIDED layout to this endpoint along with a plain-language
+# description of what they want, and gets back copy for every text field
+# plus a suggested image-generation prompt for every image slot. Unlike
+# generate_landing_page/generate_geo_page, this endpoint never decides
+# structure — the frontend (lib/page-ai-fill.ts's collectFillableFields)
+# walks the owner's own current `sections` tree and sends a flat list of
+# {path, kind, label, current_value}; the model only ever fills in a
+# "value" per path, echoed back and re-validated against the requested
+# path set here so a hallucinated path can never land anywhere in the
+# page (same "code guarantees structure, the LLM only supplies content"
+# split this schema already relies on for _coerce_sections). Applying a
+# result back into `sections` (via lib/cte.ts's setByPath) is entirely the
+# frontend's job — this endpoint has no idea what a "container" or
+# "hero" even is beyond the field manifest it was given.
+#
+# Image fields deliberately never get an image generated here — image
+# generation is slow/resource-heavy (ComfyUI), so the frontend defers it
+# to a per-field, owner-triggered queue (see ai-content-assistant.tsx)
+# that reuses the existing POST /agent/poster/generate one field at a
+# time. This call only ever returns a short *prompt suggestion* for each
+# image slot, pre-filling that later step.
+class AiFillFieldRequest(BaseModel):
+    path: str
+    kind: Literal["text", "image", "text-list"]
+    label: str
+    current_value: str = ""
+
+
+class AiFillContentRequest(BaseModel):
+    prompt: str
+    fields: list[AiFillFieldRequest]
+
+
+class AiFillFieldResult(BaseModel):
+    path: str
+    value: str
+
+
+class AiFillContentResponse(BaseModel):
+    fields: list[AiFillFieldResult]
+
+
+_AI_FILL_SYSTEM_PROMPT = """You are a copywriter filling in content for an already-designed webpage layout. \
+The site owner has already arranged this page's sections and blocks — you do NOT invent or change structure, \
+order, or layout, you only supply the actual words (and, for image slots, a short description of what photo \
+should go there) for a fixed list of content fields.
+
+You will be given:
+1. A description from the site owner of what they want this page/content to be about.
+2. Optionally, background facts about the real business, taken from documents they've uploaded — use these \
+for accuracy whenever they're relevant to a field; when they're silent on something, invent plausible, \
+generic, on-brand copy consistent with the owner's own description instead.
+3. A JSON array of fields to fill. Each field has: "path" (an opaque id — echo it back completely unchanged, \
+never alter or invent one), "kind" ("text", "image", or "text-list"), "label" (what this field is, e.g. \
+"Hero headline", "Feature grid item 2 description" — infer appropriate tone/length from it), and \
+"current_value" (whatever's there now, may be empty).
+
+For "text" fields: write real, ready-to-publish copy matching the field's role (a headline is short and \
+punchy, a body paragraph can be a few sentences, a button label is 1-4 words). Never leave a field as a \
+placeholder like "[insert text here]".
+
+For "text-list" fields: write several short items (3-6 words each, e.g. badges/tags), joined together with \
+" | " (a pipe character with a space on each side) — the value must contain nothing else.
+
+For "image" fields: do NOT describe the field itself or repeat its label back — write a short, concrete, \
+visual image-generation prompt (one sentence, e.g. "a cozy modern coffee shop interior with warm wood tones \
+and pendant lighting") describing what photo/illustration should go in that slot, suitable for feeding \
+directly into a text-to-image model later. Never describe a real, identifiable person's likeness, a real \
+brand's logo, or other trademarked imagery.
+
+Respond with ONLY a single JSON object, no markdown fences, no commentary:
+{"fields": [{"path": "<echoed path>", "value": "<the generated text, pipe-joined list, or image prompt>"}, ...]}
+
+Include exactly one entry per field you were given. If a field is genuinely inapplicable (e.g. an optional \
+eyebrow this page doesn't need), still include its entry with "value" set to an empty string "" rather than \
+omitting it, so the caller knows you considered it."""
+
+
+@router.post("/agent/pages/ai-fill-content", response_model=AiFillContentResponse)
+async def ai_fill_content(req: AiFillContentRequest, db: Session = Depends(get_db)) -> AiFillContentResponse:
+    """See the module comment just above for the full design. Grounds the
+    generation in real business facts when any are available
+    (_gather_ready_document_text, the same helper generate_geo_page uses)
+    but works with zero ingested documents too, same as every other AI
+    feature in this app."""
+    if not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt must not be empty")
+    if not req.fields:
+        raise HTTPException(status_code=400, detail="no fillable fields were given")
+
+    doc_text, doc_count = _gather_ready_document_text(db, char_budget=4000)
+    context_parts = [f"Owner's description of what this content should be about:\n{req.prompt.strip()}"]
+    if doc_count > 0:
+        context_parts.append(f"Background facts about the real business, from ingested documents:\n{doc_text}")
+    manifest = [f.model_dump() for f in req.fields]
+    context_parts.append(f"Fields to fill (JSON array):\n{json.dumps(manifest, ensure_ascii=False)}")
+    messages = [{"role": "user", "content": "\n\n".join(context_parts)}]
+
+    try:
+        provider = resolve_chat_provider(db)
+        raw_content = await provider.chat(messages, system=_AI_FILL_SYSTEM_PROMPT, json_mode=True)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+
+    try:
+        parsed = parse_lenient_json(raw_content)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    raw_fields = parsed.get("fields")
+    if not isinstance(raw_fields, list):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Model output had no 'fields' array. Raw output: {raw_content[:2000]}",
+        )
+
+    # Never trust a path the model returns beyond the exact set requested —
+    # a hallucinated/mangled path here would otherwise be handed straight
+    # to the frontend's setByPath, which throws on an unknown shape (or,
+    # worse, could silently land in the wrong spot on a coincidental match).
+    requested_paths = {f.path for f in req.fields}
+    results: list[AiFillFieldResult] = []
+    seen_paths: set[str] = set()
+    for item in raw_fields:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        value = item.get("value")
+        if not isinstance(path, str) or path not in requested_paths or path in seen_paths:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            continue
+        seen_paths.add(path)
+        results.append(AiFillFieldResult(path=path, value=value))
+
+    return AiFillContentResponse(fields=results)
+
+
+# Added 2026-09-08 — the "local area" counterpart to ai_fill_content above.
+# A real, confirmed scope-narrowing: an earlier attempt at a blanket CSS
+# fix for uneven row-column heights (giving every ContainerBlock `h-full`)
+# broke a DIFFERENT container's intentional design (a full-bleed
+# background-image banner whose short colored child panels are meant to
+# leave most of the photo visible) — see the root AGENTS.md's CTE section
+# for the real screenshot-driven story. There's no single CSS rule that's
+# correct for every container, since "should children fill the available
+# height" is a real per-container design decision, not a bug — so instead
+# of a global rule, this is a per-container, owner-triggered ask: given
+# ONE container's own current style fields + a plain summary of what it
+# holds (never the actual content, never structure), suggest better
+# values for JUST that container's own layout/spacing/alignment fields.
+# Deliberately narrower than ai_fill_content in two ways, both confirmed
+# with the user directly: (1) scoped to one container the owner is
+# already looking at, not the whole page: (2) can only choose values for
+# existing style fields — it can never add/remove/reorder/nest children,
+# so a genuine structural fix (like the nested-row fix the real banner
+# case above actually needed) is explicitly out of reach; the model is
+# told to say so honestly in "reasoning" rather than fake a fix with a
+# misleading value.
+class AiAdjustLayoutContainerSummary(BaseModel):
+    layout: Literal["row", "column", "grid"]
+    gap: Literal["none", "sm", "md", "lg"] = "md"
+    padding: Literal["none", "sm", "md", "lg"] = "none"
+    margin: Literal["none", "sm", "md", "lg"] = "none"
+    align: Literal["start", "center", "end", "stretch"] = "stretch"
+    justify: Literal["start", "center", "end", "between"] | None = None
+    min_height: Literal["sm", "md", "lg", "xl", "screen"] | None = None
+    full_bleed: bool = False
+    has_background_image: bool = False
+    has_background_color: bool = False
+
+
+class AiAdjustLayoutChildSummary(BaseModel):
+    kind: str
+    summary: str = ""
+
+
+class AiAdjustLayoutRequest(BaseModel):
+    instruction: str = ""
+    container: AiAdjustLayoutContainerSummary
+    children: list[AiAdjustLayoutChildSummary]
+
+
+class AiAdjustLayoutResponse(BaseModel):
+    layout: Literal["row", "column", "grid"]
+    gap: Literal["none", "sm", "md", "lg"]
+    padding: Literal["none", "sm", "md", "lg"]
+    margin: Literal["none", "sm", "md", "lg"]
+    align: Literal["start", "center", "end", "stretch"]
+    justify: Literal["start", "center", "end", "between"] | None = None
+    min_height: Literal["sm", "md", "lg", "xl", "screen"] | None = None
+    reasoning: str = ""
+
+
+_AI_ADJUST_LAYOUT_SYSTEM_PROMPT = """You are a layout consultant for ONE container block in an already-built \
+webpage. Someone has already decided WHAT is inside this container (its content, and every other container \
+around it) — you never see or change that, only how THIS container arranges the children it already has: its \
+"layout" (row/column/grid) and a handful of spacing/alignment style fields.
+
+You will be given:
+1. An optional instruction describing what looks wrong or what's wanted — may be empty; if so, just use your own \
+judgment for a generally more coherent result.
+2. This container's current style fields, including whether it has a background image and/or background color.
+3. A short summary of each direct child it holds (kind + a snippet of its content). You cannot add, remove, \
+reorder, or rewrite these children — only decide how this container arranges the ones already there.
+
+Important, a real failure mode to actively avoid: "align": "stretch" combined with a tall "min_height" makes \
+every child fill the container's FULL height. If "has_background_image" is true, that means stretched children \
+will completely cover the background photo — only choose "stretch" when full coverage is clearly appropriate \
+(e.g. every child already has its own background_color and is meant to fill the space). When children are \
+meant to overlay only part of a tall background-image container, prefer "start" or "center" instead.
+
+You may only choose values for: layout, gap, padding, margin, align, justify, min_height. If the actual ask \
+genuinely needs restructuring the children themselves (e.g. "make these two columns match each other's height \
+without covering the background photo" usually needs an extra nested row around just those two children, which \
+these fields alone cannot express) — say so plainly and honestly in "reasoning" instead of picking a value that \
+only looks like it addressed it.
+
+Respond with ONLY a single JSON object, no markdown fences, no commentary:
+{"layout": "row", "gap": "md", "padding": "none", "margin": "none", "align": "stretch", "justify": null, \
+"min_height": null, "reasoning": "<1-3 sentences explaining your choice, or explaining what these fields alone \
+can't fix>"}
+
+Always include every field, even ones you're leaving unchanged — echo the current value back for anything you \
+don't want to change."""
+
+
+@router.post("/agent/pages/ai-adjust-layout", response_model=AiAdjustLayoutResponse)
+async def ai_adjust_layout(req: AiAdjustLayoutRequest, db: Session = Depends(get_db)) -> AiAdjustLayoutResponse:
+    """See the module comment just above for the full design."""
+    manifest = {
+        "container": req.container.model_dump(),
+        "children": [c.model_dump() for c in req.children],
+    }
+    context_parts = [
+        f"Owner's instruction:\n{req.instruction.strip()}"
+        if req.instruction.strip()
+        else "Owner's instruction: (none given — use your own judgment for a generally more coherent layout)",
+        f"Container + children (JSON):\n{json.dumps(manifest, ensure_ascii=False)}",
+    ]
+    messages = [{"role": "user", "content": "\n\n".join(context_parts)}]
+
+    try:
+        provider = resolve_chat_provider(db)
+        raw_content = await provider.chat(messages, system=_AI_ADJUST_LAYOUT_SYSTEM_PROMPT, json_mode=True)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+
+    try:
+        parsed = parse_lenient_json(raw_content)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    try:
+        return AiAdjustLayoutResponse.model_validate(parsed)
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Model output didn't match the expected shape ({e}). Raw output: {raw_content[:2000]}",
+        )
 
 
 class IntegrationStatus(BaseModel):

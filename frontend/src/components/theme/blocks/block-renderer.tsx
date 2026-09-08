@@ -20,11 +20,33 @@ import type { Block, BlockWidth } from "@/lib/theme";
 // children size differently (see BlockWidth's doc comment). "auto" keeps
 // this schema's original equal-split behavior unchanged, so a row with
 // no `width` set on any child renders exactly as it did before this
-// field existed. Fixed-ratio items get `shrink-0 grow-0` so they hold
-// their assigned share exactly, rather than flex's default grow/shrink
-// stretching or compressing them; `basis-full` below `sm` matches the
-// row's own `flex-col sm:flex-row` breakpoint (mobile always stacks
-// full-width regardless of `width`).
+// field existed. Fixed-ratio items get `grow-0` so they never grow past
+// their assigned share; `basis-full` below `sm` matches the row's own
+// `flex-col sm:flex-row` breakpoint (mobile always stacks full-width
+// regardless of `width`).
+//
+// **`shrink-0` removed, 2026-09-08 — a real overflow bug, caught by the
+// user from a real screenshot, not hypothetical.** Two `width: "1/2"`
+// children sum to exactly 100% of the row in *published/preview*
+// rendering, so `shrink-0` never visibly did anything there (nothing to
+// shrink away — 50%+50% already fits with zero overflow). But in *edit
+// mode*, `BlockRenderer` inserts extra `InsertGap` "+"s as additional
+// flex items in that SAME row (before/between/after the real children,
+// itself `shrink-0` too) — now the row's total requested width is
+// 50%+50%+(3 gaps' own width), genuinely over 100%, and with every item
+// in the row refusing to shrink, the excess had nowhere to go but
+// overflow past the row's own right edge (exactly the bug: a `width:
+// "1/2"` child visibly spilling outside its full-bleed row's background).
+// Dropping `shrink-0` (keeping `grow-0`) fixes this with no effect on
+// the published/preview case — flex-shrink only ever activates when
+// content genuinely exceeds the container, which never happens there
+// (min-w-0 is what actually lets shrinking go below the content's own
+// intrinsic width once it needs to). The one accepted trade-off: in edit
+// mode specifically, an exact 50/50 split can now compress a little
+// (e.g. 1/2 minus roughly half the gaps' combined width each) to make
+// room for the insert-gap "+"s — a temporary, edit-only visual tweak,
+// never reflected in what's actually saved/published, and a strictly
+// better outcome than content spilling outside its own container.
 //
 // Lives here, not in container-block.tsx, since 2026-08-06 — this used
 // to be passed down as a function prop (`itemClassName`), which broke
@@ -35,11 +57,11 @@ import type { Block, BlockWidth } from "@/lib/theme";
 // serializable; the actual class lookup happens entirely on this side.
 const WIDTH_CLASS: Record<BlockWidth, string> = {
   auto: "basis-full sm:flex-1 min-w-0",
-  "1/4": "basis-full sm:basis-1/4 sm:shrink-0 sm:grow-0 min-w-0",
-  "1/3": "basis-full sm:basis-1/3 sm:shrink-0 sm:grow-0 min-w-0",
-  "1/2": "basis-full sm:basis-1/2 sm:shrink-0 sm:grow-0 min-w-0",
-  "2/3": "basis-full sm:basis-2/3 sm:shrink-0 sm:grow-0 min-w-0",
-  "3/4": "basis-full sm:basis-3/4 sm:shrink-0 sm:grow-0 min-w-0",
+  "1/4": "basis-full sm:basis-1/4 sm:grow-0 min-w-0",
+  "1/3": "basis-full sm:basis-1/3 sm:grow-0 min-w-0",
+  "1/2": "basis-full sm:basis-1/2 sm:grow-0 min-w-0",
+  "2/3": "basis-full sm:basis-2/3 sm:grow-0 min-w-0",
+  "3/4": "basis-full sm:basis-3/4 sm:grow-0 min-w-0",
   full: "basis-full min-w-0",
 };
 
