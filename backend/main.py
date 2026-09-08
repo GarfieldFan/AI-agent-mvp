@@ -36,6 +36,7 @@ from apis.payments import public_router as payments_public_router
 from apis.products import admin_router as products_admin_router
 from apis.products import public_router as products_public_router
 from apis.scheduled_tasks import router as scheduled_tasks_router
+from apis.seo_audit import admin_router as seo_audit_router
 from apis.users import router as users_router
 from chat_attachments import CHAT_UPLOAD_DIR
 from rate_limit import RateLimitMiddleware
@@ -105,6 +106,7 @@ app.include_router(oauth_public_router, prefix="/api")
 app.include_router(my_account_router, prefix="/api")
 app.include_router(scheduled_tasks_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
+app.include_router(seo_audit_router, prefix="/api")
 
 # Serves apis/media.py's uploaded images back out — publicly readable by
 # filename (no RBAC), same as ComfyUI's own /view endpoint for generated

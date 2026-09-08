@@ -2020,6 +2020,120 @@ well and asked me to design and build the whole thing.
   data" posture rather than building a repeatable-field-row editor for
   what's realistically a handful of lines.
 
+### GEO push part 2 — product schema, page metadata, llms.txt, `check_seo_schema` (2026-09-08)
+
+Added 2026-09-08 off a user-supplied planning document
+(`AI-agent-mvp_GEO实施方案.pdf`) auditing this app against a standard
+GEO/AI-discoverability checklist. Most of the plan's Layer 1
+(crawlability: SSR, robots.txt, sitemap) was already done by the
+2026-08-21 work above; this closes the concrete gaps a fork-based audit
+found: no per-product schema.org markup, no per-page metadata beyond the
+site-wide default, no llms.txt, and no automated way to check any of it.
+Review/NAP-consistency-across-pages from the plan was explicitly NOT
+built the way the plan describes — see `check_seo_schema`'s own
+docstring below for why that check doesn't apply to this app's
+architecture.
+
+- **`lib/products.ts`'s `buildProductJsonLd(product, siteUrl)`** — a
+  schema.org `Product`+`Offer` JSON-LD block, mirrors
+  `buildLocalBusinessJsonLd`'s pure-formatting/no-null-padding posture
+  exactly. `/products/[id]/page.tsx` now injects it directly (a second
+  `<script type="application/ld+json">` alongside the site-wide
+  `WebSite`/`LocalBusiness` graph from `SiteJsonLd`, not a replacement of
+  it) and gained a real `generateMetadata` (title/description/OG) — it
+  used to inherit only the generic site-wide title. `priceCurrency` is
+  hardcoded to `"USD"` — there's no currency column anywhere in this app
+  (`Product.price` is a bare `Numeric`; the only other currency mention
+  is `payments.py`'s own hardcoded Stripe `"usd"`), so this matches that
+  rather than inventing a currency feature.
+- **`lib/theme.ts`'s `extractPageSummary(sections)`** — best-effort
+  title/description extraction from an already-saved page's *top-level*
+  sections (Hero/FeatureGrid/TextBlock/CtaBanner/BadgeList's own
+  heading/body-ish fields; deliberately does NOT recurse into
+  `ContainerBlock.children` — a page built entirely from generic Block
+  primitives falls back to the site-wide default rather than guessing).
+  Used by `/p/[slug]/page.tsx`'s new `generateMetadata` (was static
+  inheritance only) and `/about/page.tsx`'s `generateMetadata` (replaced
+  a hardcoded `export const metadata` with this app's own portfolio
+  copy, now reflecting the owner's actual saved "About" content once
+  customized — falls back to the same original copy when unsaved).
+- **`app/llms.txt/route.ts`** — the 2024+ llms.txt convention (a
+  Markdown "what is this site, what's worth reading" doc for AI
+  systems specifically, not yet universally read but essentially free
+  to add). A `route.ts` Route Handler, not a Metadata Route file (no
+  `llms.ts` convention exists the way there is for robots.txt/
+  sitemap.xml) — built dynamically from `getPublicBusinessProfile()` +
+  `listPublicPages()`, same "reflects live config, zero maintenance"
+  posture as `robots.ts`/`sitemap.ts`, never a static file.
+- **`backend/apis/seo_audit.py` + owner-agent's `check_seo_schema` tool**
+  (owner-agent now 21 tools) — the plan's Layer 4 "productize the
+  checks" idea, built as a genuinely read-only diagnostic: 6 checks
+  (business-profile/NAP completeness, robots.txt AI-crawler allowlist,
+  llms.txt reachability, sitemap.xml freshness + URL count, homepage
+  JSON-LD presence, and a **sampled live fetch** of one real product
+  page checking for its `Product` JSON-LD block — not a static
+  code-path assumption), each independently try/excepted so one
+  unreachable check never hides the others' results. Never writes
+  anything — every real fix here (e.g. filling in a missing phone
+  number) is a plain owner edit in `BusinessProfilePanel`, not something
+  automatable, so there's no propose-then-apply flow needed, just a
+  report. **Deliberately does NOT implement the plan's "NAP consistency
+  across pages" check as originally described** — that check exists to
+  catch a hand-authored multi-page site where the phone number typed on
+  one page drifts from another. This app has no such risk structurally:
+  `AppSettings`'s single `business_*` row is the one source of NAP data
+  read by every page's JSON-LD/metadata/llms.txt alike, so cross-page
+  consistency is already guaranteed by the architecture — the
+  `business_profile` check reports completeness instead, and says so
+  plainly in its own `detail` text so an owner (or the model reading it)
+  doesn't mistake "no consistency check" for an oversight.
+  - **New `FRONTEND_INTERNAL_URL` env var** (`docker-compose.yml`,
+    default `http://frontend:3000`) — this is the first backend-
+    initiated call INTO the frontend service (every other cross-service
+    call in this app goes the other direction). The existing
+    `FRONTEND_PUBLIC_URL` (used by Stripe/OAuth redirects) is the wrong
+    variable for this: in local dev it resolves to `http://localhost:
+    3000`, which from *inside* the backend container means the backend
+    container itself, not the frontend one — the identical
+    internal-vs-public split `COMFYUI_URL`/`COMFYUI_PUBLIC_URL` already
+    established. Hit for real during verification (the first live run
+    of `check_seo_schema` returned "connection failed" on every network
+    check until this var was added and the backend container recreated).
+  - Verified end-to-end against the real running stack (Docker Desktop
+    was not running at session start; started it and brought the full
+    `docker compose up -d` stack up specifically to verify this rather
+    than relying on static checks alone): `GET /api/agent/seo/check`
+    (as `owner@example.com`) correctly reported robots.txt/llms.txt/
+    sitemap.xml all `ok`, homepage JSON-LD `warning` (no business
+    profile configured on this dev instance — correctly detected, not a
+    false pass), and — the real proof the frontend half works — the
+    sampled product check `ok` against a live `/products/13`. Confirmed
+    directly via `curl` against the frontend container too: `/llms.txt`
+    renders real Markdown listing the actual saved pages; `/products/13`
+    serves `<title>long black | AI MVP</title>`, a real meta description,
+    and a real `Product`/`Offer` JSON-LD block (`price: "3.00"`,
+    `availability` correctly reflecting that product's actual
+    `available` flag); `/about` (which has real saved content on this
+    dev instance) serves its own extracted title/description rather than
+    the site default; `/p/product-list` (a page built entirely from a
+    `ProductListBlock`, no extractable heading text) correctly falls back
+    to the site-wide default title/description rather than guessing.
+    `tsc`/`eslint` clean on every changed frontend file; `python -m
+    py_compile` clean on every changed backend/owner-agent file.
+  - **The owner-agent `/run` loop itself was verified live too, one
+    session later, once the user started their local llama.cpp
+    server** (the first attempt this same session 502'd — the
+    configured local model wasn't running yet, unrelated to this
+    change, same class of gap this file's "Known gotchas" already
+    documents for an unreachable custom endpoint). Real command: "Run a
+    GEO/SEO health check on the site and summarize the results." — the
+    model correctly selected `check_seo_schema` on its own (no other
+    tool tried first), got a real result back, and its final answer
+    correctly grouped the two genuine warnings (missing business
+    profile; homepage JSON-LD lacking a LocalBusiness entity) as one
+    root cause with one fix, while accurately reporting the four
+    passing checks — not just echoing the raw report back verbatim.
+
 ### Owner-configurable public-chat system prompt (`backend/apis/chat_settings.py`)
 
 Added 2026-08-21, same day as the GEO push above, off a direct user
@@ -3282,7 +3396,7 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 20 tools (`generate_poster`,
+  envelope: either call one of 21 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
   `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
@@ -3290,10 +3404,11 @@ this is the one place the model itself decides which action(s) to take.
   `manage_review_queue`, `detect_business_type`, `propose_intent_schema`,
   `list_products`, `propose_products`, `set_order_status_options`,
   `ingest_documents_from_url`, `list_scheduled_tasks`,
-  `manage_scheduled_task` — each
+  `manage_scheduled_task`, `check_seo_schema` (2026-09-08, see "GEO push
+  part 2" above) — each
   a thin HTTP call onto an already-real `backend/apis/agent.py`/
   `apis/intent_schemas.py`/`apis/products.py`/`apis/documents.py`/
-  `apis/scheduled_tasks.py` endpoint) or give a final
+  `apis/scheduled_tasks.py`/`apis/seo_audit.py` endpoint) or give a final
   answer. Up to 6 turns, a 300s overall budget. The full step trace
   (tool, args, result, ok/error) is returned to the frontend and
   rendered, not just the final answer.

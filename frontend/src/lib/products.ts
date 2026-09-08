@@ -166,6 +166,39 @@ export function listPublicProductFields() {
   return apiFetch<ProductFieldDefinition[]>("/api/product-fields");
 }
 
+/** Builds a schema.org Product+Offer JSON-LD object for one product page
+ * (2026-09-08, GEO push part 2 — see the root AGENTS.md's GEO/business-
+ * profile section) — mirrors `lib/business-profile.ts`'s
+ * `buildLocalBusinessJsonLd` exactly: pure formatting, no network I/O,
+ * so it's usable from a Server Component. Every optional field
+ * (description/image) is omitted rather than emitted empty, same
+ * "smaller, honest block" posture as that function.
+ *
+ * `priceCurrency` has no real data source anywhere in this app —
+ * `Product.price` is a bare `Numeric`, no currency column exists (the
+ * only other place a currency shows up at all is `payments.py`'s
+ * hardcoded Stripe `"usd"`). Hardcoded to `"USD"` here to match that,
+ * not a guess — a real multi-currency feature is out of scope for this
+ * pass. */
+export function buildProductJsonLd(product: Product, siteUrl: string): Record<string, unknown> {
+  const url = `${siteUrl}/products/${product.id}`;
+  return {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    name: product.name,
+    url,
+    ...(product.description ? { description: product.description } : {}),
+    ...(product.image_url ? { image: product.image_url } : {}),
+    offers: {
+      "@type": "Offer",
+      url,
+      price: product.price.toFixed(2),
+      priceCurrency: "USD",
+      availability: product.available ? "https://schema.org/InStock" : "https://schema.org/OutOfStock",
+    },
+  };
+}
+
 export function createProduct(input: ProductInput) {
   return apiFetch<Product>("/api/agent/products", { method: "POST", body: input });
 }

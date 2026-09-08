@@ -40,6 +40,15 @@ services:
       # renders that redirect itself, it just needs to tell Stripe where
       # to send the visitor once they've paid or cancelled.
       - FRONTEND_PUBLIC_URL=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
+      # Reachable *from inside this container* (apis/seo_audit.py's
+      # check_seo_schema — the first backend-initiated call INTO the
+      # frontend service; every other cross-service call in this app goes
+      # the other direction, frontend calling backend via INTERNAL_API_URL
+      # below). Docker DNS, not FRONTEND_PUBLIC_URL — in local dev that
+      # resolves to "localhost", which from inside this container means
+      # this container itself, not the frontend one. Same
+      # internal-vs-public split as COMFYUI_URL/COMFYUI_PUBLIC_URL above.
+      - FRONTEND_INTERNAL_URL=http://frontend:3000
       # RAG document uploads (backend/apis/documents.py). Lives under the
       # existing ./backend bind mount (see volumes: below) — no separate
       # named volume needed, and backend/.dockerignore keeps uploaded

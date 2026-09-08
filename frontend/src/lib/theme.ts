@@ -431,6 +431,47 @@ export type PageSection =
   | BadgeListSection
   | ContainerBlock;
 
+function textOf(value: string | RichText | undefined): string | undefined {
+  if (!value) return undefined;
+  return typeof value === "string" ? value : value.content;
+}
+
+/** Best-effort title/description extraction from an already-saved page's
+ * sections (2026-09-08, GEO push part 2) — used for `/p/[slug]` and
+ * `/about`'s own `generateMetadata`, which otherwise only ever inherited
+ * the site-wide business-name/description from the root layout, never
+ * naming the specific page. Scans top-level sections in order for the
+ * first heading-ish and first body-ish text; deliberately does not
+ * recurse into `ContainerBlock.children` — a page's own hand-authored
+ * or vision-generated top-level sections are already the closest thing
+ * this schema has to a "what is this page about" summary, and the
+ * generic Block primitives have no dedicated heading/body distinction
+ * to key off of. Returns `{}` (both fields undefined) when nothing
+ * usable is found — callers fall back to the site-wide default. */
+export function extractPageSummary(sections: PageSection[]): { title?: string; description?: string } {
+  let title: string | undefined;
+  let description: string | undefined;
+
+  for (const section of sections) {
+    if (!title) {
+      if (section.type === "hero") title = textOf(section.headline);
+      else if (section.type === "feature-grid") title = textOf(section.heading);
+      else if (section.type === "text-block") title = textOf(section.heading);
+      else if (section.type === "cta-banner") title = textOf(section.heading);
+      else if (section.type === "badge-list") title = textOf(section.heading);
+    }
+    if (!description) {
+      if (section.type === "hero") description = textOf(section.subheadline);
+      else if (section.type === "feature-grid") description = textOf(section.body) ?? textOf(section.subheading);
+      else if (section.type === "text-block") description = textOf(section.body);
+      else if (section.type === "cta-banner") description = textOf(section.body);
+    }
+    if (title && description) break;
+  }
+
+  return { title, description };
+}
+
 export type GeneratedPage = {
   sections: PageSection[];
   /** Hex color (e.g. "#c9a227"), the dominant/brand color the vision LLM

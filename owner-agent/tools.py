@@ -362,6 +362,22 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="POST",
         path="/api/agent/scheduled-tasks",
     ),
+    "check_seo_schema": ToolSpec(
+        name="check_seo_schema",
+        description=(
+            "Runs a read-only GEO/AI-discoverability health check against the live site: business "
+            "profile (NAP) completeness, whether robots.txt allows the major AI crawlers (GPTBot, "
+            "ClaudeBot, etc.), whether llms.txt and sitemap.xml are reachable, whether the homepage "
+            "carries LocalBusiness structured data, and whether a sampled product page carries Product "
+            'structured data. Returns {"items": [{"check", "label", "status": "ok"|"warning"|"error", '
+            '"detail"}, ...]}. Diagnostic only — never changes anything; report warnings/errors to the '
+            "owner in plain language (e.g. missing phone number in the business profile) rather than "
+            "trying to fix them yourself, since every real fix here is a manual owner edit (dashboard "
+            "settings), not something another tool can safely automate. No arguments."
+        ),
+        method="GET",
+        path="/api/agent/seo/check",
+    ),
 }
 
 
