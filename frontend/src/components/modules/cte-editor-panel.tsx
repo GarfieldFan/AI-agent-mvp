@@ -486,12 +486,34 @@ export function CteEditorPanel() {
                         </button>
                       </div>
                     ) : null}
-                    <SectionRenderer
-                      sections={[section]}
-                      accentColor={accentColor}
-                      startIndex={index}
-                      mergeContainerBadge
-                    />
+                    {/* pt-10 wrapper, container sections only, edit mode only
+                       (2026-09-08 fix, a real collision the user caught from
+                       a screenshot) — this section's own move/delete/edit
+                       toolbar just above (`top-2 left-2`, absolute) and a
+                       `type: "container"` section's own first child's
+                       `ArrayItemToolbar` (also `top-2 left-2` — see
+                       block-renderer.tsx) are each anchored to the top-left
+                       of a DIFFERENT box, but when the container itself has
+                       no padding/gap at its top edge (a common case — a
+                       full-bleed row/banner), those two boxes' top-left
+                       corners land on almost the same screen position, and
+                       the two toolbars visually merge into one crowded
+                       stack. Reserving 2.5rem of clearance here (mirrors
+                       BlockRenderer's own `isContainer && "pt-10"`, one
+                       level down, for the analogous InsertGap-vs-
+                       ArrayItemToolbar collision) pushes the section's own
+                       rendered box down far enough that its first child's
+                       toolbar renders below this section's own — cosmetic,
+                       edit-mode-only spacing, never touches the actual saved
+                       content or its published rendering. */}
+                    <div className={editModeOn && section.type === "container" ? "pt-10" : undefined}>
+                      <SectionRenderer
+                        sections={[section]}
+                        accentColor={accentColor}
+                        startIndex={index}
+                        mergeContainerBadge
+                      />
+                    </div>
                   </div>
                   {editModeOn ? <InsertGap onClick={() => setInsertAt(index + 1)} /> : null}
                 </React.Fragment>
