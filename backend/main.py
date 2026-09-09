@@ -40,6 +40,8 @@ from apis.products import admin_router as products_admin_router
 from apis.products import public_router as products_public_router
 from apis.scheduled_tasks import router as scheduled_tasks_router
 from apis.seo_audit import admin_router as seo_audit_router
+from apis.turnstile_settings import admin_router as turnstile_admin_router
+from apis.turnstile_settings import public_router as turnstile_public_router
 from apis.users import router as users_router
 from chat_attachments import CHAT_UPLOAD_DIR
 from error_alerts import unhandled_exception_handler
@@ -126,6 +128,8 @@ app.include_router(users_router, prefix="/api")
 app.include_router(seo_audit_router, prefix="/api")
 app.include_router(contact_router, prefix="/api")
 app.include_router(error_log_router, prefix="/api")
+app.include_router(turnstile_admin_router, prefix="/api")
+app.include_router(turnstile_public_router, prefix="/api")
 app.include_router(ollama_admin_router, prefix="/api")
 
 # Serves apis/media.py's uploaded images back out — publicly readable by

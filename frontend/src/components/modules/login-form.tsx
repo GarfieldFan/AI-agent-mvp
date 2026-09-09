@@ -9,9 +9,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
+import { TurnstileWidget } from "@/components/common/turnstile-widget";
 import { apiFetch, ApiError } from "@/lib/api";
 import { setAuth } from "@/lib/auth";
 import { getOAuthProviders, googleOAuthStartUrl, facebookOAuthStartUrl, xOAuthStartUrl, type OAuthProviders } from "@/lib/oauth";
+import { getTurnstileConfig } from "@/lib/turnstile";
 
 type MeResponse = { email: string; role: "owner" | "admin" | "user" };
 
@@ -34,11 +36,20 @@ export function LoginForm() {
   const [status, setStatus] = React.useState<"idle" | "loading" | "error">("idle");
   const [error, setError] = React.useState<string | null>(null);
   const [oauthProviders, setOauthProviders] = React.useState<OAuthProviders>({ google: false, facebook: false, x: false });
+  // Bot verification (2026-09-10) — a brute-force-guessing script hitting
+  // /api/auth/login gets stopped here, on top of the existing per-IP
+  // rate limit (rate_limit.py). Only rendered once the owner has turned
+  // it on.
+  const [turnstileSiteKey, setTurnstileSiteKey] = React.useState<string | null>(null);
+  const [turnstileToken, setTurnstileToken] = React.useState("");
 
   React.useEffect(() => {
     getOAuthProviders()
       .then(setOauthProviders)
       .catch(() => setOauthProviders({ google: false, facebook: false, x: false }));
+    getTurnstileConfig()
+      .then((config) => setTurnstileSiteKey(config.enabled ? config.site_key : null))
+      .catch(() => setTurnstileSiteKey(null));
   }, []);
 
   // Picks up the redirect back from any provider's own consent screen
@@ -81,7 +92,7 @@ export function LoginForm() {
     try {
       const response = await apiFetch<LoginResponse>("/api/auth/login", {
         method: "POST",
-        body: { email, password },
+        body: { email, password, turnstile_token: turnstileToken },
       });
       setAuth({ token: response.access_token, email: response.email, role: response.role });
       router.push("/dashboard");
@@ -117,7 +128,13 @@ export function LoginForm() {
           />
         </div>
 
-        <Button type="submit" disabled={status === "loading"} className="w-full">
+        {turnstileSiteKey ? <TurnstileWidget siteKey={turnstileSiteKey} onToken={setTurnstileToken} /> : null}
+
+        <Button
+          type="submit"
+          disabled={status === "loading" || (!!turnstileSiteKey && !turnstileToken)}
+          className="w-full"
+        >
           <LogIn className="size-4" />
           Log in
         </Button>

@@ -412,16 +412,15 @@ class AppSettings(Base):
     # their own fixed prompts this field never touches. See
     # `_resolve_system_prompt`'s own docstring for the full reasoning.
     chat_system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Intent-triage prompt (2026-09-09, apis/chat_settings.py) — config-
-    # layer only for now, deliberately NOT wired into /api/chat's actual
-    # runtime yet (see that router's own docstring). Meant to eventually
-    # replace chat-panel.tsx's hardcoded 3-step category/tags/channel
-    # wizard with a real LLM decision about whether/what structured
-    # question to ask a visitor before replying. Same null-means-default
-    # convention as chat_system_prompt; drafted via POST
-    # /agent/chat-settings/suggest-intent-prompt from ingested company
-    # documents, owner reviews/edits before saving, same propose-then-
-    # owner-applies posture as business_profile.py's suggest endpoint.
+    # Intent-triage prompt (2026-09-09, apis/chat.py's _intent_triage_call
+    # via _resolve_intent_prompt) — drives a real classification call on a
+    # conversation's first turn deciding whether to ask a structured
+    # clarifying question, replacing chat-panel.tsx's old hardcoded 3-step
+    # category/tags/channel wizard. Same null-means-default convention as
+    # chat_system_prompt; drafted via POST /agent/chat-settings/suggest-
+    # intent-prompt from ingested company documents, owner reviews/edits
+    # before saving, same propose-then-owner-applies posture as
+    # business_profile.py's suggest endpoint.
     chat_intent_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Social login for the public `user` tier only (2026-08-22, see
     # apis/oauth.py) — confirmed directly with the user: admin/owner stay
@@ -454,6 +453,22 @@ class AppSettings(Base):
     # exist and be ready.
     x_oauth_client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     x_oauth_client_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Bot verification gate (2026-09-10, see backend/turnstile.py) — same
+    # "swappable, off by default" posture as payment/email/map above,
+    # narrowed to one provider (Cloudflare Turnstile) since there's no
+    # equivalent "test" no-op needed here: disabled (the default) already
+    # IS the zero-friction no-op state, unlike payment/email where a
+    # provider is always selected (test-or-real) because something has to
+    # handle every checkout/send call. Gates only WRITE endpoints
+    # (/api/chat's first turn, /api/contact, /api/auth/login) — deliberately
+    # never a page-view gate, so it can never affect SEO/GEO crawling (see
+    # the root AGENTS.md's "Bot verification" section for the full
+    # reasoning). `turnstile_site_key` is safe to echo back (embedded in
+    # browser-side JS on every Turnstile integration, same posture as
+    # Stripe's own publishable key); `turnstile_secret_key` is write-only.
+    turnstile_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    turnstile_site_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    turnstile_secret_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()

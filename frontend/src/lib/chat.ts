@@ -78,6 +78,7 @@ export async function sendChatMessage(
   message: string,
   history: ChatApiTurn[] = [],
   attachmentUrl?: string,
+  turnstileToken?: string,
 ): Promise<{
   reply: string;
   sources: RagSource[];
@@ -87,7 +88,16 @@ export async function sendChatMessage(
 }> {
   const response = await apiFetch<ChatApiResponse>("/api/chat", {
     method: "POST",
-    body: { message, history, session_id: getChatSessionId(), attachment_url: attachmentUrl ?? null },
+    body: {
+      message,
+      history,
+      session_id: getChatSessionId(),
+      attachment_url: attachmentUrl ?? null,
+      // Bot verification (2026-09-10) — only ever checked server-side on
+      // a conversation's first turn (empty history); harmless to include
+      // on every call, see backend/apis/chat.py's own gate.
+      turnstile_token: turnstileToken ?? null,
+    },
   });
   return {
     reply: response.reply,

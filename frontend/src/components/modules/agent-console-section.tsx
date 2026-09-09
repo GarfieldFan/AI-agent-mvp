@@ -31,6 +31,7 @@ import { ReviewQueuePanel } from "@/components/modules/review-queue-panel";
 import { ScheduledTasksPanel } from "@/components/modules/scheduled-tasks-panel";
 import { SetupStatusBanner } from "@/components/modules/setup-status-banner";
 import { UserManagementPanel } from "@/components/modules/user-management-panel";
+import { TurnstileSettingsPanel } from "@/components/modules/turnstile-settings-panel";
 import { ApiError, apiFetch } from "@/lib/api";
 import { clearAuth, useAuth } from "@/lib/auth";
 
@@ -199,6 +200,13 @@ export function AgentConsoleSection() {
             <AccordionPanel>
               <UserManagementPanel />
               <OAuthSettingsPanel />
+            </AccordionPanel>
+          </AccordionItem>
+
+          <AccordionItem value="security">
+            <AccordionTrigger>Security</AccordionTrigger>
+            <AccordionPanel>
+              <TurnstileSettingsPanel />
             </AccordionPanel>
           </AccordionItem>
 

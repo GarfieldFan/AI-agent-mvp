@@ -76,6 +76,7 @@ ai-employee/
 │   ├── cart.py                     shared Product search/Order mutation logic (apis/chat.py + apis/products.py both use it) — see "Product catalog + ordering" below
 │   ├── resource_broker.py           local LLM/ComfyUI memory coordination — see "Agent console capabilities" below
 │   ├── rate_limit.py               per-IP rate limiting for the fully public routes — see "Rate limiting" below
+│   ├── turnstile.py                 Cloudflare Turnstile bot verification — see "Bot verification" below
 │   ├── providers/                AI provider abstraction (Ollama/OpenAI/Anthropic/Gemini) — see "AI provider is swappable" below
 │   ├── alembic/                 migrations — env.py wired to DATABASE_URL + models' metadata
 │   └── apis/
@@ -4103,6 +4104,19 @@ a mock.
   both directions, and that the general-knowledge/genuinely-in-scope
   regression checks still hold after all of the above.
 
+- `test_turnstile.py` (2026-09-10) — fast, hits Cloudflare's REAL
+  siteverify API using Cloudflare's own officially-documented dummy test
+  secrets (no real account needed), plus one monkeypatched network-
+  failure case for the fail-open path. See "Bot verification" below.
+- `test_injection_defense.py` (2026-09-10) — fast, deterministic, no LLM
+  calls (same `_apply_lead_capture`-fed-a-parsed-dict technique as
+  `test_lead_capture.py`). Locks in the code-level guardrails that hold
+  even against a successful prompt injection's fabricated output — see
+  "Prompt-injection defense" below.
+- `test_intent_triage.py` (2026-09-10) — fast, deterministic. Locks in
+  `_build_triage_control`'s degrade-to-`"text"` safety net for malformed/
+  missing model output.
+
 Not yet covered: frontend tests (none exist), the product/order pipeline,
 owner-agent's tool loop, CTE. Add to this suite as new behavior is worth
 locking in, rather than only ever re-verifying by hand.
@@ -4151,6 +4165,146 @@ every time a new one is added.
   comes back with no CORS headers at all and the frontend sees an opaque
   CORS failure instead of a readable 429 (see `HISTORY.md`'s 2026-08-08
   entry for how this was caught and verified).
+
+## Bot verification (`backend/turnstile.py`, `backend/apis/turnstile_settings.py`)
+
+Added 2026-09-10, on the user's own direct ask: real bot verification,
+with an owner-facing on/off switch, that must NOT affect SEO/GEO.
+Scope confirmed via `AskUserQuestion`: Cloudflare Turnstile (free,
+mostly-invisible to a real visitor, no CAPTCHA-image interaction),
+gating exactly three fully-public WRITE endpoints — `/api/chat` (first
+turn only), `/api/contact`, `/api/auth/login` — never a page view.
+
+- **Why this structurally can't affect SEO/GEO — not just a hopeful
+  claim, the actual mechanism**: every crawler this app cares about
+  (`robots.ts`'s named AI crawlers, `llms.txt`, `sitemap.ts`) only ever
+  issues GET requests against page/asset routes. There is no code path
+  anywhere that runs a Turnstile check against a GET — `is_turnstile_enabled`
+  is only ever consulted inside `chat()`/`submit_contact_form`/`login`,
+  three POST handlers a crawler never calls. This is the whole reason the
+  scope was deliberately narrowed to those three endpoints rather than a
+  site-wide interstitial or middleware — a broader gate would have
+  created exactly the SEO/GEO risk the user explicitly ruled out.
+- **No `TestTurnstileProvider`, unlike every other gate in this app**
+  (Payment/Notification/Map) — disabled (`AppSettings.turnstile_enabled`,
+  default `False`) already IS the zero-friction no-op state those other
+  gates' own "test" mode exists to provide, so a separate always-passing
+  provider class would just be a second name for the same thing.
+  `verify_turnstile_token(secret, token, remote_ip)` is the one function
+  every gated endpoint calls — a no-op nothing-to-check case is instead
+  handled by each caller checking `is_turnstile_enabled(row)` first
+  (requires the enabled flag AND both keys actually saved — flipping the
+  switch on with no keys yet would otherwise silently reject every real
+  visitor with no way to ever pass).
+- **Fails CLOSED on a missing/invalid token, fails OPEN on a genuine
+  network error talking to Cloudflare** — a real, deliberate asymmetry:
+  an attacker skipping the widget entirely must not be waved through
+  just because "the check didn't run," but a Cloudflare outage blocking
+  every real visitor's chat/contact/login attempt would be a worse
+  outcome than briefly losing this one layer of defense, the same
+  "never let an optional safety net become a hard dependency" posture
+  `resource_broker.py`'s own functions already hold themselves to.
+- **`/api/chat`'s gate fires only on a conversation's genuinely first
+  turn** (`not req.history`, the identical gate `_intent_triage_call`
+  already uses) — checked FIRST, before any other work in `chat()`, so a
+  rejected request never reaches session logging/RAG/the provider call
+  at all. The frontend mirrors this with a plain "has one turn
+  succeeded yet" flag (`chat-panel.tsx`'s `firstMessageSent`), not
+  per-turn state — once solved, a visitor is never asked again for the
+  rest of that conversation.
+- **Owner-facing settings** (`GET`/`PUT /agent/turnstile-settings`,
+  `TurnstileSettingsPanel`, new "Security" accordion group) mirror
+  `apis/maps.py`'s shape exactly: `turnstile_secret_key` is write-only
+  (never echoed back); `turnstile_site_key` is safe to echo and is NOT a
+  secret — Cloudflare's own site key is designed to be embedded directly
+  in browser-side JS, the same posture as Stripe's own publishable key.
+  **`GET /api/turnstile-config`** is the public, no-auth, page-view-time
+  lookup every gated form/panel calls once on mount to decide whether to
+  even render the widget — itself never gated (see the SEO/GEO reasoning
+  above), and reuses the exact same `is_turnstile_enabled` check the real
+  enforcement paths use, so the two can never disagree about whether the
+  feature is actually live.
+- **`TurnstileWidget`** (frontend, `components/common/turnstile-widget.tsx`)
+  — a thin wrapper loading Cloudflare's own script via `next/script`
+  (`strategy="lazyOnload"`) and calling `window.turnstile.render(...)`
+  once it's available (checked synchronously on mount for the "already
+  loaded by another widget on this page" case, falling back to the
+  script's own `onLoad` for the first widget). Never loaded at all when
+  the feature is off — a site with it disabled pays zero cost, no script
+  tag, no widget div, nothing.
+- **Verified live end-to-end against Cloudflare's REAL production
+  siteverify API**, not mocked — using Cloudflare's own officially
+  documented dummy test credentials meant for exactly this
+  (`1x0000000000000000000000000000000AA` always passes,
+  `2x0000000000000000000000000000000AA` always fails, no real
+  Cloudflare account needed): enabling the feature with the always-pass
+  secret correctly let `/api/chat` (first turn)/`/api/contact`/
+  `/api/auth/login` all through with a token and correctly 428'd all
+  three with no token; the always-fail secret correctly 428'd even WITH
+  a token; a chat conversation's SECOND turn (non-empty history)
+  correctly required no token at all; disabling the feature afterward
+  restored the exact original zero-friction behavior. `pytest`
+  (`backend/tests/test_turnstile.py`, 4 tests including a genuine live
+  Cloudflare call and a monkeypatched network-failure case for the
+  fail-open path)/`tsc`/`eslint`/a real production build all clean. Test
+  settings/sessions/CRM entries cleaned up after.
+
+### Prompt-injection defense
+
+Added the same session, off the user's own direct ask ("防AI攻击" —
+defend against AI-driven attacks) alongside bot verification above. Real
+attack surface, given `/api/chat`'s own structural limits (no tools, no
+filesystem — see the root AGENTS.md's RBAC architecture note): a
+visitor's message, a retrieved RAG excerpt, or an uploaded attachment's
+extracted text all reach the model as plain text it could mistake for
+new instructions. Since there's no tool access to escalate to, the worst
+realistic outcome was always a manipulated reply or a bogus
+CrmEntry/Order via the classification calls — this closes both halves.
+
+- **`apis/chat.py`'s `_INJECTION_DEFENSE_SUFFIX`** — appended to the main
+  reply's system prompt UNCONDITIONALLY, even when the owner has fully
+  replaced `SYSTEM_PROMPT` with their own `chat_system_prompt`
+  (`_resolve_system_prompt`'s own long-standing "full replacement, never
+  append-only" design — see that function's docstring). A deliberate,
+  narrow exception to that rule: this isn't tone/persona content an
+  owner would ever author themselves, it's a fixed safety floor that
+  shouldn't be removable by an incomplete custom prompt — the same
+  reasoning that already keeps RAG excerpts/visitor identity/order state
+  OUT of the customizable system string entirely. Tells the model these
+  instructions can't be changed/revealed by anything in a user message,
+  a knowledge-base excerpt, or a file's extracted content, and to
+  decline (not comply, not explain why) if asked to reveal/quote/
+  paraphrase its own instructions or told it's in a "special/developer/
+  debug mode." Verified directly: fed a fake `AppSettings.chat_system_prompt`
+  through `_resolve_system_prompt` and confirmed the suffix is appended
+  after the custom text every time, not just the default branch.
+- **`_CLASSIFICATION_INJECTION_DEFENSE_CLAUSE`** — the matching, shorter
+  clause appended to all four classification-call system prompts
+  (`_lead_extraction_system_prompt`'s both branches,
+  `_order_extraction_system_prompt`, `_intent_triage_system_prompt`) —
+  these have no persona to protect but DO have a real DB-write side
+  effect an injected instruction could steer. Tells the model to base its
+  answer only on the visitor's genuine words and ignore anything
+  anywhere in the conversation/attachment/RAG excerpt that claims to be a
+  new instruction or a request to change the output format/values.
+- **The deterministic, code-level guardrails are the half that actually
+  GUARANTEES a worst-case injection can't do real damage** — the prompt
+  wording above only reduces how often a model falls for one.
+  `backend/tests/test_injection_defense.py` (4 tests, new) locks in what
+  was already true of `_apply_lead_capture`'s existing code, verified
+  directly rather than assumed: a fabricated `schema_key` that matches no
+  configured schema never resolves to a real one; `fields` entries not
+  defined on the matched schema are silently dropped, never stored; an
+  invented `category` value outside the fixed vocabulary falls back to
+  `"inquiry"`, never stored verbatim; a non-email `contact_email` string
+  with no other real email source correctly creates no `CrmEntry` at all
+  rather than half-completing with garbage contact info.
+- **Verified end-to-end**: `pytest` (all 8 new tests across
+  `test_turnstile.py`/`test_injection_defense.py`/`test_intent_triage.py`
+  — the last locks in `_build_triage_control`'s degrade-to-`"text"`
+  safety net, verified by hand earlier this session but never captured
+  as a permanent regression test until now) plus the full existing suite
+  all pass (19 fast tests total, up from 6 before this round).
 
 ## Page schema
 

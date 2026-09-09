@@ -8,8 +8,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ErrorMessage } from "@/components/common/error-message";
+import { TurnstileWidget } from "@/components/common/turnstile-widget";
 import { ApiError } from "@/lib/api";
 import { submitContactForm } from "@/lib/contact";
+import { getTurnstileConfig } from "@/lib/turnstile";
 
 type ContactFormProps = {
   /** Shown above the fields — lets a caller (e.g. `not-found.tsx`) give
@@ -32,12 +34,24 @@ export function ContactForm({ title, description, className }: ContactFormProps)
   const [status, setStatus] = React.useState<"idle" | "sending" | "sent" | "error">("idle");
   const [error, setError] = React.useState<string | null>(null);
 
+  // Bot verification (2026-09-10) — only rendered/required once the
+  // owner has actually turned it on; a fresh install with it off never
+  // even calls getTurnstileConfig's result into account here.
+  const [turnstileSiteKey, setTurnstileSiteKey] = React.useState<string | null>(null);
+  const [turnstileToken, setTurnstileToken] = React.useState("");
+
+  React.useEffect(() => {
+    getTurnstileConfig()
+      .then((config) => setTurnstileSiteKey(config.enabled ? config.site_key : null))
+      .catch(() => setTurnstileSiteKey(null));
+  }, []);
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setStatus("sending");
     setError(null);
     try {
-      await submitContactForm({ name, email, message });
+      await submitContactForm({ name, email, message, turnstileToken });
       setStatus("sent");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't send that — please try again shortly.");
@@ -88,7 +102,9 @@ export function ContactForm({ title, description, className }: ContactFormProps)
           />
         </div>
 
-        <Button type="submit" disabled={status === "sending"}>
+        {turnstileSiteKey ? <TurnstileWidget siteKey={turnstileSiteKey} onToken={setTurnstileToken} /> : null}
+
+        <Button type="submit" disabled={status === "sending" || (!!turnstileSiteKey && !turnstileToken)}>
           <Send className="mr-1.5 h-3.5 w-3.5" />
           {status === "sending" ? "Sending…" : "Send message"}
         </Button>

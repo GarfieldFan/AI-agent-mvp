@@ -10,10 +10,12 @@ import { ChatMessageBubble } from "@/components/modules/chat/chat-message-bubble
 import { ContactForm } from "@/components/modules/contact-form";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
+import { TurnstileWidget } from "@/components/common/turnstile-widget";
 import { ApiError } from "@/lib/api";
 import { sendChatMessage, uploadChatAttachment, type ChatApiTurn } from "@/lib/chat";
 import { requestResumeCode, verifyResumeCode } from "@/lib/crm-resume";
 import { fileToBase64 } from "@/lib/file";
+import { getTurnstileConfig } from "@/lib/turnstile";
 import type { ChatMessage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -70,6 +72,22 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   // fallback `app/not-found.tsx` offers for a missing page.
   const [chatUnavailable, setChatUnavailable] = React.useState(false);
   const bottomRef = React.useRef<HTMLDivElement>(null);
+
+  // Bot verification (2026-09-10) — only ever required for a
+  // conversation's first real turn (backend/apis/chat.py's own gate is
+  // identical: `not history`), never again after that, so this only
+  // needs a plain "have we sent one successfully yet" flag rather than
+  // per-turn state.
+  const [turnstileSiteKey, setTurnstileSiteKey] = React.useState<string | null>(null);
+  const [turnstileToken, setTurnstileToken] = React.useState("");
+  const [firstMessageSent, setFirstMessageSent] = React.useState(false);
+  const needsTurnstile = !!turnstileSiteKey && !firstMessageSent;
+
+  React.useEffect(() => {
+    getTurnstileConfig()
+      .then((config) => setTurnstileSiteKey(config.enabled ? config.site_key : null))
+      .catch(() => setTurnstileSiteKey(null));
+  }, []);
 
   // Uploaded ahead of send (POST /api/chat/upload) — see lib/chat.ts's
   // uploadChatAttachment. `uploading`/`uploadError` track that pre-send
@@ -227,6 +245,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   // it originated, goes through the exact same real /api/chat call.
   async function sendTurn(text: string, attachmentUrl?: string) {
     if ((!text && !attachmentUrl) || pending || uploading) return;
+    if (needsTurnstile && !turnstileToken) return;
 
     // The seed greeting (SEED_MESSAGE_ID) never actually reached the
     // backend before this rewrite either — excluding it here is what lets
@@ -242,7 +261,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
 
     setPending(true);
     try {
-      const { reply, sources, products, searchLink, control } = await sendChatMessage(text, history, attachmentUrl);
+      const { reply, sources, products, searchLink, control } = await sendChatMessage(
+        text,
+        history,
+        attachmentUrl,
+        turnstileToken || undefined,
+      );
+      setFirstMessageSent(true);
       pushMessage({
         role: "assistant",
         content: reply,
@@ -271,7 +296,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   async function handleSend(event: React.FormEvent) {
     event.preventDefault();
     const text = draft.trim();
-    if ((!text && !pendingAttachment) || pending || uploading) return;
+    if ((!text && !pendingAttachment) || pending || uploading || (needsTurnstile && !turnstileToken)) return;
     const attachmentUrl = pendingAttachment?.url;
     setDraft("");
     setPendingAttachment(null);
@@ -403,6 +428,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
           </div>
         ) : null}
         {uploadError ? <p className="px-3 pt-2 text-xs text-destructive">{uploadError}</p> : null}
+        {needsTurnstile ? (
+          <div className="px-3 pt-2">
+            <TurnstileWidget siteKey={turnstileSiteKey!} onToken={setTurnstileToken} />
+          </div>
+        ) : null}
 
         <form onSubmit={handleSend} className="flex items-center gap-2 p-3">
           <input
@@ -433,7 +463,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
             type="submit"
             size="icon"
             aria-label="Send message"
-            disabled={(!draft.trim() && !pendingAttachment) || pending || uploading}
+            disabled={(!draft.trim() && !pendingAttachment) || pending || uploading || (needsTurnstile && !turnstileToken)}
           >
             <Send className="size-4" />
           </Button>
