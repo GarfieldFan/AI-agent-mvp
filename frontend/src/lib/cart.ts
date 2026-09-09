@@ -100,20 +100,22 @@ export type CheckoutInput = {
 export type CheckoutResult = {
   order: Cart;
   /** Set only when the owner's configured payment provider needs the
-   * visitor's browser to go pay somewhere else (Stripe's own hosted
-   * Checkout page, 2026-08-20 — see backend/payments.py). Null means
-   * payment already resolved synchronously (the default "test"
-   * provider) — the caller should show the normal confirmation screen
-   * instead of redirecting. */
-  checkout_url: string | null;
+   * visitor to actually pay through a real UI — Stripe's embedded
+   * Checkout as of 2026-09-10 (a modal on this page, see
+   * components/modules/stripe-checkout-dialog.tsx and
+   * backend/payments.py's own docstring for the "why" behind embedded
+   * over a full-page redirect). Null means payment already resolved
+   * synchronously (the default "test" provider) — the caller should show
+   * the normal confirmation screen instead of opening the modal. */
+  client_secret: string | null;
 };
 
 /** Finalizes the cart through the owner's configured payment gate
  * (2026-08-20, backend/payments.py) — records contact/pickup details,
  * then either closes the order immediately as paid (the default "test"
- * provider, no real charge) or hands back a `checkout_url` to redirect
- * the visitor's browser to for a real Stripe payment; the order only
- * actually closes once that payment is confirmed via a webhook. */
+ * provider, no real charge) or hands back a Stripe `client_secret` to
+ * mount the embedded-Checkout modal with; the order only actually
+ * closes once that payment is confirmed via a webhook. */
 export function checkoutCart(input: CheckoutInput) {
   return apiFetch<CheckoutResult>("/api/cart/checkout", {
     method: "POST",

@@ -22,7 +22,14 @@ import stripe
 from apis.deps import Role, require_role
 from db import get_db
 from models import AppSettings, Order
-from payments import PaymentProvider, PaymentProviderNotConfigured, StripePaymentProvider, TestPaymentProvider, verify_stripe_webhook
+from payments import (
+    PaymentProvider,
+    PaymentProviderNotConfigured,
+    StripePaymentProvider,
+    TestPaymentProvider,
+    retrieve_checkout_session_status,
+    verify_stripe_webhook,
+)
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -146,3 +153,51 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)) -> Non
                 db.commit()
     # Every other event type is silently ignored — this endpoint only
     # cares about a Checkout Session's own payment outcome.
+
+
+class PaymentConfigResponse(BaseModel):
+    provider: str
+    # Safe to expose — Stripe's own publishable key is DESIGNED to be
+    # embedded in browser-side JS (same posture as its own docs, and the
+    # same "write-only secret, safe-to-echo public key" split this app
+    # already applies to Google Maps' embed key / Turnstile's site key).
+    # `/checkout`'s embedded-checkout modal needs this to call Stripe.js's
+    # own `loadStripe(publishableKey)` — the admin-gated GET
+    # /agent/payment-settings above was never reachable from a public,
+    # unauthenticated checkout page.
+    publishable_key: str | None
+
+
+@public_router.get("/payment-config", response_model=PaymentConfigResponse)
+def get_payment_config(db: Session = Depends(get_db)) -> PaymentConfigResponse:
+    row = db.get(AppSettings, 1)
+    provider = (row.payment_provider if row else None) or "test"
+    return PaymentConfigResponse(
+        provider=provider,
+        publishable_key=row.stripe_publishable_key if row and provider == "stripe" else None,
+    )
+
+
+class CheckoutSessionStatusResponse(BaseModel):
+    status: str
+    payment_status: str
+
+
+@public_router.get("/checkout/session-status", response_model=CheckoutSessionStatusResponse)
+async def get_checkout_session_status(session_id: str, db: Session = Depends(get_db)) -> CheckoutSessionStatusResponse:
+    """Public, no-auth — a best-effort READ of Stripe's own record of a
+    session's status, for `/checkout`'s return-page display copy ONLY
+    (see payments.py's `retrieve_checkout_session_status` docstring for
+    why this is never what actually marks an Order paid). `session_id`
+    comes back from Stripe's own `return_url` redirect
+    (`{CHECKOUT_SESSION_ID}`), not anything this app generated itself —
+    Stripe's own API is what actually validates it's a real session, a
+    bad/unknown id correctly 502s rather than ever being trusted."""
+    row = db.get(AppSettings, 1)
+    if not row or row.payment_provider != "stripe" or not row.stripe_secret_key:
+        raise HTTPException(status_code=503, detail="Stripe isn't the configured payment provider.")
+    try:
+        result = await retrieve_checkout_session_status(row.stripe_secret_key, session_id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=f"Stripe rejected the session lookup: {e}")
+    return CheckoutSessionStatusResponse(**result)

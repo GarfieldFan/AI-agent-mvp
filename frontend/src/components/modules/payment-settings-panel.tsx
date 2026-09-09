@@ -24,14 +24,14 @@ const PROVIDER_OPTIONS = [
  * the default: `/checkout` works with zero configuration, no real money
  * ever moves, an order is immediately marked paid — same "give the
  * owner choices, don't force config before anything works" posture
- * every AI provider picker already has. Switching to Stripe needs a
- * secret key (server-side, creates real Checkout Sessions) and,
- * separately, a webhook secret (verifies `POST /api/webhooks/stripe`
- * requests actually came from Stripe) before checkout will work end to
- * end — the publishable key is optional here since this app's own
- * checkout flow never renders Stripe Elements client-side (hosted
- * Checkout redirects instead), it's just surfaced for the owner's own
- * reference/future use. */
+ * every AI provider picker already has. Switching to Stripe needs THREE
+ * things before checkout works end to end: a secret key (server-side,
+ * creates real embedded Checkout Sessions), a publishable key
+ * (2026-09-10 — genuinely REQUIRED now, not just for reference: `/checkout`'s
+ * embedded-Checkout popup calls Stripe.js's `loadStripe(publishableKey)`
+ * client-side, fetched via the public `GET /api/payment-config`), and a
+ * webhook secret (verifies `POST /api/webhooks/stripe` requests actually
+ * came from Stripe). */
 export function PaymentSettingsPanel() {
   const [settings, setSettings] = React.useState<PaymentSettings | null>(null);
   const [loadError, setLoadError] = React.useState<string | null>(null);
@@ -144,8 +144,12 @@ export function PaymentSettingsPanel() {
             ) : null}
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Publishable key (optional, for reference)</Label>
+            <Label className="text-xs text-muted-foreground">Publishable key</Label>
             <Input value={publishableKey} onChange={(e) => setPublishableKey(e.target.value)} placeholder="pk_test_…" />
+            <p className="text-xs text-muted-foreground">
+              Required — the checkout popup uses this client-side to load Stripe.js. Safe to expose;
+              it&apos;s not a secret.
+            </p>
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-muted-foreground">Webhook signing secret</Label>

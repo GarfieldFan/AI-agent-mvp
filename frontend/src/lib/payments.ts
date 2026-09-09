@@ -29,3 +29,33 @@ export function getPaymentSettings() {
 export function updatePaymentSettings(input: PaymentSettingsInput) {
   return apiFetch<PaymentSettings>("/api/agent/payment-settings", { method: "PUT", body: input });
 }
+
+/** Public payment config (2026-09-10, backend/apis/payments.py) — what
+ * `/checkout`'s embedded-Checkout modal needs to call Stripe.js's own
+ * `loadStripe(publishableKey)`. `publishable_key` isn't a secret — same
+ * posture as Google Maps' embed key / Turnstile's site key. This is a
+ * SEPARATE, public, no-auth endpoint from `getPaymentSettings` above
+ * (admin/owner-gated) — a public checkout page has no admin JWT to call
+ * that with. */
+export type PaymentConfig = {
+  provider: string;
+  publishable_key: string | null;
+};
+
+export function getPaymentConfig() {
+  return apiFetch<PaymentConfig>("/api/payment-config");
+}
+
+/** A best-effort READ of a Checkout Session's status, for the return
+ * page's own friendly display copy only — never proof of payment (see
+ * backend/payments.py's `retrieve_checkout_session_status` docstring).
+ * `sessionId` comes from Stripe's own `return_url` redirect, not
+ * anything generated client-side. */
+export type CheckoutSessionStatus = {
+  status: string;
+  payment_status: string;
+};
+
+export function getCheckoutSessionStatus(sessionId: string) {
+  return apiFetch<CheckoutSessionStatus>(`/api/checkout/session-status?session_id=${encodeURIComponent(sessionId)}`);
+}

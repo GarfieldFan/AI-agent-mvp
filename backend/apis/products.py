@@ -884,13 +884,15 @@ class CheckoutRequest(BaseModel):
 
 class CheckoutResponse(BaseModel):
     order: OrderSummary
-    # Set only when the configured payment provider needs the visitor's
-    # browser to go somewhere else to actually pay (Stripe's own hosted
-    # Checkout page) — null when payment already resolved synchronously
-    # (the "test" provider, see backend/payments.py). The frontend
-    # redirects the browser here when set, shows the normal confirmation
-    # screen when not.
-    checkout_url: str | None
+    # Set only when the configured payment provider needs the visitor to
+    # actually pay through a real UI (Stripe's embedded Checkout, see
+    # backend/payments.py) — null when payment already resolved
+    # synchronously (the "test" provider). The frontend mounts Stripe's
+    # own `<EmbeddedCheckout>` modal with this when set (2026-09-10 — a
+    # popup on this page, not a full-page redirect, see payments.py's own
+    # docstring for the "why"), shows the normal confirmation screen when
+    # not.
+    client_secret: str | None
 
 
 @public_router.post("/cart/checkout", response_model=CheckoutResponse)
@@ -898,14 +900,14 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
     """Finalizes the visitor's own active cart through the owner's
     configured payment gate (backend/payments.py) — "test" (the default)
     skips straight to a paid, closed order with no real charge; "stripe"
-    creates a real Checkout Session and hands back its URL instead of
-    closing the order immediately. The order only actually closes
-    (`is_open = False`) once payment is confirmed — synchronously here
-    for "test," asynchronously via `POST /webhooks/stripe` for a real
-    Stripe payment, since a visitor can close the tab right after paying
-    and before any redirect back to this site completes. 400s on an
-    empty/missing cart rather than creating an empty Order — nothing to
-    check out."""
+    creates a real embedded Checkout Session and hands back its
+    `client_secret` instead of closing the order immediately. The order
+    only actually closes (`is_open = False`) once payment is confirmed —
+    synchronously here for "test," asynchronously via
+    `POST /webhooks/stripe` for a real Stripe payment, since a visitor
+    can close the tab right after paying and before the embedded
+    checkout's own return trip completes. 400s on an empty/missing cart
+    rather than creating an empty Order — nothing to check out."""
     session = _get_or_create_session(db, req.session_id, None)
     order = find_active_order(db, session.id)
     if order is None or not order.items:
@@ -927,10 +929,14 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
     except PaymentProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    success_url = f"{FRONTEND_PUBLIC_URL}/checkout?order_id={order.id}&paid=1"
-    cancel_url = f"{FRONTEND_PUBLIC_URL}/checkout?order_id={order.id}"
+    # {CHECKOUT_SESSION_ID} is a literal template Stripe itself
+    # substitutes on redirect — not an f-string placeholder, must not be
+    # escaped/formatted away. Embedded mode uses a single return_url
+    # (unlike hosted mode's separate success_url/cancel_url) since a
+    # visitor never fully leaves this page either way.
+    return_url = f"{FRONTEND_PUBLIC_URL}/checkout/complete?order_id={order.id}&session_id={{CHECKOUT_SESSION_ID}}"
     try:
-        result = await provider.create_checkout(order, success_url, cancel_url)
+        result = await provider.create_checkout(order, return_url)
     except PaymentProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -940,4 +946,4 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
         order.is_open = False
     db.commit()
     db.refresh(order)
-    return CheckoutResponse(order=_to_order_summary(order), checkout_url=result.redirect_url)
+    return CheckoutResponse(order=_to_order_summary(order), client_secret=result.client_secret)

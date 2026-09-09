@@ -14,17 +14,20 @@ import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { StripeCheckoutDialog } from "@/components/modules/stripe-checkout-dialog";
 import { ApiError } from "@/lib/api";
 import { checkoutCart, getCart, type Cart } from "@/lib/cart";
+import { getPaymentConfig } from "@/lib/payments";
 
 /** `/checkout` (2026-08-20, payment gate added same day — see
  * backend/payments.py) — finalizes the same session-scoped cart
  * `/cart` reads (lib/cart.ts). "Place order" goes through the owner's
  * configured payment gate: the default "test" provider marks the order
  * paid immediately with no real charge; a real Stripe provider instead
- * redirects the visitor's browser to Stripe's own hosted Checkout page
- * (`checkout_url` in the response) — this component's own state never
- * renders that page, it just navigates there. A prefilled
+ * opens Stripe's own embedded Checkout in a popup on this page
+ * (2026-09-10, `StripeCheckoutDialog` — a `client_secret` in the
+ * response, not a redirect URL, see backend/payments.py's own docstring
+ * for the "why" behind embedded over a full-page redirect). A prefilled
  * `contact_email`/`contact_name` (if the cart already carries one, e.g.
  * from an earlier chat turn) is editable, never locked. */
 export function CheckoutPage() {
@@ -40,26 +43,18 @@ export function CheckoutPage() {
   const [placeError, setPlaceError] = React.useState<string | null>(null);
   const [placedOrder, setPlacedOrder] = React.useState<Cart | null>(null);
 
-  // Set when Stripe redirects the visitor's browser back here after a
-  // real hosted-Checkout payment attempt (`success_url` carries
-  // `?paid=1`, see backend/apis/products.py's checkout_cart). Read via a
-  // lazy useState initializer (runs once, on first render) rather than
-  // an effect — an effect calling setState synchronously in its body
-  // trips the react-hooks/set-state-in-effect lint rule, and there's no
-  // real user interaction to drive this from instead (same class of
-  // constraint ImageFieldEditor's Library-tab fetch already documents).
-  // Not next/navigation's useSearchParams() either — that hook needs a
-  // Suspense boundary and would force this whole route into dynamic
-  // rendering just to read a param this component only cares about once
-  // (same reasoning SessionIdBootstrap's own doc comment gives). This is
-  // a friendly landing message only, NOT proof of payment — the real
-  // source of truth is POST /webhooks/stripe updating the order
-  // server-side, which may not have landed yet by the time this
-  // redirect completes.
-  const [returnedFromStripe] = React.useState(() => {
-    if (typeof window === "undefined") return false;
-    return new URLSearchParams(window.location.search).get("paid") === "1";
-  });
+  // Stripe embedded Checkout (2026-09-10) — the publishable key is fetched
+  // once, up front, so it's already in hand by the time "Place order"
+  // actually needs it; the dialog itself only opens once a real
+  // client_secret comes back from POST /cart/checkout.
+  const [publishableKey, setPublishableKey] = React.useState<string | null>(null);
+  const [checkoutClientSecret, setCheckoutClientSecret] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    getPaymentConfig()
+      .then((config) => setPublishableKey(config.provider === "stripe" ? config.publishable_key : null))
+      .catch(() => setPublishableKey(null));
+  }, []);
 
   React.useEffect(() => {
     getCart()
@@ -84,8 +79,8 @@ export function CheckoutPage() {
         pickup_time: pickupTime.trim() || null,
         note: note.trim() || null,
       });
-      if (result.checkout_url) {
-        window.location.href = result.checkout_url;
+      if (result.client_secret) {
+        setCheckoutClientSecret(result.client_secret);
         return;
       }
       setPlacedOrder(result.order);
@@ -94,23 +89,6 @@ export function CheckoutPage() {
     } finally {
       setPlacing(false);
     }
-  }
-
-  if (returnedFromStripe) {
-    return (
-      <Container className="max-w-lg py-10">
-        <EmptyState
-          icon={CheckCircle2}
-          title="Payment received"
-          description="Thanks — your payment is being confirmed and your order will show up in our system shortly."
-          action={
-            <Button render={<Link href="/" />} nativeButton={false} variant="outline">
-              Back to home
-            </Button>
-          }
-        />
-      </Container>
-    );
   }
 
   if (placedOrder) {
@@ -214,6 +192,17 @@ export function CheckoutPage() {
       <Button size="lg" className="w-full" disabled={placing} onClick={handlePlaceOrder}>
         {placing ? "Placing order…" : "Place order"}
       </Button>
+
+      {checkoutClientSecret && publishableKey ? (
+        <StripeCheckoutDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setCheckoutClientSecret(null);
+          }}
+          publishableKey={publishableKey}
+          clientSecret={checkoutClientSecret}
+        />
+      ) : null}
     </Container>
   );
 }

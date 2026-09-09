@@ -19,15 +19,32 @@ Two providers exist today:
   signature verification is security-critical: `stripe.Webhook.
   construct_event` is a vetted HMAC check, not something worth
   reimplementing by hand for a payment-forgery-adjacent code path.
-  Checkout itself is Stripe-*hosted* (the visitor is redirected to a
-  Stripe-owned page to enter card details) — the simplest, safest
-  integration shape available: card data never touches this app's own
-  server at all, sidestepping PCI scope entirely. Confirmation of
-  payment always comes back asynchronously via `POST /webhooks/stripe`,
-  never synchronously from `create_checkout()` itself — Stripe's own
-  recommended flow, and the only way to reliably learn a payment
+
+  **Embedded Checkout (2026-09-10, replaced the original full-page
+  redirect mode the same day, on the user's own direct ask for a
+  "popup" rather than a full navigation away from this site)** —
+  `ui_mode="embedded"` instead of the default `"hosted"`: Stripe returns
+  a `client_secret`, not a `url`, and the frontend mounts Stripe's own
+  `<EmbeddedCheckout>` iframe inside a modal
+  (`components/modules/stripe-checkout-dialog.tsx`) rather than
+  navigating the whole browser away. Still Stripe-*hosted* underneath —
+  the iframe Stripe serves into that modal is still Stripe's own origin,
+  so card data never touches this app's own server at all, the exact
+  same PCI-scope-avoidance the redirect mode already had. A single
+  `return_url` (not separate success/cancel URLs — embedded mode doesn't
+  have that distinction) is where Stripe navigates the top-level page
+  once the visitor finishes inside the modal, carrying `{CHECKOUT_
+  SESSION_ID}` as a literal template Stripe itself substitutes.
+  Confirmation of payment always comes back asynchronously via
+  `POST /webhooks/stripe`, never synchronously from `create_checkout()`
+  itself and never trusted from the `return_url` visit either — Stripe's
+  own recommended flow, and the only way to reliably learn a payment
   succeeded even if the visitor closes the tab right after paying,
-  before Stripe's own redirect back to this site completes."""
+  before the embedded checkout's own redirect completes. `GET
+  /api/checkout/session-status` (apis/payments.py) is a separate,
+  best-effort READ of the session's current status Stripe already knows
+  about — purely for the return page's own friendly display copy, never
+  what actually flips `Order.payment_status`."""
 
 from __future__ import annotations
 
@@ -49,43 +66,47 @@ class PaymentProviderNotConfigured(Exception):
 
 class CheckoutResult:
     """What `create_checkout()` returns. Exactly one of the two is
-    meaningful: `redirect_url` set means "send the visitor's browser
-    there to actually pay" (real payment, not yet confirmed);
+    meaningful: `client_secret` set means "mount Stripe's own embedded
+    checkout in a modal with this" (real payment, not yet confirmed —
+    see StripePaymentProvider's own docstring for why this is a
+    `client_secret`, not a redirect `url`, as of 2026-09-10);
     `already_paid=True` means the provider itself resolved payment
     synchronously (only the test provider does this today) and the
-    caller can mark the order paid immediately, no redirect needed."""
+    caller can mark the order paid immediately, no checkout UI needed at
+    all."""
 
-    def __init__(self, redirect_url: str | None = None, already_paid: bool = False):
-        self.redirect_url = redirect_url
+    def __init__(self, client_secret: str | None = None, already_paid: bool = False):
+        self.client_secret = client_secret
         self.already_paid = already_paid
 
 
 class PaymentProvider(Protocol):
-    async def create_checkout(self, order: "Order", success_url: str, cancel_url: str) -> CheckoutResult: ...
+    async def create_checkout(self, order: "Order", return_url: str) -> CheckoutResult: ...
 
 
 class TestPaymentProvider:
     """No real charge — immediately reports the order paid. See this
     module's own docstring for why this is the default."""
 
-    async def create_checkout(self, order: "Order", success_url: str, cancel_url: str) -> CheckoutResult:
+    async def create_checkout(self, order: "Order", return_url: str) -> CheckoutResult:
         return CheckoutResult(already_paid=True)
 
 
 class StripePaymentProvider:
-    """Creates a real Stripe Checkout Session. Line items are built from
-    the order's own real `OrderItem` rows (`unit_price_snapshot`/
-    `quantity`), never a client-supplied total — the same "never trust
-    the client for money math" posture `cart.apply_order_delta` already
-    holds for the order total itself. `stripe`'s SDK is synchronous;
-    wrapped in `asyncio.to_thread` so it doesn't block this process's
-    event loop, the standard way to call a blocking SDK from async
-    FastAPI code."""
+    """Creates a real Stripe Checkout Session in embedded (`"popup"`)
+    mode — see this module's own docstring for the full "why". Line
+    items are built from the order's own real `OrderItem` rows
+    (`unit_price_snapshot`/`quantity`), never a client-supplied total —
+    the same "never trust the client for money math" posture
+    `cart.apply_order_delta` already holds for the order total itself.
+    `stripe`'s SDK is synchronous; wrapped in `asyncio.to_thread` so it
+    doesn't block this process's event loop, the standard way to call a
+    blocking SDK from async FastAPI code."""
 
     def __init__(self, secret_key: str):
         self.secret_key = secret_key
 
-    async def create_checkout(self, order: "Order", success_url: str, cancel_url: str) -> CheckoutResult:
+    async def create_checkout(self, order: "Order", return_url: str) -> CheckoutResult:
         line_items = [
             {
                 "price_data": {
@@ -99,9 +120,9 @@ class StripePaymentProvider:
         ]
         kwargs: dict = {
             "mode": "payment",
+            "ui_mode": "embedded",
             "line_items": line_items,
-            "success_url": success_url,
-            "cancel_url": cancel_url,
+            "return_url": return_url,
             "client_reference_id": str(order.id),
         }
         if order.contact_email:
@@ -113,7 +134,23 @@ class StripePaymentProvider:
             )
         except stripe.error.StripeError as e:
             raise PaymentProviderNotConfigured(f"Stripe rejected the checkout request: {e}") from e
-        return CheckoutResult(redirect_url=session.url)
+        return CheckoutResult(client_secret=session.client_secret)
+
+
+async def retrieve_checkout_session_status(secret_key: str, session_id: str) -> dict:
+    """Best-effort READ of a Checkout Session's current status, straight
+    from Stripe — powers the return page's own friendly display copy
+    ONLY. Never what actually flips `Order.payment_status`; that's
+    `POST /webhooks/stripe`'s job alone, for the exact reason this
+    module's docstring already gives (a visitor can close the tab before
+    ever completing this round trip at all). Raises
+    `stripe.error.StripeError` on a bad/unknown session id — the route
+    handler decides what HTTP status that becomes, same posture as
+    `verify_stripe_webhook`."""
+    session = await asyncio.to_thread(
+        stripe.checkout.Session.retrieve, session_id, api_key=secret_key
+    )
+    return {"status": session.status, "payment_status": session.payment_status}
 
 
 def verify_stripe_webhook(payload: bytes, sig_header: str, webhook_secret: str) -> "stripe.Event":

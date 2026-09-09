@@ -1792,22 +1792,33 @@ that package is specifically AI providers, and payment isn't one.
   integrations) specifically because webhook signature verification is
   security-critical: `stripe.Webhook.construct_event` is a vetted HMAC
   check, not something worth reimplementing by hand for a
-  payment-forgery-adjacent code path. Checkout itself is Stripe-*hosted*
-  (the visitor's browser is redirected to a Stripe-owned page to enter
-  card details) — the simplest, safest integration shape available: card
-  data never touches this app's own server at all, sidestepping PCI
-  scope entirely.
+  payment-forgery-adjacent code path. Checkout is still Stripe-*hosted*
+  underneath — card data never touches this app's own server at all,
+  sidestepping PCI scope entirely — but as of **2026-09-10, in EMBEDDED
+  mode, not a full-page redirect**, on the user's own direct ask to
+  "complete the payment steps... popup" instead of navigating the
+  visitor's whole browser away to Stripe's own site: `ui_mode="embedded"`
+  returns a `client_secret` (not a `url`), and the frontend mounts
+  Stripe's own `<EmbeddedCheckout>` iframe inside a real modal
+  (`StripeCheckoutDialog`, `components/ui/dialog.tsx` — a new, centered
+  Dialog primitive, `sheet.tsx`'s side-panel shape wasn't the right fit
+  for a payment popup) rather than leaving this site.
 - **Payment confirmation is always asynchronous, never trusted from the
-  redirect itself** — `create_checkout()` either reports `already_paid`
-  synchronously (test provider only) or hands back a `redirect_url`;
+  return trip itself** — `create_checkout()` either reports `already_paid`
+  synchronously (test provider only) or hands back a `client_secret`;
   either way, the actual "mark this order paid" write only ever happens
   in `checkout_cart` itself (test) or `POST /webhooks/stripe` (Stripe,
-  verified event). The visitor's own return trip to `/checkout?paid=1`
-  (Stripe's `success_url`) is a friendly landing message only, never
-  proof of payment — `CheckoutPage`'s own doc comment says so
-  explicitly: a visitor can close the tab right after paying, before
-  Stripe's redirect even completes, and the order must still end up
-  marked paid from the webhook alone.
+  verified event). Once the visitor finishes paying inside the embedded
+  modal, Stripe itself navigates the top-level page to a single
+  `return_url` (embedded mode has no separate success/cancel URLs the
+  way hosted mode did) — **`/checkout/complete`** (new route,
+  `CheckoutCompletePage`) is a friendly landing message only, never proof
+  of payment: it calls the new public `GET /api/checkout/session-status`
+  (a best-effort READ of Stripe's own record, `retrieve_checkout_session_
+  status`) purely for its own display copy, and says so in its own doc
+  comment — a visitor can close the tab right after paying, before this
+  page even loads, and the order must still end up marked paid from the
+  webhook alone.
 - **`Order.payment_status`/`payment_provider`/`payment_reference` are
   deliberately separate columns from `Order.status`**, not values
   reused from that existing free-text field — `status` is a label
@@ -1829,12 +1840,22 @@ that package is specifically AI providers, and payment isn't one.
   to null through this endpoint, the same limitation `custom_api_key`
   already has — a deliberate, pre-existing tradeoff, not a new gap).
   `stripe_publishable_key` is the one exception, safe to echo back —
-  Stripe's own publishable key is meant to be public.
-- **`FRONTEND_PUBLIC_URL`** (new env var, `docker-compose.yml`, same
+  Stripe's own publishable key is meant to be public. **2026-09-10: this
+  key is now genuinely REQUIRED for checkout to work at all**, not just
+  "surfaced for reference" as originally noted here — embedded Checkout
+  needs it client-side (`loadStripe(publishableKey)`), fetched via a new
+  public, no-auth **`GET /api/payment-config`** (`{provider,
+  publishable_key}` — a public checkout page has no admin JWT to call
+  the `/agent/payment-settings` endpoint with). `PaymentSettingsPanel`'s
+  own copy was updated to say so plainly.
+- **`FRONTEND_PUBLIC_URL`** (env var, `docker-compose.yml`, same
   `${HOST}:${FRONTEND_PORT}` composition as every other public-URL env
-  var) — what `checkout_cart` builds Stripe's `success_url`/`cancel_url`
-  from; this backend never renders that redirect itself, it just needs
-  to tell Stripe where to send the visitor's browser back to.
+  var) — what `checkout_cart` builds Stripe's single `return_url` from
+  (`/checkout/complete?order_id=...&session_id={CHECKOUT_SESSION_ID}` —
+  that last part is a literal template Stripe itself substitutes, not an
+  f-string placeholder); this backend never renders that page itself, it
+  just needs to tell Stripe where to send the visitor's browser once
+  they finish inside the embedded modal.
 - **`PaymentSettingsPanel`** (frontend, in the "Products & orders"
   accordion group alongside `ProductPanel`/`OrderPanel`) — provider
   picker + Stripe key inputs, mirrors `ModelSettingsPanel`'s
@@ -1843,18 +1864,40 @@ that package is specifically AI providers, and payment isn't one.
   surfaces the exact webhook URL to paste into Stripe's own dashboard.
   `OrderPanel`'s summary row gained a `payment_status` `Badge`
   (paid/unpaid/failed) next to the total, visible without expanding.
-- **Verified end-to-end**: default test-mode checkout closes the order
-  as `paid`/`test` with no configuration; switching to `stripe` with no
-  secret key set correctly 503s with a clear message instead of
-  crashing; the write-only secret-key round-trip (set → never echoed →
-  updating an unrelated field leaves it intact); and — the one genuinely
-  security-sensitive path — a forged webhook request with a bad
+- **Verified end-to-end against the real running stack, including
+  genuine live rejections from Stripe's actual production API** (no real
+  Stripe account was available either session — confirmed directly with
+  the user before building the embedded-Checkout redesign, who chose to
+  have the code written correctly now and configure/test real keys
+  themselves later): default test-mode checkout still closes the order
+  as `paid`/`test` with zero configuration, `client_secret: null`;
+  switching to `stripe` with no secret key set correctly 503s; the
+  write-only secret-key round-trip (set → never echoed → updating an
+  unrelated field leaves it intact); a forged webhook request with a bad
   signature is correctly rejected with a real HMAC verification failure
   (`stripe.error.SignatureVerificationError`), not just a header-presence
-  check. No real Stripe account was available this session, so the full
-  hosted-Checkout redirect → webhook → paid-order round trip was not
-  exercised against Stripe's actual servers — only every piece on this
-  app's own side of that boundary.
+  check. **2026-09-10, against a real (fake-credentialed) Stripe API
+  call**, not just this app's own side of the boundary: `POST
+  /cart/checkout` with a fake `sk_test_...` key genuinely reached
+  Stripe's real `checkout.Session.create` endpoint in embedded mode and
+  got a real "Invalid API Key provided" rejection back (proving the
+  `ui_mode="embedded"`/`return_url` request shape is well-formed — Stripe
+  validated the request structurally before ever checking the key),
+  correctly surfaced as a clean 503; `GET /api/checkout/session-status`
+  with a bogus session id similarly reached Stripe's real
+  `checkout.Session.retrieve` and got a genuine rejection, correctly
+  surfaced as a 502. `backend/tests/test_payments.py` (2 new tests) locks
+  in a real, new gap this redesign could have reopened: a stale
+  `stripe_publishable_key` left over from a previous Stripe
+  configuration must never leak out of the now-public `GET
+  /api/payment-config` while `payment_provider` is back on `"test"`.
+  `tsc`/`eslint`/`pytest` (21 fast tests)/a real production build (with
+  the new `@stripe/stripe-js`/`@stripe/react-stripe-js` dependencies
+  actually baked into a rebuilt image, not just live-installed) all
+  clean. Test orders/sessions/settings cleaned up after. **Not
+  independently verified this round**: an actual successful embedded-
+  Checkout payment completing inside the modal and a real webhook firing
+  — needs the real Stripe test-mode keys only the user can obtain.
 
 ### Email + SMS gate (`backend/notifications.py`, `backend/apis/notifications.py`)
 
@@ -4116,6 +4159,11 @@ a mock.
 - `test_intent_triage.py` (2026-09-10) — fast, deterministic. Locks in
   `_build_triage_control`'s degrade-to-`"text"` safety net for malformed/
   missing model output.
+- `test_payments.py` (2026-09-10) — fast, deterministic. Locks in a real
+  gap the embedded-Checkout redesign could have reopened: a stale
+  `stripe_publishable_key` from a previous Stripe config must never leak
+  out of the now-public `GET /api/payment-config` while
+  `payment_provider` is back on `"test"`. See "Payment gate" above.
 
 Not yet covered: frontend tests (none exist), the product/order pipeline,
 owner-agent's tool loop, CTE. Add to this suite as new behavior is worth
