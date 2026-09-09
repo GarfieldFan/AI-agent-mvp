@@ -1,0 +1,64 @@
+# Reverse-proxy config for a real domain-based deployment
+# (deploy/setup-server.sh) — routes one public origin to this app's three
+# HTTP services, all still just docker-compose containers bound to
+# 127.0.0.1 on the same machine (see docker-compose.yml's BIND_HOST).
+#
+# Three location blocks, matched to how each service actually expects to
+# receive a path (confirmed by reading the real code, not assumed):
+#   - backend/main.py mounts every router under "/api" itself (e.g. the
+#     real route is "/api/chat", not "/chat") — so /api/ here has NO
+#     trailing path after the upstream address, which tells Nginx to pass
+#     the original request URI straight through unchanged.
+#   - owner-agent/main.py's own routes have NO "/api" prefix at all
+#     ("/run", "/health") — so /owner-agent/ here proxies to a trailing
+#     "/", which tells Nginx to STRIP the "/owner-agent" prefix before
+#     forwarding (frontend/src/lib/owner-agent.ts calls
+#     "${NEXT_PUBLIC_OWNER_AGENT_URL}/run", which becomes
+#     "https://__DOMAIN__/owner-agent/run" — this strips back down to
+#     plain "/run" for owner-agent itself).
+#   - everything else falls through to the frontend (Next.js serves its
+#     own routing from its own root).
+#
+# __DOMAIN__/__BACKEND_PORT__/__FRONTEND_PORT__/__OWNER_AGENT_PORT__ are
+# substituted by deploy/setup-server.sh — this file is a template, never
+# used verbatim.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    # Generous enough for a document/media upload — chat's own attachment
+    # cap is 8MB (backend/chat_attachments.py), other uploads can be
+    # larger; better to let the app's own validation reject an oversized
+    # file with a real error than have Nginx silently 413 first.
+    client_max_body_size 50m;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:__BACKEND_PORT__;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /owner-agent/ {
+        proxy_pass http://127.0.0.1:__OWNER_AGENT_PORT__/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # owner-agent's own run budget is up to ~300s total, with a single
+        # tool call (generate_landing_page) individually allowed up to
+        # 620s — see the root AGENTS.md's "Owner agent" section. Nginx's
+        # own default (60s) would cut this off mid-run.
+        proxy_read_timeout 660s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:__FRONTEND_PORT__;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

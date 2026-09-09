@@ -2,8 +2,19 @@ services:
   backend:
     build: ./backend
     container_name: mvp_fastapi_backend
+    restart: unless-stopped
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      # BIND_HOST (2026-09-09, deploy/setup-server.sh) defaults to
+      # 0.0.0.0 — i.e. identical to the plain "${BACKEND_PORT}:8000"
+      # shorthand every existing local setup already runs with, zero
+      # behavior change. A real internet-facing deployment behind the
+      # Nginx+TLS reverse proxy deploy/setup-server.sh sets up sets this
+      # to 127.0.0.1 instead, so the raw HTTP port is only reachable from
+      # Nginx on the same machine, never directly from the public
+      # internet bypassing TLS — same reasoning postgres-db's own port
+      # mapping below already documents, just applied to this service too
+      # now that a real non-local deployment target exists.
+      - "${BIND_HOST:-0.0.0.0}:${BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend:/app
       - "${COMFYUI_HOST_OUTPUT_DIR}:/comfy_output"
@@ -51,13 +62,35 @@ services:
       # This backend's own browser-facing URL — needed to build absolute
       # URLs for content it serves itself (e.g. CTE media-library
       # uploads, apis/media.py), the same way COMFYUI_PUBLIC_URL does for
-      # ComfyUI-served images.
-      - BACKEND_PUBLIC_URL=http://${HOST:-localhost}:${BACKEND_PORT:-8000}
+      # ComfyUI-served images. PUBLIC_ORIGIN (2026-09-09,
+      # deploy/setup-server.sh) overrides the whole HOST:PORT derivation
+      # when set — a real domain-based deployment behind Nginx serves
+      # every backend route under the SAME origin as the frontend (Nginx
+      # proxies /api/* straight through to this container, see
+      # deploy/nginx.conf.template), so there's no port to append at all.
+      # Unset (every existing local/dev setup) falls through to the exact
+      # prior HOST:BACKEND_PORT composition, byte-for-byte.
+      - BACKEND_PUBLIC_URL=${PUBLIC_ORIGIN:-http://${HOST:-localhost}:${BACKEND_PORT:-8000}}
       # Where to send a visitor's browser back after a hosted Stripe
       # Checkout session (backend/payments.py) — this backend never
       # renders that redirect itself, it just needs to tell Stripe where
-      # to send the visitor once they've paid or cancelled.
-      - FRONTEND_PUBLIC_URL=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
+      # to send the visitor once they've paid or cancelled. Same
+      # PUBLIC_ORIGIN override as BACKEND_PUBLIC_URL above — this is the
+      # frontend's own origin, identical to BACKEND_PUBLIC_URL's value
+      # once both are served from one domain behind the reverse proxy.
+      - FRONTEND_PUBLIC_URL=${PUBLIC_ORIGIN:-http://${HOST:-localhost}:${FRONTEND_PORT:-3000}}
+      # Browser-facing origin CORSMiddleware allows (main.py) — a real,
+      # PRE-EXISTING gap closed 2026-09-09: this var was never threaded
+      # through to the backend service at all before now (only
+      # owner-agent's own CORS_ALLOW_ORIGINS line, below, existed),
+      # meaning the backend always fell back to main.py's hardcoded
+      # "http://localhost:3000" default regardless of HOST/FRONTEND_PORT
+      # — harmless for a local demo that only ever uses the literal
+      # defaults, but would have silently broken every browser call with
+      # a real CORS rejection the moment either differed, exactly the
+      # case a real deployment guarantees. Same PUBLIC_ORIGIN override as
+      # above for the reverse-proxied production case.
+      - CORS_ALLOW_ORIGINS=${PUBLIC_ORIGIN:-http://${HOST:-localhost}:${FRONTEND_PORT:-3000}}
       # Reachable *from inside this container* (apis/seo_audit.py's
       # check_seo_schema — the first backend-initiated call INTO the
       # frontend service; every other cross-service call in this app goes
@@ -93,6 +126,7 @@ services:
     # on CPU, just slower than a GPU-accelerated setup.
     image: ollama/ollama:latest
     container_name: mvp_ollama
+    restart: unless-stopped
     ports:
       # 127.0.0.1-bound, not 0.0.0.0 — same reasoning as postgres-db's own
       # port mapping below: backend reaches this over the internal Docker
@@ -111,8 +145,11 @@ services:
   frontend:
     build: ./frontend
     container_name: mvp_nextjs_frontend
+    restart: unless-stopped
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      # BIND_HOST — see the backend service's own port-mapping comment
+      # above for the full reasoning; identical default/override shape.
+      - "${BIND_HOST:-0.0.0.0}:${FRONTEND_PORT:-3000}:3000"
     volumes:
       - ./frontend:/app
       - /app/node_modules
@@ -121,8 +158,11 @@ services:
       # Consumed by the browser, not the Next.js server — see HOST's
       # comment in .env.example: both containers publish their ports to
       # the host, and the browser reaches them from outside Docker's
-      # network entirely.
-      - NEXT_PUBLIC_API_URL=http://${HOST:-localhost}:${BACKEND_PORT:-8000}
+      # network entirely. PUBLIC_ORIGIN override — see the backend
+      # service's BACKEND_PUBLIC_URL comment above for the full reasoning
+      # (same var, same fallback shape, applied here for the browser-
+      # facing side of the identical concept).
+      - NEXT_PUBLIC_API_URL=${PUBLIC_ORIGIN:-http://${HOST:-localhost}:${BACKEND_PORT:-8000}}
       # Consumed by Next.js Server Components (running inside this
       # container) — "backend" is the other service's docker-compose name,
       # resolved via Docker's internal DNS. See lib/api.ts's comment: this
@@ -131,23 +171,32 @@ services:
       - INTERNAL_API_URL=http://backend:8000
       # Owner Agent panel calls this origin directly from the browser (no
       # SSR fetch involved), so only the NEXT_PUBLIC_ variant is needed —
-      # see frontend/src/lib/owner-agent.ts.
-      - NEXT_PUBLIC_OWNER_AGENT_URL=http://${HOST:-localhost}:${OWNER_AGENT_PORT:-8100}
+      # see frontend/src/lib/owner-agent.ts. A SEPARATE override
+      # (PUBLIC_OWNER_AGENT_URL, not PUBLIC_ORIGIN) since owner-agent is a
+      # genuinely different service on its own path (deploy/
+      # setup-server.sh's Nginx config proxies /owner-agent/ to it) rather
+      # than sharing the site's own root origin the way frontend/backend
+      # do — PUBLIC_ORIGIN alone has no way to express that extra path
+      # segment.
+      - NEXT_PUBLIC_OWNER_AGENT_URL=${PUBLIC_OWNER_AGENT_URL:-http://${HOST:-localhost}:${OWNER_AGENT_PORT:-8100}}
       # This site's own public origin (2026-08-21) — needed for absolute
       # URLs in sitemap.ts/robots.ts and as the JSON-LD "url" fallback
       # when no business_url is configured. Same composition as
       # NEXT_PUBLIC_API_URL above and backend's own FRONTEND_PUBLIC_URL
       # (docker-compose's backend service) — all three describe the same
       # externally-reachable address, just consumed by different sides.
-      - NEXT_PUBLIC_SITE_URL=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
+      - NEXT_PUBLIC_SITE_URL=${PUBLIC_ORIGIN:-http://${HOST:-localhost}:${FRONTEND_PORT:-3000}}
     depends_on:
       - backend
 
   owner-agent:
     build: ./owner-agent
     container_name: mvp_owner_agent
+    restart: unless-stopped
     ports:
-      - "${OWNER_AGENT_PORT:-8100}:8100"
+      # BIND_HOST — see the backend service's own port-mapping comment
+      # above; identical default/override shape.
+      - "${BIND_HOST:-0.0.0.0}:${OWNER_AGENT_PORT:-8100}:8100"
     volumes:
       - ./owner-agent:/app
       - ./owner-agent/logs:/app/logs
@@ -158,7 +207,13 @@ services:
       # service calls backend from inside the Compose network, never from
       # a browser.
       - BACKEND_URL=http://backend:8000
-      - CORS_ALLOW_ORIGINS=http://${HOST:-localhost}:${FRONTEND_PORT:-3000}
+      # PUBLIC_ORIGIN override — see the backend service's own
+      # CORS_ALLOW_ORIGINS comment above. The browser reaches owner-agent
+      # via Nginx's /owner-agent/ proxy under the SAME origin as the
+      # frontend in a real deployment (see NEXT_PUBLIC_OWNER_AGENT_URL's
+      # own comment), so this checks against the site's plain origin, not
+      # a URL carrying the /owner-agent path segment.
+      - CORS_ALLOW_ORIGINS=${PUBLIC_ORIGIN:-http://${HOST:-localhost}:${FRONTEND_PORT:-3000}}
       - WATCHFILES_FORCE_POLLING=true
     depends_on:
       - backend
@@ -166,6 +221,7 @@ services:
   postgres-db:
     image: pgvector/pgvector:pg16
     container_name: mvp_postgres_db
+    restart: unless-stopped
     ports:
       # 127.0.0.1-bound, not 0.0.0.0 — backend/owner-agent reach this over
       # Docker's internal network (postgres-db:5432) and never need this

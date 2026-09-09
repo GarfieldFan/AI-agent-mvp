@@ -14,7 +14,7 @@ import { ApiError } from "@/lib/api";
 import { sendChatMessage, uploadChatAttachment, type ChatApiTurn } from "@/lib/chat";
 import { requestResumeCode, verifyResumeCode } from "@/lib/crm-resume";
 import { fileToBase64 } from "@/lib/file";
-import type { ChatMessage, ChatOption } from "@/lib/types";
+import type { ChatMessage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // Kept in sync with backend/apis/chat.py's CHAT_UPLOAD_EXTENSIONS — the
@@ -22,37 +22,17 @@ import { cn } from "@/lib/utils";
 // picker doesn't even offer an unsupported type.
 const ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/webp,image/gif,application/pdf";
 
-// The intent-triage steps (0-3) below are a scripted local flow, not an LLM
-// call — see the project plan's chatbot module for the
-// intent-recognition -> structured-field-capture -> CRM/human handoff
-// shape this mirrors. Once that flow completes ("done"), free-text
-// messages go to the real backend (POST /api/chat — see backend/apis/chat.py),
-// which is RAG-grounded as of 2026-08-04: it answers from uploaded
-// documents when relevant (rendered below via SourceCitationList in
-// ChatMessageBubble) and falls back to plain conversation otherwise.
-// TODO(Phase 3): replace the scripted steps with LLM-driven
-// `{ type, options }` responses too, once the backend can produce them.
-const CATEGORY_OPTIONS: ChatOption[] = [
-  { label: "General inquiry", value: "general" },
-  { label: "Technical support", value: "support" },
-  { label: "Careers", value: "careers" },
-];
-
-const TAG_OPTIONS: ChatOption[] = [
-  { label: "Urgent", value: "urgent" },
-  { label: "Needs a callback", value: "callback" },
-  { label: "Just browsing", value: "browsing" },
-];
-
-const CHANNEL_OPTIONS: ChatOption[] = [
-  { label: "Email", value: "email" },
-  { label: "Phone", value: "phone" },
-  { label: "No preference", value: "none" },
-];
-
-function labelFor(options: ChatOption[], value: string) {
-  return options.find((option) => option.value === value)?.label ?? value;
-}
+// Every real turn (free text or a clicked control option) goes straight
+// to the real backend (POST /api/chat) from message 1 — see
+// backend/apis/chat.py's `_intent_triage_call` (2026-09-09): the model
+// itself decides, on the conversation's first turn, whether a short
+// clarifying question (rendered via ChatControlRenderer's generic
+// `{ type, options }` contract) would help before it replies, instead of
+// this panel walking a fixed local script. `/api/chat` is also
+// RAG-grounded (2026-08-04): it answers from uploaded documents when
+// relevant (rendered below via SourceCitationList in ChatMessageBubble)
+// and falls back to plain conversation otherwise.
+const SEED_MESSAGE_ID = "msg-0";
 
 type ChatPanelProps = {
   /** True when rendered inside `ChatBubbleWidget`'s own floating card —
@@ -71,14 +51,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
 
   const [messages, setMessages] = React.useState<ChatMessage[]>(() => [
     {
-      id: "msg-0",
+      id: SEED_MESSAGE_ID,
       role: "assistant",
-      content: "Hi! I can help route your question. What would you like help with?",
-      control: { type: "radio", options: CATEGORY_OPTIONS },
+      content: "Hi! What can I help you with today?",
       createdAt: new Date(0).toISOString(),
     },
   ]);
-  const [step, setStep] = React.useState<0 | 1 | 2 | 3 | "done">(0);
   const [draft, setDraft] = React.useState("");
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -137,41 +115,18 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     ]);
   }
 
+  // A control's options only ever exist on the assistant message that
+  // rendered it — resolve the clicked value(s) back to their human-
+  // readable label(s) so the visitor's "reply" (both what's shown in the
+  // transcript and what actually goes to the LLM as this turn's message)
+  // reads as natural language, not a raw machine value.
   function handleControlSubmit(value: string | string[]) {
-    if (step === 0 && typeof value === "string") {
-      pushMessage({ role: "user", content: labelFor(CATEGORY_OPTIONS, value) });
-      pushMessage({
-        role: "assistant",
-        content: "Got it. Do any of these apply to you? (select all that fit)",
-        control: { type: "checkbox", options: TAG_OPTIONS },
-      });
-      setStep(1);
-      return;
-    }
-
-    if (step === 1 && Array.isArray(value)) {
-      pushMessage({
-        role: "user",
-        content: value.map((v) => labelFor(TAG_OPTIONS, v)).join(", ") || "None",
-      });
-      pushMessage({
-        role: "assistant",
-        content: "Thanks — what's the best way to follow up with you?",
-        control: { type: "select", options: CHANNEL_OPTIONS },
-      });
-      setStep(2);
-      return;
-    }
-
-    if (step === 2 && typeof value === "string") {
-      pushMessage({ role: "user", content: labelFor(CHANNEL_OPTIONS, value) });
-      pushMessage({
-        role: "assistant",
-        content: "Anything else you'd like us to know? (optional — type below and send)",
-        control: { type: "text" },
-      });
-      setStep(3);
-    }
+    const controlMessage = [...messages].reverse().find((message) => message.control?.options?.length);
+    const options = controlMessage?.control?.options ?? [];
+    const label = Array.isArray(value)
+      ? value.map((v) => options.find((o) => o.value === v)?.label ?? v).join(", ") || "None"
+      : options.find((o) => o.value === value)?.label ?? value;
+    void sendTurn(label);
   }
 
   async function handleAttachmentSelect(file: File | null) {
@@ -267,41 +222,31 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     if (file) handleAttachmentSelect(file);
   }
 
-  async function handleSend(event: React.FormEvent) {
-    event.preventDefault();
-    const text = draft.trim();
-    if ((!text && !pendingAttachment) || pending || uploading) return;
+  // Shared by both the composer's free-text submit and a clicked control
+  // option (handleControlSubmit above) — every real visitor turn, however
+  // it originated, goes through the exact same real /api/chat call.
+  async function sendTurn(text: string, attachmentUrl?: string) {
+    if ((!text && !attachmentUrl) || pending || uploading) return;
 
+    // The seed greeting (SEED_MESSAGE_ID) never actually reached the
+    // backend before this rewrite either — excluding it here is what lets
+    // backend/apis/chat.py's `_intent_triage_call` gate correctly on
+    // "this is the conversation's first turn" (an empty `history`).
     const history: ChatApiTurn[] = messages
-      .filter((message) => message.content)
+      .filter((message) => message.id !== SEED_MESSAGE_ID && message.content)
       .map((message) => ({ role: message.role, content: message.content }));
 
-    const attachmentUrl = pendingAttachment?.url;
     pushMessage({ role: "user", content: text, attachmentUrl });
-    setDraft("");
-    setPendingAttachment(null);
-    setUploadError(null);
     setError(null);
     setChatUnavailable(false);
 
-    // step 3's "anything else?" used to short-circuit here with a canned
-    // "that's been captured" reply and never actually call the backend —
-    // found 2026-08-20 from a real report: a visitor who attached a file
-    // right at this step had it silently discarded, never analyzed, never
-    // captured into any CrmEntry/queue. CRM capture and attachment
-    // analysis are both fully real now (unlike when this stub was
-    // written), so step 3 gets exactly the same real backend call every
-    // other turn does — no reason for it to be a dead end.
-    if (step === 3) {
-      setStep("done");
-    }
-
     setPending(true);
     try {
-      const { reply, sources, products, searchLink } = await sendChatMessage(text, history, attachmentUrl);
+      const { reply, sources, products, searchLink, control } = await sendChatMessage(text, history, attachmentUrl);
       pushMessage({
         role: "assistant",
         content: reply,
+        control: control ?? undefined,
         sources: sources.length ? sources : undefined,
         products: products ?? undefined,
         searchLink: searchLink ?? undefined,
@@ -321,6 +266,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     } finally {
       setPending(false);
     }
+  }
+
+  async function handleSend(event: React.FormEvent) {
+    event.preventDefault();
+    const text = draft.trim();
+    if ((!text && !pendingAttachment) || pending || uploading) return;
+    const attachmentUrl = pendingAttachment?.url;
+    setDraft("");
+    setPendingAttachment(null);
+    setUploadError(null);
+    await sendTurn(text, attachmentUrl);
   }
 
   return (

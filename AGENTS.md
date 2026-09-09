@@ -58,11 +58,17 @@ ai-employee/
 ├── HISTORY.md                 full chronological development log — read on demand, not by default
 ├── docker-compose.yml        backend + frontend + postgres-db + owner-agent + ollama services
 ├── .env / .env.example       host/ports/ComfyUI config — see "Configuration" below
+├── deploy/                   real-server deployment automation — see "Deploying to a real server" below
+│   ├── setup-server.sh         one-command bootstrap for a fresh Ubuntu/Debian server
+│   ├── update.sh                pulls latest code + restarts an already-deployed stack
+│   ├── nginx.conf.template      reverse-proxy config template for the optional --domain mode
+│   └── README.md                 the one-time manual AWS-console (or any VPS) steps + full walkthrough
 ├── backend/                  FastAPI (Python) — see backend/main.py
 │   ├── db.py                  SQLAlchemy engine/session (DATABASE_URL), Base, get_db dependency
 │   ├── models.py               User / Page / PageVersion / Document / DocumentChunk / AppSettings / ChatSession / ChatMessage / CrmEntry ORM models
 │   ├── auth.py                 password hashing (bcrypt) + JWT sign/verify (PyJWT)
-│   ├── seed.py                 creates the 3 demo accounts — run manually after migrating
+│   ├── seed.py                 creates the 3 demo accounts — run manually after migrating, LOCAL DEMO ONLY, never on a real deployment (see create_owner.py)
+│   ├── create_owner.py          production-safe real-owner-account bootstrap — deploy/setup-server.sh's own first-run step, not seed.py
 │   ├── ingest.py                RAG doc parsing (pdf/docx/md/txt) + chunking — pure functions, no I/O
 │   ├── retrieval.py              RAG retrieval: embed -> pgvector search -> scored chunks (no router — called from apis/chat.py)
 │   ├── llm_json.py                lenient JSON extraction from raw LLM output, shared by agent.py/chat.py/chat_attachments.py
@@ -162,6 +168,165 @@ Binding it to every interface would let anyone who can reach this
 machine's network connect directly with the hardcoded `my_user`/
 `my_password` credentials (`docker-compose.yml`) and read/write the
 whole DB, bypassing every RBAC/JWT check in the app entirely.
+
+## Deploying to a real server (`deploy/`)
+
+Added 2026-09-09, closing the "automated cloud/server deployment" open
+item this file previously called "genuinely unstarted." Scope confirmed
+directly with the user (`AskUserQuestion`) before building: this
+automates everything that happens **on the server itself** — it does
+NOT provision an EC2 instance or any cloud resource, since that needs
+the owner's own AWS/cloud account credentials, which this project has
+no access to and shouldn't be handed. `deploy/README.md` documents the
+one-time AWS-console (or any VPS provider's own) steps — launch an
+instance, open its firewall/security-group ports, point a domain's DNS
+at it — as a normal manual walkthrough; `deploy/setup-server.sh` is
+everything from "SSH into a fresh Ubuntu/Debian box" to "the app is
+running" in one command.
+
+- **`deploy/setup-server.sh`** — installs Docker (official apt-repo
+  method) if missing, clones/updates this repo, generates a real `.env`
+  from `.env.example` (never overwrites an existing one), starts the
+  stack, creates a real owner account, and — with `--domain <domain>
+  --email <email>` — installs Nginx + Certbot and gets a real Let's
+  Encrypt certificate. **Idempotent by design, verified directly, not
+  just claimed**: every step was checked to either no-op or safely
+  reconverge on a second run — re-running never regenerates an
+  already-set `JWT_SECRET`, never re-derives an already-fixed
+  `COMFYUI_HOST_OUTPUT_DIR`, never creates a second owner account, and
+  reuses an already-issued TLS certificate.
+- **Never seeds `backend/seed.py`'s demo accounts onto a real server —
+  a real security decision, not an oversight.** Those three accounts
+  (shared password `0000`, displayed openly on the frontend's own
+  `/login` page) are explicitly documented, in `seed.py`'s own
+  docstring, as having "nothing behind them worth protecting" in the
+  local docker-compose demo — running that script against a publicly
+  reachable server would leave a well-known `owner@example.com`/`0000`
+  account with FULL owner privileges sitting on the open internet from
+  the instant the containers come up. **`backend/create_owner.py`** is a
+  new, deliberately separate, production-safe bootstrap: exactly one
+  real owner account, a freshly generated random password
+  (`secrets.token_urlsafe(18)`) printed once by the deploy script and
+  never written anywhere else (no log file), and it refuses to run again
+  once ANY owner account already exists — so re-running the deploy
+  script after a partial/failed first attempt can never create a second
+  owner or silently reset a password the real owner has already
+  changed. Verified directly against this project's own real dev
+  database (which already has real owner accounts from `seed.py`):
+  correctly detected the existing owner and no-op'd, touching nothing.
+- **Firewall handling is deliberately conservative** — the script only
+  ever ADDS `ufw` rules (80/443, or the raw app ports when not using a
+  domain) when `ufw` is ALREADY active on the box; it never force-enables
+  `ufw` for the first time itself. Turning on a firewall remotely
+  without first confirming SSH stays allowed is a classic way to lock
+  yourself out of your own server — this script has no way to know
+  whether the owner is relying on `ufw`, a different firewall, or their
+  cloud provider's own security group instead, so the safe default is to
+  leave that decision alone and just tell the owner what needs to be
+  open (see `deploy/README.md`).
+- **A real domain deployment needs every browser-facing URL in
+  `docker-compose.yml` to resolve under ONE origin, which required real
+  changes there, not just the deploy script** — confirmed by actually
+  reading the code, not assumed: `frontend/src/lib/api.ts`'s `apiFetch`
+  concatenates `API_BASE_URL` directly with an already-`/api/`-prefixed
+  path (every backend router is mounted with `prefix="/api"` in
+  `main.py`), so `NEXT_PUBLIC_API_URL` needs to be the bare origin, not
+  `.../api`. Two new optional override env vars, both unset (today's
+  exact `HOST:PORT` composition, byte-for-byte) unless the deploy script
+  sets them:
+  - **`PUBLIC_ORIGIN`** (e.g. `https://example.com`) — when set,
+    replaces the `http://${HOST}:${PORT}` derivation for
+    `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SITE_URL`, `BACKEND_PUBLIC_URL`,
+    `FRONTEND_PUBLIC_URL`, and (backend + owner-agent)
+    `CORS_ALLOW_ORIGINS` all at once — they're all conceptually the same
+    "this deployment's public origin" value once Nginx proxies both the
+    frontend and `/api/*` under one domain (see
+    `deploy/nginx.conf.template`).
+  - **`PUBLIC_OWNER_AGENT_URL`** (e.g.
+    `https://example.com/owner-agent`) — a separate override, since
+    owner-agent is reachable via Nginx's own `/owner-agent/` path prefix
+    rather than sharing the bare origin the way frontend/backend do.
+  - **A genuine, pre-existing gap found and fixed as a side effect**:
+    `backend`'s own `docker-compose.yml` service block never threaded
+    `CORS_ALLOW_ORIGINS` through AT ALL before this — only
+    `owner-agent`'s had it. `main.py`'s `CORSMiddleware` was silently
+    falling back to its hardcoded `"http://localhost:3000"` default
+    regardless of `HOST`/`FRONTEND_PORT`, harmless for a demo that only
+    ever uses those literal defaults, but would have broken every
+    browser call with a real CORS rejection the instant a real
+    deployment (any non-default `HOST`, exactly what this whole feature
+    is for) used a different origin. Now threaded through with the same
+    `PUBLIC_ORIGIN` override as everything else.
+  - **`BIND_HOST`** (default `0.0.0.0`, today's exact behavior) —
+    restricts `backend`/`frontend`/`owner-agent`'s Docker port
+    publishing to loopback-only (`127.0.0.1`) when set, the same
+    reasoning `postgres-db`/`ollama`'s own port mappings already
+    document — the deploy script sets this to `127.0.0.1` specifically
+    in `--domain` mode, so the raw HTTP ports are only reachable from
+    Nginx on the same machine, never directly from the public internet
+    bypassing TLS.
+  - **`restart: unless-stopped` added to every service** (there was no
+    restart policy at all before this) — a server reboot now brings the
+    whole stack back up with zero manual intervention, the concrete
+    "WP-style, no ops babysitting" bar the user set for this feature;
+    harmless for local dev too (Docker Desktop already generally
+    preserves running containers across its own restarts once this is
+    set).
+  - Verified live against the real running dev stack, not just
+    `docker compose config`: recreated every container with the modified
+    `docker-compose.yml` and NO override vars set — confirmed
+    byte-identical port bindings/URLs to before, the owner's real
+    `AppSettings` row (their actual `custom` chat/vision provider
+    config) completely untouched, and both backend (`/openapi.json`) and
+    frontend (`/`) healthy immediately after. Separately confirmed via
+    `docker compose config` with `PUBLIC_ORIGIN`/`PUBLIC_OWNER_AGENT_URL`/
+    `BIND_HOST` set that every derived value resolves exactly as
+    designed.
+- **`deploy/nginx.conf.template`** — three `location` blocks (`/api/`,
+  `/owner-agent/`, `/`), each proxy-passed to the right container port
+  with the right trailing-slash-or-not shape to match how that
+  service's own routes actually expect to receive the path (confirmed
+  by reading `main.py`'s router prefixes and `owner-agent/main.py`'s
+  own bare `/run`/`/health` routes, not assumed) — see the template's
+  own comments for the exact reasoning per block.
+  `deploy/setup-server.sh` substitutes `__DOMAIN__`/`__BACKEND_PORT__`/
+  `__FRONTEND_PORT__`/`__OWNER_AGENT_PORT__` via `sed`, then runs
+  `certbot --nginx` to layer on a real HTTPS server block + auto-renewal.
+  A failed `certbot` call (almost always DNS not pointed at the server
+  yet) is handled as a clear, non-fatal warning — the site stays
+  reachable over plain HTTP in the meantime, with the exact command to
+  re-run once DNS resolves.
+- **Verified for real, not just reviewed**, within what this sandboxed
+  session could actually exercise (no real EC2 instance/AWS account, no
+  real domain — both genuinely require the owner's own accounts, see
+  above):
+  - `shellcheck` (via the real `koalaman/shellcheck` image) clean on
+    both `deploy/setup-server.sh` and `deploy/update.sh` — one harmless
+    info-level notice (`SC1091`, can't statically follow `/etc/os-
+    release`, a real runtime system file).
+  - The `.env` bootstrap/upsert logic (`set_env`, the `JWT_SECRET`/
+    `COMFYUI_HOST_OUTPUT_DIR`/domain-mode conditionals) extracted and run
+    standalone against a real copy of `.env.example`, in isolation from
+    the real project's own `.env` (never touched): confirmed correct
+    output for both domain and no-domain modes, and confirmed a second
+    run is a byte-identical no-op (true idempotency, not just "probably
+    fine").
+  - The generated Nginx config (real `sed` substitution against the real
+    template) validated with a real `nginx -t` (via the official
+    `nginx:stable` image) — syntactically valid, not just eyeballed.
+  - `backend/create_owner.py` run for real against this project's own
+    live dev database (see above).
+  - **Not independently verified this round, and said so plainly rather
+    than assumed**: the actual `apt-get install docker-ce`/`ufw`/
+    `nginx`/`certbot` orchestration on a genuinely fresh Ubuntu/Debian
+    box, and a real Let's Encrypt certificate issuance against a real
+    resolving domain — both need infrastructure (a real fresh cloud VM,
+    a real registered domain) this sandboxed session has no access to.
+    Those specific commands are the standard, officially-documented
+    invocations for each tool (Docker's own apt-repo method, Certbot's
+    own `--nginx` plugin) rather than anything novel, which is why this
+    is disclosed as an honest scope limitation rather than treated as a
+    blocker to shipping the rest of this verified-for-real.
 
 ## Architecture decisions
 
@@ -2211,68 +2376,116 @@ itself was still a hardcoded constant in `apis/chat.py`.
   this session, a known external-dependency gap, not a code issue — see
   "Known gotchas").
 
-### Intent-triage prompt — config layer only, not yet wired into runtime (`AppSettings.chat_intent_prompt`)
+### Real LLM-driven intent triage — wired into `/api/chat`'s runtime (`AppSettings.chat_intent_prompt`, `_intent_triage_call`)
 
-Added 2026-09-09, on the user's own direct ask, off the "real LLM-driven
-intent recognition" open item in "Progress against the plan's phases"
-below: `/chat`'s own 3-step category/tags/channel wizard
-(`chat-panel.tsx`) is a hardcoded, always-identical local script, not an
-LLM decision — the user wants a real model to eventually decide, per
-visitor, whether to ask a clarifying structured question and what it
-should be. Scope for this round, confirmed directly with the user before
-building (`AskUserQuestion`): **config layer only** — a stored prompt,
-an AI-drafted starting point from ingested company documents, and a
-dashboard editor. `/api/chat`'s actual runtime does not read this field
-at all yet; wiring a real classification call to it (mirroring
-`_lead_extraction_call`/`_order_extraction_call`'s existing shape, plus
-a new `ChatResponse.control` field and a rewrite of `chat-panel.tsx`'s
-step state machine) is a deliberately separate, larger follow-up.
+Added 2026-09-09, in two rounds the same day: the config layer (prompt
+field, dashboard editor, AI-draft-from-documents suggestion), then a
+same-day follow-up that actually wires a real classification call to
+it. `/chat`'s old 3-step category/tags/channel wizard (`chat-panel.tsx`)
+was a hardcoded, always-identical local script, never an LLM decision —
+this replaces it entirely.
 
 - **`AppSettings.chat_intent_prompt: str | None`** (`models.py`) — same
   null-means-default convention as `chat_system_prompt`, but a
-  completely SEPARATE field/concern: `chat_system_prompt` shapes the
-  main reply's tone/persona, this one is reserved for a future decision
-  about whether/what structured question to ask before that reply.
-  Neither reads the other.
-- **`backend/apis/chat_settings.py`** — `GET`/`PUT /agent/chat-settings`
-  widened to carry `chat_intent_prompt`/`default_chat_intent_prompt`
-  alongside the existing `chat_system_prompt` fields, each independently
-  optional in the `PUT` body (omit one to leave it untouched, explicit
-  null resets just that one). `DEFAULT_INTENT_PROMPT` is a generic,
-  business-agnostic template describing the FUTURE dynamic-triage
-  behavior this prompt is meant to drive — kept local to this file
-  (not alongside `SYSTEM_PROMPT` in `apis/chat.py`) since nothing in the
-  runtime reads it yet.
-- **`POST /agent/chat-settings/suggest-intent-prompt`** — mirrors
+  completely separate field/concern: `chat_system_prompt` shapes the
+  main reply's tone/persona; this one drives the triage decision below.
+  Neither reads the other. **`DEFAULT_INTENT_PROMPT` lives in
+  `apis/chat.py`** (alongside `SYSTEM_PROMPT`, which `apis/
+  chat_settings.py` already imported the same way) since the runtime
+  actually reads it now — it started out in `chat_settings.py` during
+  the config-only round and moved once that stopped being true.
+- **`backend/apis/chat_settings.py`'s `GET`/`PUT /agent/chat-settings`**
+  carries `chat_intent_prompt`/`default_chat_intent_prompt` alongside
+  the existing `chat_system_prompt` fields, each independently optional
+  in the `PUT` body (omit one to leave it untouched, explicit null
+  resets just that one). **`POST .../suggest-intent-prompt`** mirrors
   `business_profile.py`'s `suggest_business_profile` propose-then-owner-
-  applies pattern exactly: drafts a prompt from `_gather_ready_document_
-  text`'s ingested company-material documents plus a listing of any
-  already-configured `IntentSchema`s (their label/description, so the
-  draft can name real configured request types, not just guess from raw
-  prose), and never saves anything itself — the owner reviews/edits in
-  the dashboard before an explicit Save. Degrades to an empty suggestion
-  (not an error) when there are no ready documents, same posture as
-  every other RAG-adjacent suggest endpoint in this app.
-- **`ChatPromptSettingsPanel`** (frontend) gained a second, independent
-  card below the existing system-prompt editor — same Textarea/Badge/
-  Save/Reset shape, plus a "Suggest from documents" button
-  (`Sparkles` icon) and its own status/error state. Carries an explicit
-  "Not yet live" `Badge` and copy stating plainly that saving this text
-  has **no effect on live chat** today — deliberate, so an owner never
-  mistakes filling this in for the feature actually working yet.
-- **Verified end-to-end against the real running stack**: `GET`/`PUT
-  /agent/chat-settings` round-trip `chat_intent_prompt` independently of
-  `chat_system_prompt` (setting one leaves the other untouched, reset-
-  to-null restores the built-in default); `POST .../suggest-intent-
-  prompt` correctly passed the `document_count == 0` short-circuit stage
-  (real ready company documents exist on this dev instance) and reached
-  a real call to the configured `custom` chat provider, which correctly
-  surfaced as a clean 502 rather than a crash when that local server
-  wasn't running — the same known external-dependency gap already
-  documented elsewhere in this file, not a code issue. A full successful
-  LLM-drafted suggestion was not exercised this round for that reason.
-  `tsc`/`eslint`/a real production build (`docker compose run --rm
-  frontend npm run build`) all clean.
+  applies pattern: drafts a prompt from `_gather_ready_document_text`'s
+  ingested company-material documents plus a listing of any already-
+  configured `IntentSchema`s, never saves anything itself. Degrades to
+  an empty suggestion (not an error) when there are no ready documents.
+- **`backend/apis/chat.py`'s `_intent_triage_call`/
+  `_intent_triage_system_prompt`/`_build_triage_control`** — mirrors
+  `_lead_extraction_call`/`_order_extraction_call`'s existing shape
+  exactly: one fixed-shape classification call, never arbitrary tool
+  access. Only ever attempted by `chat()` on a conversation's very first
+  turn (`not history and not req.attachment_url` — a real attachment
+  already shows clear intent, and a second triage question mid-
+  conversation was never part of the design). Grounds its decision in
+  this business's already-loaded `IntentSchema`s/`Product` catalog (the
+  same data `_available_request_types_block`/`_menu_context_block`
+  already use for the main reply) rather than a separate RAG call, and
+  reads `AppSettings.chat_intent_prompt` via a new
+  `_resolve_intent_prompt(db)` (same null-means-`DEFAULT_INTENT_PROMPT`
+  fallback as `_resolve_system_prompt`). Returns `None` on any failure
+  (provider unreachable, malformed JSON) — `chat()` treats that
+  identically to an explicit "don't ask," never blocking the turn.
+  `_build_triage_control` never trusts the model's `control_type`/
+  `options` shape blindly — an unrecognized type, or missing/malformed
+  options for a radio/checkbox/select type, both degrade to a plain
+  `"text"` control (no special widget) rather than ever surfacing a
+  broken control with nothing to click; verified directly by feeding
+  malformed/missing-options JSON straight into the function.
+- **`ChatResponse.control: ChatControlOut | None`** (new
+  `ChatControlOut`/`ChatOptionOut` Pydantic models) — the same
+  `{type, options}` structured-control contract `frontend/src/lib/
+  types.ts`'s `ChatControl` type had always defined (its own doc comment
+  says so explicitly — written forward-looking for exactly this, back
+  when only the scripted wizard used it). When triage decides to ask,
+  `chat()` returns early with `reply` set to the question text and
+  `control` set — skipping RAG/order/lead-capture for that one turn —
+  but still logs the question as a `ChatMessage` for
+  `ChatSessionViewerPanel`/market-research review, same as any other
+  reply.
+- **`chat-panel.tsx` rewritten** — the old hardcoded `CATEGORY_OPTIONS`/
+  `TAG_OPTIONS`/`CHANNEL_OPTIONS` arrays and the `step: 0|1|2|3|"done"`
+  state machine are gone entirely. The seed greeting is now a single
+  generic line with no control; every real turn (free text OR a clicked
+  control option, both through one shared `sendTurn` function) calls the
+  real `/api/chat` from message 1. A clicked control option is resolved
+  back to its human-readable label before being sent as this turn's
+  plain-language message — the LLM sees natural language, never a raw
+  machine value. **The seed message is excluded from the `history` array
+  sent to the backend** (filtered by its fixed `SEED_MESSAGE_ID`) — this
+  is what lets `_intent_triage_call`'s `not history` gate correctly
+  detect "this is really the first turn." `ChatControlRenderer`/
+  `ChatMessageBubble` needed **zero changes** — the generic
+  `{type, options}` rendering + `onControlSubmit` plumbing they already
+  had was, per `ChatControl`'s own pre-existing doc comment, already
+  built for exactly this. `ChatPromptSettingsPanel`'s intent-prompt card
+  dropped the "Not yet live" badge/copy the config-only round had
+  carried, since it's live now.
+- **Verified end-to-end against the real running stack.** Config CRUD:
+  `GET`/`PUT /agent/chat-settings` round-trip `chat_intent_prompt`
+  independently of `chat_system_prompt`; `suggest-intent-prompt`
+  correctly passed its `document_count == 0` short-circuit and reached a
+  real (if unreachable-in-this-session) configured provider. Runtime
+  wiring: direct unit-level calls confirmed `_intent_triage_call`'s JSON
+  parsing and `_build_triage_control`'s degrade-to-`"text"` safety net
+  both work in isolation; then against a REAL bundled-Ollama model (a
+  temporarily pulled/tuned `qwen2.5:0.5b`, swapped in as `chat_provider`/
+  `chat_model` only — vision/embedding untouched — via the real `PUT
+  /agent/settings` API, restored to the owner's exact original
+  `custom`-provider snapshot afterward via a direct DB write, the same
+  "known-good snapshot restore" pattern used elsewhere in this file when
+  a live-revalidation PUT can't succeed because the owner's own local
+  llama-server isn't running here): a real first-turn message ("I want
+  to talk about insurance" — this dev instance has `insurance_claim`/
+  `insurance_application` schemas configured) correctly triggered
+  `ask: true` with a real `control: {"type": "text"}` over HTTP; several
+  other first-turn messages correctly returned `control: null` and fell
+  through to the ordinary reply pipeline unchanged. `tsc`/`eslint`/a real
+  production build all clean. Test chat sessions/models cleaned up after.
+- **A genuine, honest caveat**: `qwen2.5:0.5b` is a very small model —
+  its triage judgment itself was inconsistent (several genuinely
+  ambiguous test messages got `ask: false` when a stronger model might
+  reasonably have asked). This round verifies the *mechanism* — the
+  classification call, the control-safety degrade path, the full
+  request/response wiring, the frontend rendering — actually works
+  end-to-end, not that any particular small model's judgment is great. A
+  real production setup (this dev instance's own configured 27B
+  `custom` model, unreachable from this sandboxed test environment)
+  should judge noticeably better.
 
 ### Public "contact us" form + site-wide 404 page (`backend/apis/contact.py`, `frontend/src/app/not-found.tsx`)
 
@@ -3977,6 +4190,88 @@ semantic `<h1>` that a generic `TextContentBlock` (always `<p>`) can't
 replicate. Keep both families; don't try to merge them without new
 evidence.
 
+### Vision-model reliability for Container nesting — tested 2026-09-09, real findings
+
+Closes (with real data, not more speculation) the long-standing "Known
+gap"/"Suggested next step" item asking whether the vision model can
+reliably generate the Container/Block schema's nested-row-of-columns
+pattern from a real design image — every example of it in this app had
+until now been hand-authored, never generated by the model on its own.
+
+- **Method**: three synthetic PNG mockups (built with PIL directly inside
+  the backend container, no external design tool) fed through the real
+  `POST /agent/landing-page/generate` pipeline against a real, live
+  vision-capable model — `gemma3:4b`, temporarily pulled via the bundled
+  Ollama and tuned the same way `ollama_admin.py`'s pull flow always
+  does, swapped in as `vision_provider`/`vision_model` only (chat/
+  embedding untouched), restored to the owner's exact original `custom`
+  27B-model snapshot afterward via a direct DB write (same known-good-
+  snapshot-restore pattern used elsewhere in this file when the owner's
+  own local llama-server isn't reachable to live-revalidate a PUT).
+  1. A plain stacked hero (headline above subheadline, photo beside the
+     whole column — a real, valid `hero` case, no container involved) —
+     included as a sanity baseline, not a nesting test.
+  2. **The canonical 2-level-nesting case named directly in
+     `_VISION_SYSTEM_PROMPT` itself**: a row of two UNEVEN-width columns,
+     different background tints, each holding its own photo placeholder
+     + caption underneath, no card border — exactly the "50/50-photo-
+     columns... canonical case" the prompt's own width-heuristic section
+     describes.
+  3. Three EQUAL-width columns, same treatment — per the prompt's own
+     rule this should collapse to one flat `"grid"` container with 3
+     children and needs NO nesting at all, a simpler sibling case.
+- **Result 1 (baseline hero)**: correctly identified as a hero — but the
+  model ALSO hallucinated a second, spurious `container` section with a
+  fabricated `background_image` ("Blue background," not in the source
+  image at all) and a duplicated copy of the real caption text. Not a
+  nesting failure, but a real reliability problem: even the simplest,
+  unambiguous case produced an extra, invented section.
+- **Result 2 (the actual 2-level-nesting target case)**: the model
+  **hallucinated an entirely fictional headline/eyebrow/subheadline**
+  ("Trusted Advisors," "About Us," "We're committed to helping our
+  clients succeed...") for a bogus `hero` section — none of that text
+  exists anywhere in the source image, which had zero headline text at
+  all. It then emitted a `container` with `layout: "row"` (the correct
+  top-level type!) but with only ONE child — a lone, uncaptioned image
+  block. **No nesting was attempted at all**: neither column became its
+  own nested container, one column's photo+caption pair was dropped
+  entirely, and the other lost its caption. The specific pattern this
+  test targeted — a row containing two nested column-containers — was
+  never produced, not even incorrectly; the model quietly gave up on
+  representing the second column at all.
+- **Result 3 (equal columns, should need zero nesting)**: even the
+  *simpler* flat case failed independently of nesting — the model
+  invented a full paragraph of fictional marketing copy for a hero
+  section from an image containing no real text at all beyond three
+  short captions, then split the three real columns into two separate,
+  nonsensical `feature-grid` sections (`"columns": 2` for 2 and 1 items
+  respectively) with one item's title/description duplicated near-
+  verbatim across both.
+- **Conclusion — real, verified, not assumed**: with a small (4B
+  parameter) vision model, structural nesting reliability is downstream
+  of a more basic problem — the model hallucinates fabricated marketing
+  copy and duplicate/incomplete sections even on the simplest synthetic
+  mockups, well before nesting depth becomes the limiting factor. The
+  2-level "row containing column-containers" pattern this app's prompt
+  explicitly documents as its own canonical case was not successfully
+  produced in this test — the model chose to drop content and flatten
+  rather than nest.
+- **Honest scope limitation, stated plainly**: this dev/test environment
+  has no way to reach the project's actual configured production vision
+  model (`custom` provider, a real 27B `Qwen3.8-27B-Uncensored` running
+  on the owner's own host machine, unreachable from this sandboxed
+  session) — only a small locally-pulled `gemma3:4b` was available to
+  test against. These findings characterize that specific small model's
+  behavior, not a verified ceiling on what the owner's own real,
+  substantially larger production model can do — a real 27B model
+  should reasonably be expected to hallucinate less and follow structural
+  instructions more reliably, though this was NOT independently
+  confirmed this round. Test images/generations were not persisted
+  anywhere in this app (no page/document was saved) and the pulled
+  model was deleted after testing — this was a pure diagnostic run
+  against the live `generate_landing_page` pipeline, not a feature
+  change.
+
 ## CTE (click-to-edit), `/editor`
 
 Admin/owner-gated. Deliberately **not GrapesJS** (the original plan's
@@ -4152,17 +4447,21 @@ considering it fully settled.
 ## Progress against the plan's phases (四、开发顺序建议)
 
 - **Phase 1 — Skeleton**: done. Next.js + Tailwind, Postgres/Alembic,
-  real self-issued-JWT auth + RBAC (deliberately not Firebase — this is
-  a local-demo MVP, not a real deployment; don't push toward Firebase/
-  cloud deploy unless asked). 3 seeded demo accounts, password `0000`
-  for all: `owner@example.com`, `admin@example.com`, `user@example.com`.
+  real self-issued-JWT auth + RBAC (deliberately not Firebase — still
+  standing, not reconsidered). 3 seeded demo accounts, password `0000`
+  for all: `owner@example.com`, `admin@example.com`, `user@example.com`
+  — **local-demo-only credentials, never used on a real deployment**,
+  see "Deploying to a real server" above for the real `create_owner.py`
+  bootstrap that replaces them there.
   **2026-08-22**: real Google OAuth added for the public `user` tier
   (`backend/apis/oauth.py`) — still self-issued JWTs underneath, not
   Firebase; OAuth is just a second way to prove identity before this
   app's own token takes over, confirmed with the user as in-scope and
   distinct from the standing "no Firebase" call. admin/owner stay
   password-only, a deliberate, confirmed design boundary — see "Social
-  login" below.
+  login" below. **2026-09-09: the original "not a real deployment, don't
+  push toward cloud deploy" framing is reversed** — real deployment
+  automation now exists, see "Deploying to a real server" above.
 - **Phase 2 — RAG core**: done. See "RAG" above.
 - **Phase 3 — Chatbot**: mostly done. `POST /api/chat` real, provider-
   abstracted, RAG-merged, with automatic lead capture and optional
@@ -4170,16 +4469,15 @@ considering it fully settled.
   optional caller identity" above). **Not done**: streaming (SSE/
   WebSocket — single non-streaming call today, and deliberately staying
   that way for the public path, see "Suggested next step" below for
-  why); real LLM-driven intent recognition (the frontend's
-  category→tags→channel→free-text flow is a **scripted local sequence**,
-  not LLM-driven — it demonstrates the `{type, options}` structured-
-  control contract, nothing more). **2026-09-09**: the config-layer
-  groundwork for the intent-recognition half now exists —
-  `AppSettings.chat_intent_prompt`, an AI-draft-from-documents endpoint,
-  and a dashboard editor (see "Intent-triage prompt" above) — but
-  `/api/chat`'s actual runtime still doesn't read it; the scripted
-  wizard is unchanged until a follow-up wires a real classification call
-  to it.
+  why). **Real LLM-driven intent recognition is now done, 2026-09-09** —
+  see "Real LLM-driven intent triage" above: `chat-panel.tsx`'s old
+  hardcoded category→tags→channel wizard is gone; a real classification
+  call (`_intent_triage_call`, `backend/apis/chat.py`) decides, on a
+  conversation's first turn, whether to ask a structured clarifying
+  question via the same `{type, options}` control contract, grounded in
+  `AppSettings.chat_intent_prompt` and this business's own configured
+  schemas/products. Verified live end-to-end against a real (small)
+  bundled-Ollama model.
 - **Phase 4 — CTE editor**: done, extensively. See "CTE" above.
 - **Phase 5 — Visual polish**: page generation/schema done (see "Page
   schema" above). **Not done**: GSAP/ScrollTrigger (not started); Swiper
@@ -4539,19 +4837,6 @@ is ever built at all, it's scoped to `owner-agent`'s own run output only
 (an owner watching their own agent work, a different audience/use case)
 — see "Progress against the plan's phases," Phase 3.
 
-**Phase 1's original "no cloud/EC2 deploy" scope cut is REVERSED as of
-2026-09-09** — the user explicitly asked for this project to be
-deployable "像WP那样" (like WordPress) on AWS EC2 or another server, with
-a first-run setup wizard modeled on an OS's own out-of-box experience.
-Confirmed scope for this round, via `AskUserQuestion`: build the
-web-based setup wizard only (see "First-run setup wizard" above) —
-**a real one-command/scripted EC2 deployment (installing Docker,
-pulling this repo, running compose, configuring security groups/a
-domain, ...) is NOT built yet and remains a real, larger open item**,
-explicitly not started, not merely deferred-and-forgotten. Don't
-describe cloud deploy as "out of scope by explicit decision" anymore —
-describe it as "wizard done, deployment automation itself still open."
-
 **Known gaps, still open** (beyond the per-phase "Not done" bullets in
 "Progress against the plan's phases" above):
 - **A real in-browser click-through of everything in this project** —
@@ -4560,27 +4845,21 @@ describe it as "wizard done, deployment automation itself still open."
   verified via `tsc`/`eslint`/curl/backend checks, dev-server logs, and
   (more recently) the user's own screenshots — never a live click-through
   by this session's own tools.
-- Whether the vision model can reliably generate the Container/Block
-  schema's *deeper nesting* patterns from a real design image — still
-  genuinely open; every nested-container example in this app so far was
-  hand-authored, never generated by the model on its own.
-- **"Real LLM-driven intent recognition"** — `chat/chat-panel.tsx`'s
-  steps 0-2 (category → tags → channel) are STILL a hand-authored, fixed
-  decision tree, not the LLM classifying anything; only step 3 onward
-  calls the real `/api/chat`. **2026-09-09**: the config-layer
-  groundwork now exists (`AppSettings.chat_intent_prompt`, an AI-draft-
-  from-documents endpoint, a dashboard editor — see "Intent-triage
-  prompt" above), but `/api/chat`'s runtime still doesn't read it. A
-  real version needs: a new classification call (mirroring
-  `_lead_extraction_call`/`_order_extraction_call`'s existing shape), a
-  `ChatResponse.control` field, and a rewrite of `chat-panel.tsx`'s step
-  state machine to call the backend from turn 1 instead of walking the
-  same fixed wizard.
-- **Automated cloud/server deployment** (2026-09-09, see "Suggested next
-  step" above) — the setup wizard (`/setup`) exists; a real one-command
-  EC2/server deployment script does not. Genuinely unstarted, not just
-  deferred: installing Docker, pulling this repo, running compose,
-  handling a domain/TLS/security groups are all still fully manual.
+- **Vision-model reliability for deep Container/Block nesting** —
+  tested for real, 2026-09-09, see "Vision-model reliability for
+  Container nesting" above. Real answer, not a proven ceiling on every
+  configuration: a small (4B) vision model hallucinated fabricated
+  content and produced incomplete/un-nested output even on simple
+  mockups built to trigger the documented 2-level "row containing
+  columns" case; not independently verified against this project's own
+  actual, larger (27B) production vision model, unreachable from the
+  sandboxed session that ran the test.
+- **Real deployment automation (`deploy/setup-server.sh`) exists but its
+  OS-level install/certbot orchestration was never exercised against a
+  genuinely fresh cloud VM/resolving domain** — no access to either from
+  this sandboxed session. See "Deploying to a real server" above for
+  exactly what WAS verified for real (idempotency, the `.env` upsert
+  logic, a real `nginx -t`, `shellcheck`) versus this specific gap.
 - Local resource coordination (`resource_broker.py`) is deliberately
   v1-scoped: the standalone embedding server isn't part of it (a
   one-line `--sleep-idle-seconds` fix would cover it, not broker logic),

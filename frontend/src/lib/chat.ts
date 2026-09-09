@@ -1,5 +1,5 @@
 import { apiFetch } from "@/lib/api";
-import type { ChatProductCard, RagSource } from "@/lib/types";
+import type { ChatControl, ChatProductCard, RagSource } from "@/lib/types";
 
 export type ChatApiTurn = {
   role: "user" | "assistant";
@@ -11,6 +11,11 @@ type ChatApiResponse = {
   sources: RagSource[];
   products: ChatProductCard[] | null;
   search_link: string | null;
+  // Real LLM-driven intent triage (2026-09-09, backend/apis/chat.py's
+  // _intent_triage_call) — a structured clarifying question for a
+  // conversation's very first turn, when the model judges one would
+  // help. null for every ordinary reply.
+  control: ChatControl | null;
 };
 
 type ChatUploadResponse = {
@@ -73,7 +78,13 @@ export async function sendChatMessage(
   message: string,
   history: ChatApiTurn[] = [],
   attachmentUrl?: string,
-): Promise<{ reply: string; sources: RagSource[]; products: ChatProductCard[] | null; searchLink: string | null }> {
+): Promise<{
+  reply: string;
+  sources: RagSource[];
+  products: ChatProductCard[] | null;
+  searchLink: string | null;
+  control: ChatControl | null;
+}> {
   const response = await apiFetch<ChatApiResponse>("/api/chat", {
     method: "POST",
     body: { message, history, session_id: getChatSessionId(), attachment_url: attachmentUrl ?? null },
@@ -83,6 +94,7 @@ export async function sendChatMessage(
     sources: response.sources,
     products: response.products,
     searchLink: response.search_link,
+    control: response.control,
   };
 }
 

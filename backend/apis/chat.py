@@ -240,6 +240,29 @@ SYSTEM_PROMPT = (
 )
 
 
+# The built-in default for AppSettings.chat_intent_prompt — moved here
+# 2026-09-09 from apis/chat_settings.py (which originally owned it back
+# when this was config-layer-only, unwired) now that _intent_triage_call
+# below actually reads it, mirroring SYSTEM_PROMPT's own
+# "defined and used in this file, chat_settings.py just exposes it"
+# posture. apis/chat_settings.py imports this the same way it already
+# imports SYSTEM_PROMPT.
+DEFAULT_INTENT_PROMPT = """You help decide, at the start of a visitor's conversation, whether asking one \
+short structured question would help route them faster before the main assistant replies.
+
+Given the visitor's message and the conversation so far, decide:
+1. Is the visitor's need already clear enough to answer directly? If so, ask nothing — go straight to a \
+normal reply.
+2. If not, what is the single most useful clarifying question to ask right now, and should it be presented \
+as a multiple-choice question (pick one), a checkbox question (pick any that apply), or a short free-text \
+prompt?
+
+Base any categories/options you offer on what THIS business actually does — its documented services and any \
+request types it has explicitly configured for structured intake (appointments, quotes, claims, or anything \
+else) — never on a generic template. Keep it to a single short question with a handful of options, never a \
+multi-question survey, and never ask when the visitor has already told you enough to proceed."""
+
+
 def _resolve_system_prompt(db: Session) -> str:
     """Owner-configurable (2026-08-21, apis/chat_settings.py) — an
     AppSettings.chat_system_prompt row FULLY REPLACES the built-in
@@ -261,6 +284,16 @@ def _resolve_system_prompt(db: Session) -> str:
     if row and row.chat_system_prompt:
         return row.chat_system_prompt
     return SYSTEM_PROMPT
+
+
+def _resolve_intent_prompt(db: Session) -> str:
+    """Same null-means-default fallback as _resolve_system_prompt above,
+    for the separate chat_intent_prompt field (2026-09-09) — see
+    _intent_triage_call's docstring for what actually reads this now."""
+    row = db.get(AppSettings, 1)
+    if row and row.chat_intent_prompt:
+        return row.chat_intent_prompt
+    return DEFAULT_INTENT_PROMPT
 
 
 def _chunk_source_note(chunk: RetrievedChunk) -> str:
@@ -1018,6 +1051,16 @@ class ChatSource(BaseModel):
     score: float | None = None
 
 
+class ChatOptionOut(BaseModel):
+    label: str
+    value: str
+
+
+class ChatControlOut(BaseModel):
+    type: str  # "radio" | "checkbox" | "select" | "text" — matches frontend/src/lib/types.ts's ChatControlType
+    options: list[ChatOptionOut] | None = None
+
+
 class ChatResponse(BaseModel):
     reply: str
     sources: list[ChatSource] = []
@@ -1029,6 +1072,13 @@ class ChatResponse(BaseModel):
     # AGENTS.md for the full "why" behind this refactor).
     products: list["ProductCardOut"] | None = None
     search_link: str | None = None
+    # Set by _intent_triage_call below (2026-09-09) — a real LLM-driven
+    # clarifying question for the very first turn of a conversation, when
+    # the model judges one would help. Mirrors the same {type, options}
+    # structured-control contract frontend/src/lib/types.ts's ChatControl
+    # has always defined for this purpose (see that type's own doc
+    # comment — it was written forward-looking for exactly this).
+    control: ChatControlOut | None = None
 
 
 class ChatUploadRequest(BaseModel):
@@ -1126,6 +1176,105 @@ def _get_or_create_session(db: Session, session_key: str, user_email: str | None
     return session
 
 
+_TRIAGE_CONTROL_TYPES = {"radio", "checkbox", "select", "text"}
+
+
+def _intent_triage_system_prompt(intent_prompt: str, schemas: list[IntentSchema], products: list[Product]) -> str:
+    """Grounds the owner's (or default) intent-triage instructions in this
+    business's actual configured request types/catalog — the same
+    schemas/products the main reply's own context blocks already use
+    (_available_request_types_block/_menu_context_block) — rather than a
+    separate RAG call, keeping this a single, cheap classification call.
+    Deliberately no RAG document excerpts here: this fires once, before
+    the visitor has said enough to know what's relevant to retrieve, and
+    the built-in default prompt is written to work fine without them
+    (schemas/products alone are usually the real "what does this business
+    offer" signal for a fresh visitor)."""
+    context_parts = []
+    if schemas:
+        context_parts.append(
+            "This business has these configured request types:\n"
+            + "\n".join(f"- {s.label}: {s.description}" for s in schemas)
+        )
+    if products:
+        context_parts.append(
+            "This business's product catalog:\n" + "\n".join(f"- {p.name}" for p in products[:20])
+        )
+    context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
+
+    return (
+        f"{intent_prompt}\n"
+        f"{context_block}\n\n"
+        "Respond with ONLY a single JSON object, no markdown fences, no commentary before or after it:\n"
+        '{"ask": true or false, "question": "<the single clarifying question to ask, or null if ask is '
+        'false>", "control_type": "radio" or "checkbox" or "select" or "text", "options": '
+        '[{"label": "<shown to the visitor>", "value": "<short machine value>"}, ...]}\n\n'
+        'Only include "options" (2-5 of them) when control_type is "radio"/"checkbox"/"select" — omit it '
+        '(or use an empty list) for "text", where the visitor just types their answer normally. Set ask to '
+        "false — and question to null — whenever the visitor's very first message already gives you enough "
+        "to answer directly, or is just a greeting/general question with no real ambiguity to resolve."
+    )
+
+
+async def _intent_triage_call(
+    provider,
+    message: str,
+    intent_prompt: str,
+    schemas: list[IntentSchema],
+    products: list[Product],
+) -> dict | None:
+    """The real LLM-driven half of intent recognition (2026-09-09) — see
+    the root AGENTS.md's "Intent-triage prompt" section for the config
+    layer this reads (AppSettings.chat_intent_prompt via
+    _resolve_intent_prompt) and its own history: that round deliberately
+    stopped short of wiring a runtime call at all. This is that call.
+
+    Only ever attempted by chat() on a conversation's very first turn
+    (see that gate there) — a single fixed-shape classification decision
+    (ask a clarifying question, or don't), same "one bounded LLM call,
+    never arbitrary tool access" posture as _lead_extraction_call/
+    _order_extraction_call. Returns None on any failure (network,
+    malformed JSON, unconfigured provider) — chat() treats that
+    identically to an explicit "don't ask," so a triage failure never
+    blocks or breaks the visitor's first reply, only skips the
+    clarifying-question step."""
+    try:
+        raw = await provider.chat(
+            [{"role": "user", "content": message}],
+            system=_intent_triage_system_prompt(intent_prompt, schemas, products),
+        )
+        return parse_lenient_json(raw)
+    except (httpx.HTTPError, ProviderNotConfigured, ValueError):
+        return None
+
+
+def _build_triage_control(triage: dict) -> ChatControlOut | None:
+    """Turns _intent_triage_call's already-parsed JSON into the real
+    ChatControlOut the frontend renders — never trusts the model's
+    control_type/options shape blindly: an unrecognized type or missing/
+    malformed options both degrade to a plain "text" control (no special
+    widget, the visitor just types normally) rather than surfacing a
+    broken control with nothing to click."""
+    control_type = triage.get("control_type")
+    if control_type not in _TRIAGE_CONTROL_TYPES:
+        control_type = "text"
+
+    options: list[ChatOptionOut] | None = None
+    raw_options = triage.get("options")
+    if isinstance(raw_options, list):
+        parsed_options = [
+            ChatOptionOut(label=str(o["label"]), value=str(o["value"]))
+            for o in raw_options
+            if isinstance(o, dict) and o.get("label") and o.get("value")
+        ]
+        options = parsed_options or None
+
+    if control_type in ("radio", "checkbox", "select") and not options:
+        control_type = "text"
+
+    return ChatControlOut(type=control_type, options=options)
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest, db: Session = Depends(get_db), current: CurrentUser = Depends(get_current_user)
@@ -1195,6 +1344,34 @@ async def chat(
         # the intent-schema lookups above, fully independent of them.
         products = _load_products(db)
         active_order = find_active_order(db, chat_session_id)
+
+        # Real LLM-driven intent triage (2026-09-09) — only ever attempted
+        # on the conversation's very first turn (no history yet — the
+        # frontend's own seed greeting is excluded from what it sends as
+        # `history`, see chat-panel.tsx). Skipped once a real attachment is
+        # already on this turn (the visitor has already shown clear
+        # intent) or once the conversation is underway (history non-empty)
+        # — a second triage question mid-conversation would just be
+        # annoying, and the model was never asked to consider one anyway.
+        # Failure here (provider unreachable, malformed JSON) degrades to
+        # "don't ask," never blocks the turn — same swallow-and-degrade
+        # posture as every other best-effort classification call in this
+        # module.
+        if not history and not req.attachment_url:
+            try:
+                triage_provider = resolve_chat_provider(db)
+            except ProviderNotConfigured:
+                triage_provider = None
+            if triage_provider is not None:
+                triage = await _intent_triage_call(
+                    triage_provider, req.message, _resolve_intent_prompt(db), intent_schemas, products
+                )
+                if triage and triage.get("ask") and isinstance(triage.get("question"), str) and triage["question"].strip():
+                    question = triage["question"].strip()
+                    if session is not None:
+                        db.add(ChatMessage(session_id=session.id, role="assistant", content=question))
+                        db.commit()
+                    return ChatResponse(reply=question, control=_build_triage_control(triage))
 
         try:
             embedder = resolve_embedding_provider(db)

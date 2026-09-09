@@ -211,15 +211,11 @@ export function ChatPromptSettingsPanel() {
                 Default
               </Badge>
             )}
-            <Badge variant="outline" className="text-xs text-muted-foreground">
-              Not yet live
-            </Badge>
           </h3>
           <p className="text-xs text-muted-foreground">
-            Reserved for an upcoming feature that will let the chatbot decide, per visitor, whether to
-            ask a short clarifying question before replying — instead of the fixed 3-question wizard
-            `/chat` shows today. Saving this text right now has <strong>no effect on live chat</strong>;
-            it only stores what that future feature will use once it&apos;s wired up.
+            Guides the chatbot&apos;s decision, on the very first message of each conversation, whether
+            asking one short clarifying question would help before replying — live as of the visitor&apos;s
+            next chat. Leave the visitor&apos;s need clear and it asks nothing and answers directly.
           </p>
         </div>
 

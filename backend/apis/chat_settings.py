@@ -12,19 +12,16 @@ full reasoning behind why a FULL replacement (not an append-only
 override) was judged safe enough to allow, confirmed directly with the
 user.
 
-**`chat_intent_prompt` (2026-09-09) — config layer only, NOT wired into
-any live runtime yet.** This is the groundwork for eventually replacing
-`chat-panel.tsx`'s hardcoded 3-step category/tags/channel wizard (see
-the root AGENTS.md's "real LLM-driven intent recognition" open item)
-with a real model decision about whether/what structured question to
-ask a visitor before the main reply. This round deliberately stops at:
-a stored prompt, an LLM-drafted suggestion from ingested company
-documents (mirrors `business_profile.py`'s `suggest_business_profile`
-propose-then-owner-applies pattern exactly), and a dashboard panel to
-view/edit/reset it. `/api/chat` does not read this field at all yet —
-saving it has zero effect on live chat behavior until a future round
-wires a real classification call to it, the same way
-`_lead_extraction_call`/`_order_extraction_call` already work."""
+**`chat_intent_prompt` (2026-09-09) — now wired into `/api/chat`'s real
+runtime.** `apis/chat.py`'s `_intent_triage_call` reads this (via
+`_resolve_intent_prompt`) on a conversation's very first turn to decide
+whether asking one structured clarifying question would help before the
+main reply — replacing `chat-panel.tsx`'s old hardcoded 3-step category/
+tags/channel wizard (see the root AGENTS.md's "real LLM-driven intent
+recognition" section). `DEFAULT_INTENT_PROMPT` itself now lives in
+`apis/chat.py` (imported here, same as `SYSTEM_PROMPT` already was) —
+this file still owns the owner-facing settings surface (get/put/suggest)
+on top of it."""
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -33,7 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from apis.agent import _gather_ready_document_text
-from apis.chat import SYSTEM_PROMPT
+from apis.chat import DEFAULT_INTENT_PROMPT, SYSTEM_PROMPT
 from apis.deps import Role, require_role
 from apis.model_settings import resolve_chat_provider
 from db import get_db
@@ -41,26 +38,6 @@ from models import AppSettings, IntentSchema
 from providers.base import ProviderNotConfigured
 
 router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
-
-# The built-in default for chat_intent_prompt — describes the future
-# dynamic-triage behavior this prompt is meant to drive, not anything
-# `/api/chat` actually executes today. Kept local to this file (not
-# alongside SYSTEM_PROMPT in apis/chat.py) since nothing in the runtime
-# reads it yet — see this module's own docstring.
-DEFAULT_INTENT_PROMPT = """You help decide, at the start of a visitor's conversation, whether asking one \
-short structured question would help route them faster before the main assistant replies.
-
-Given the visitor's message and the conversation so far, decide:
-1. Is the visitor's need already clear enough to answer directly? If so, ask nothing — go straight to a \
-normal reply.
-2. If not, what is the single most useful clarifying question to ask right now, and should it be presented \
-as a multiple-choice question (pick one), a checkbox question (pick any that apply), or a short free-text \
-prompt?
-
-Base any categories/options you offer on what THIS business actually does — its documented services and any \
-request types it has explicitly configured for structured intake (appointments, quotes, claims, or anything \
-else) — never on a generic template. Keep it to a single short question with a handful of options, never a \
-multi-question survey, and never ask when the visitor has already told you enough to proceed."""
 
 
 class ChatPromptSettings(BaseModel):

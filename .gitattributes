@@ -1,1 +1,6 @@
 *.pdf binary
+# Shell scripts must stay LF regardless of core.autocrlf — a CRLF
+# shebang line breaks "bad interpreter" on the Linux servers
+# deploy/setup-server.sh and deploy/update.sh are actually meant to run
+# on, even though this repo is also worked on from Windows.
+*.sh text eol=lf
