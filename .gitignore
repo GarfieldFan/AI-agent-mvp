@@ -15,6 +15,16 @@ __pycache__/
 # runtime data — owner-agent's action log (owner-agent/logging_.py)
 /owner-agent/logs/
 
+# runtime data — backend's unhandled-error log (backend/error_alerts.py)
+/backend/logs/
+
+# runtime data — locally downloaded LLM model files, see models/README.md.
+# Model files are large and machine-specific; this repo only tracks the
+# folder's own README + .gitkeep, never what an owner drops into it.
+/models/*
+!/models/.gitkeep
+!/models/README.md
+
 # editor scratch space
 /.scratch/
 

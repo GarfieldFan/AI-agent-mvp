@@ -205,6 +205,20 @@ class AppSettings(Base):
     # exact case.
     custom_base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     custom_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Cloud provider API keys (2026-09-09) — previously env-var-only
+    # (OPENAI_API_KEY/etc., still supported as a fallback when these are
+    # unset — see providers/openai.py's own docstring), now also
+    # settable via the dashboard/setup wizard without a restart. DB value
+    # takes priority over the env var when both are set (see
+    # apis/model_settings.py's `_cloud_api_key`). Write-only, same
+    # never-echoed-back posture as custom_api_key above and every other
+    # secret field in this app (Stripe/Mailgun/Twilio/...). One key per
+    # vendor covers chat+vision+embedding+image-gen alike, matching how
+    # each vendor's own API actually works (one key authenticates
+    # everything under that account).
+    openai_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    anthropic_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gemini_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The one active embedding config — see DocumentChunk.embedding's
     # comment for why this is a single active slot rather than several
     # coexisting ones. embedding_dimensions is the *actual* length of the
@@ -316,6 +330,12 @@ class AppSettings(Base):
     twilio_account_sid: Mapped[str | None] = mapped_column(String(255), nullable=True)
     twilio_auth_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
     twilio_from_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Error-alert email address (2026-09-09, see backend/error_alerts.py) —
+    # where an automatic alert goes when the backend hits a genuinely
+    # unhandled (5xx-crash-class) error. No separate "enabled" flag, same
+    # posture as `is_email_configured` above: an alert fires whenever
+    # BOTH a real email provider (not "test") AND this address are set.
+    alert_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Map embed gate (2026-08-21, see backend/maps.py) — same "swappable
     # provider, null/'test' means the safe zero-config default" pattern as
     # payment/email above, extended to a fourth capability domain: showing
@@ -392,6 +412,17 @@ class AppSettings(Base):
     # their own fixed prompts this field never touches. See
     # `_resolve_system_prompt`'s own docstring for the full reasoning.
     chat_system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Intent-triage prompt (2026-09-09, apis/chat_settings.py) — config-
+    # layer only for now, deliberately NOT wired into /api/chat's actual
+    # runtime yet (see that router's own docstring). Meant to eventually
+    # replace chat-panel.tsx's hardcoded 3-step category/tags/channel
+    # wizard with a real LLM decision about whether/what structured
+    # question to ask a visitor before replying. Same null-means-default
+    # convention as chat_system_prompt; drafted via POST
+    # /agent/chat-settings/suggest-intent-prompt from ingested company
+    # documents, owner reviews/edits before saving, same propose-then-
+    # owner-applies posture as business_profile.py's suggest endpoint.
+    chat_intent_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Social login for the public `user` tier only (2026-08-22, see
     # apis/oauth.py) — confirmed directly with the user: admin/owner stay
     # on the existing password+JWT system, never OAuth, since those

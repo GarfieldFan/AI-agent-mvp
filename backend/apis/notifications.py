@@ -81,6 +81,10 @@ class NotificationSettings(BaseModel):
     twilio_account_sid: str | None
     twilio_from_number: str | None
     twilio_auth_token_set: bool
+    # Where error_alerts.py sends an automatic alert on a genuinely
+    # unhandled backend error — not a secret, safe to echo back. Reuses
+    # whichever provider is configured above (no separate credential set).
+    alert_email: str | None
 
 
 @router.get("/notification-settings", response_model=NotificationSettings)
@@ -95,6 +99,7 @@ def get_notification_settings(db: Session = Depends(get_db)) -> NotificationSett
         twilio_account_sid=row.twilio_account_sid if row else None,
         twilio_from_number=row.twilio_from_number if row else None,
         twilio_auth_token_set=bool(row and row.twilio_auth_token),
+        alert_email=row.alert_email if row else None,
     )
 
 
@@ -110,6 +115,7 @@ class UpdateNotificationSettingsRequest(BaseModel):
     twilio_account_sid: str | None = None
     twilio_from_number: str | None = None
     twilio_auth_token: str | None = None
+    alert_email: str | None = None
 
 
 @router.put("/notification-settings", response_model=NotificationSettings)
@@ -138,6 +144,8 @@ def update_notification_settings(
     if req.twilio_auth_token is not None:
         row.twilio_auth_token = req.twilio_auth_token or None
 
+    row.alert_email = (req.alert_email or "").strip() or None
+
     db.commit()
     db.refresh(row)
     return NotificationSettings(
@@ -149,6 +157,7 @@ def update_notification_settings(
         twilio_account_sid=row.twilio_account_sid,
         twilio_from_number=row.twilio_from_number,
         twilio_auth_token_set=bool(row.twilio_auth_token),
+        alert_email=row.alert_email,
     )
 
 

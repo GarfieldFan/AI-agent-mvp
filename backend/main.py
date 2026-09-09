@@ -17,7 +17,9 @@ from apis.business_profile import public_router as business_profile_public_route
 from apis.chat import router as chat_router
 from apis.chat_sessions import router as chat_sessions_router
 from apis.chat_settings import router as chat_settings_router
+from apis.contact import router as contact_router
 from apis.documents import router as documents_router
+from apis.error_log import router as error_log_router
 from apis.intent_schemas import router as intent_schemas_router
 from apis.media import MEDIA_UPLOAD_DIR
 from apis.media import router as media_router
@@ -29,6 +31,7 @@ from apis.my_account import router as my_account_router
 from apis.notifications import router as notifications_router
 from apis.oauth import admin_router as oauth_admin_router
 from apis.oauth import public_router as oauth_public_router
+from apis.ollama_admin import router as ollama_admin_router
 from apis.pages import admin_router as pages_admin_router
 from apis.pages import public_router as pages_public_router
 from apis.payments import admin_router as payments_admin_router
@@ -39,12 +42,19 @@ from apis.scheduled_tasks import router as scheduled_tasks_router
 from apis.seo_audit import admin_router as seo_audit_router
 from apis.users import router as users_router
 from chat_attachments import CHAT_UPLOAD_DIR
+from error_alerts import unhandled_exception_handler
 from rate_limit import RateLimitMiddleware
+from migrate import run_migrations_with_retry
 from scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Runs `alembic upgrade head` automatically (2026-09-09) — see
+    # migrate.py's own docstring for why: a non-technical owner can't be
+    # expected to run a migration command by hand. Must happen before
+    # anything else touches the DB.
+    run_migrations_with_retry()
     # Starts scheduler.py's in-process APScheduler (2026-08-21) — loads
     # every enabled ScheduledTask row and registers its cron job. See
     # scheduler.py's own module docstring for the full design, including
@@ -55,6 +65,13 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Basic error logging + email-on-severe-error (2026-09-09, error_alerts.py)
+# — only ever reaches a genuinely UNHANDLED exception; every deliberate
+# `raise HTTPException(...)` elsewhere in this codebase is handled by
+# Starlette's own dedicated handler and never lands here. See that
+# module's own docstring for the full "why."
+app.add_exception_handler(Exception, unhandled_exception_handler)
 
 # The frontend runs on a different port (:3000 vs :8000) so browser calls
 # from it are cross-origin. Comma-separated so a deployed frontend origin
@@ -107,6 +124,9 @@ app.include_router(my_account_router, prefix="/api")
 app.include_router(scheduled_tasks_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(seo_audit_router, prefix="/api")
+app.include_router(contact_router, prefix="/api")
+app.include_router(error_log_router, prefix="/api")
+app.include_router(ollama_admin_router, prefix="/api")
 
 # Serves apis/media.py's uploaded images back out — publicly readable by
 # filename (no RBAC), same as ComfyUI's own /view endpoint for generated

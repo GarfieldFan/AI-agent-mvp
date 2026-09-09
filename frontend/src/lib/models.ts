@@ -54,6 +54,18 @@ export type ModelSettings = {
   // separate from custom_base_url/custom_api_key above.
   embedding_base_url?: string | null;
   embedding_api_key?: string | null;
+  // Cloud provider API keys (2026-09-09) — one per vendor, covers
+  // chat+vision+embedding+image-gen for that vendor. Write-only on PUT
+  // (omit to leave the previously-saved key alone, empty string clears
+  // it); `*_api_key_set` is GET-only/informational, same pattern as
+  // lib/payments.ts's stripe_secret_key_set. Previously env-var-only
+  // (OPENAI_API_KEY/etc.) — still supported as a fallback.
+  openai_api_key?: string;
+  openai_api_key_set?: boolean;
+  anthropic_api_key?: string;
+  anthropic_api_key_set?: boolean;
+  gemini_api_key?: string;
+  gemini_api_key_set?: boolean;
   image_provider: string;
   // Only meaningful when image_provider is "comfyui" — a separate
   // endpoint config from custom_base_url above (ComfyUI isn't OpenAI-
@@ -116,6 +128,17 @@ export function updateModelSettings(settings: ModelSettings) {
   });
 }
 
+/** Saves `patch` on top of whatever's currently configured (2026-09-09)
+ * — most callers only ever intend to change one or two fields, but `PUT
+ * /agent/settings` takes the whole `ModelSettings` object, so this
+ * fetches the current settings first rather than each call site
+ * reconstructing the full shape by hand. Shared by `SetupWizard`'s
+ * `ApiKeyConnect` and `ollama-model-manager.tsx`. */
+export async function patchModelSettings(patch: Partial<ModelSettings>): Promise<ModelSettings> {
+  const current = await getModelSettings();
+  return updateModelSettings({ ...current, ...patch });
+}
+
 /** Probes an arbitrary OpenAI-compatible endpoint (llama.cpp, vLLM, ...)
  * and returns what models it currently reports — doesn't persist
  * anything, see the "Test connection" flow in model-settings-panel.tsx. */
@@ -123,5 +146,20 @@ export function testCustomProvider(baseUrl: string, apiKey?: string) {
   return apiFetch<CustomProviderTestResult>("/api/agent/models/test-custom", {
     method: "POST",
     body: { base_url: baseUrl, api_key: apiKey || null },
+  });
+}
+
+/** Sends one real chat completion through whatever chat provider/model
+ * is CURRENTLY SAVED (`resolve_chat_provider` — apis/agent.py's
+ * `/agent/chat-completion`, the same proxy owner-agent's own brain calls
+ * use) — 2026-09-09, on direct user feedback that this panel had no way
+ * to prove a just-saved cloud API key (or any other pick) actually
+ * works, short of waiting for a real visitor's chat turn to fail.
+ * Reflects the SAVED configuration, not an unsaved in-progress edit —
+ * save first if you just changed something above. */
+export function testChatCompletion(message: string) {
+  return apiFetch<{ reply: string }>("/api/agent/chat-completion", {
+    method: "POST",
+    body: { messages: [{ role: "user", content: message }] },
   });
 }

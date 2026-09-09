@@ -56,7 +56,7 @@ eventually be isolated" below.
 ai-employee/
 ├── ai-mvp-project-plan.pdf   the plan (source of truth for scope/rationale)
 ├── HISTORY.md                 full chronological development log — read on demand, not by default
-├── docker-compose.yml        backend + frontend + postgres-db + owner-agent services
+├── docker-compose.yml        backend + frontend + postgres-db + owner-agent + ollama services
 ├── .env / .env.example       host/ports/ComfyUI config — see "Configuration" below
 ├── backend/                  FastAPI (Python) — see backend/main.py
 │   ├── db.py                  SQLAlchemy engine/session (DATABASE_URL), Base, get_db dependency
@@ -94,9 +94,12 @@ ai-employee/
     └── src/components/...    reusable component catalog lives there
 ```
 
-All four services (`backend`, `frontend`, `postgres-db`, `owner-agent`) run
-via `docker-compose up` — backend on :8000, frontend on :3000,
-Postgres+pgvector on :5432, owner-agent on :8100. Both `backend/` and
+All five services (`backend`, `frontend`, `postgres-db`, `owner-agent`,
+`ollama`) run via `docker-compose up` — backend on :8000, frontend on
+:3000, Postgres+pgvector on :5432, owner-agent on :8100, and (2026-09-09)
+a bundled Ollama on :11434 (127.0.0.1-only — see "Bundled Ollama" below
+for why this exists as a real compose service now instead of an
+owner-installed host process). Both `backend/` and
 `frontend/` are bind-mounted with hot reload; `frontend/node_modules` and
 `frontend/.next` are anonymous volumes so the container's Linux-native
 `node_modules` isn't shadowed by the host's Windows one (see
@@ -122,6 +125,13 @@ matching what used to be hardcoded. Nothing here is fixed on purpose —
 ComfyUI could be swapped for a different SD backend, host/ports differ
 per machine — same "swappable, not hardcoded" principle as the AI
 providers below.
+
+**`LOCAL_MODELS_DIR`** (2026-09-09, defaults `./models`) is the one
+exception to "docker-compose.yml composes these" above — it is
+deliberately NOT read by any service in this stack. See "Local model
+files convention" below for what it's actually for (a convention for
+the owner's own self-hosted inference server command, connected via the
+already-existing "Custom endpoint" model picker, not this variable).
 
 **`JWT_SECRET` must be a real random value in your own `.env`, not
 `.env.example`'s literal default.** That default (`dev-only-insecure-
@@ -2179,8 +2189,10 @@ itself was still a hardcoded constant in `apis/chat.py`.
   the dashboard can show/diff against it without a second hardcoded copy
   of that text living in the frontend. `PUT` with `chat_system_prompt:
   null` (or blank) resets to the default.
-- **`ChatPromptSettingsPanel`** (frontend, "AI & knowledge base"
-  accordion group, alongside `ModelSettingsPanel`) — a large `Textarea`
+- **`ChatPromptSettingsPanel`** (frontend, its own "Chat prompts"
+  accordion group as of 2026-09-09 — was inside "AI & knowledge base"
+  alongside `ModelSettingsPanel` until split apart per direct user
+  feedback, see that group's own note below) — a large `Textarea`
   prefilled with the current effective prompt (custom or default), a
   "Customized"/"Default" `Badge` showing which is active, Save, and a
   "Reset to default" button (disabled when already on the default) —
@@ -2198,6 +2210,794 @@ itself was still a hardcoded constant in `apis/chat.py`.
   configured local `custom` chat provider was intermittently unreachable
   this session, a known external-dependency gap, not a code issue — see
   "Known gotchas").
+
+### Intent-triage prompt — config layer only, not yet wired into runtime (`AppSettings.chat_intent_prompt`)
+
+Added 2026-09-09, on the user's own direct ask, off the "real LLM-driven
+intent recognition" open item in "Progress against the plan's phases"
+below: `/chat`'s own 3-step category/tags/channel wizard
+(`chat-panel.tsx`) is a hardcoded, always-identical local script, not an
+LLM decision — the user wants a real model to eventually decide, per
+visitor, whether to ask a clarifying structured question and what it
+should be. Scope for this round, confirmed directly with the user before
+building (`AskUserQuestion`): **config layer only** — a stored prompt,
+an AI-drafted starting point from ingested company documents, and a
+dashboard editor. `/api/chat`'s actual runtime does not read this field
+at all yet; wiring a real classification call to it (mirroring
+`_lead_extraction_call`/`_order_extraction_call`'s existing shape, plus
+a new `ChatResponse.control` field and a rewrite of `chat-panel.tsx`'s
+step state machine) is a deliberately separate, larger follow-up.
+
+- **`AppSettings.chat_intent_prompt: str | None`** (`models.py`) — same
+  null-means-default convention as `chat_system_prompt`, but a
+  completely SEPARATE field/concern: `chat_system_prompt` shapes the
+  main reply's tone/persona, this one is reserved for a future decision
+  about whether/what structured question to ask before that reply.
+  Neither reads the other.
+- **`backend/apis/chat_settings.py`** — `GET`/`PUT /agent/chat-settings`
+  widened to carry `chat_intent_prompt`/`default_chat_intent_prompt`
+  alongside the existing `chat_system_prompt` fields, each independently
+  optional in the `PUT` body (omit one to leave it untouched, explicit
+  null resets just that one). `DEFAULT_INTENT_PROMPT` is a generic,
+  business-agnostic template describing the FUTURE dynamic-triage
+  behavior this prompt is meant to drive — kept local to this file
+  (not alongside `SYSTEM_PROMPT` in `apis/chat.py`) since nothing in the
+  runtime reads it yet.
+- **`POST /agent/chat-settings/suggest-intent-prompt`** — mirrors
+  `business_profile.py`'s `suggest_business_profile` propose-then-owner-
+  applies pattern exactly: drafts a prompt from `_gather_ready_document_
+  text`'s ingested company-material documents plus a listing of any
+  already-configured `IntentSchema`s (their label/description, so the
+  draft can name real configured request types, not just guess from raw
+  prose), and never saves anything itself — the owner reviews/edits in
+  the dashboard before an explicit Save. Degrades to an empty suggestion
+  (not an error) when there are no ready documents, same posture as
+  every other RAG-adjacent suggest endpoint in this app.
+- **`ChatPromptSettingsPanel`** (frontend) gained a second, independent
+  card below the existing system-prompt editor — same Textarea/Badge/
+  Save/Reset shape, plus a "Suggest from documents" button
+  (`Sparkles` icon) and its own status/error state. Carries an explicit
+  "Not yet live" `Badge` and copy stating plainly that saving this text
+  has **no effect on live chat** today — deliberate, so an owner never
+  mistakes filling this in for the feature actually working yet.
+- **Verified end-to-end against the real running stack**: `GET`/`PUT
+  /agent/chat-settings` round-trip `chat_intent_prompt` independently of
+  `chat_system_prompt` (setting one leaves the other untouched, reset-
+  to-null restores the built-in default); `POST .../suggest-intent-
+  prompt` correctly passed the `document_count == 0` short-circuit stage
+  (real ready company documents exist on this dev instance) and reached
+  a real call to the configured `custom` chat provider, which correctly
+  surfaced as a clean 502 rather than a crash when that local server
+  wasn't running — the same known external-dependency gap already
+  documented elsewhere in this file, not a code issue. A full successful
+  LLM-drafted suggestion was not exercised this round for that reason.
+  `tsc`/`eslint`/a real production build (`docker compose run --rm
+  frontend npm run build`) all clean.
+
+### Public "contact us" form + site-wide 404 page (`backend/apis/contact.py`, `frontend/src/app/not-found.tsx`)
+
+Added 2026-09-09, same session, on a direct user ask for "a basic 404
+page" and "a contact form for use during staging/building." Scoped
+together deliberately (confirmed via `AskUserQuestion`): the contact
+form is specifically a fallback for a visitor who lands on a page that
+doesn't exist yet (a site still being staged — an unsaved `/p/[slug]`,
+or any genuinely broken link), not a permanently-linked `/contact` nav
+route. Next.js's `not-found.tsx` renders for both cases (an explicit
+`notFound()` call and a truly unmatched route), so one page serves both
+asks: a basic "page not found" message, plus a way to actually reach the
+business instead of a dead end.
+
+- **`backend/apis/contact.py`** — a new, tiny, fully public (no-auth)
+  `POST /api/contact` — the one route that lets an unauthenticated
+  visitor create a `CrmEntry` directly (deliberately NOT folded into
+  `apis/agent.py`'s admin/owner-gated `create_crm_entry`, which the
+  contact form has no JWT to call). Stores as `category="inquiry"`,
+  `tags=["contact-form"]` — shows up in `CrmPanel`'s existing
+  "Inquiries" group with zero new dashboard UI. Server-side validation
+  only requires non-blank name/message and a `@` in the email (matches
+  this app's existing "plain `str`, no `EmailStr`" convention —
+  `email-validator` isn't a dependency here). Rate-limited in
+  `rate_limit.py` (10/5min per IP, same tier as `/api/chat/upload`) —
+  the one genuinely new public-mutation attack surface this adds.
+- **`frontend/src/lib/contact.ts`** — `submitContactForm({name, email,
+  message})`, a plain `apiFetch` call, no auth.
+- **`frontend/src/components/modules/contact-form.tsx`** — a small,
+  reusable `ContactForm` (name/email/message + submit, a "message sent"
+  confirmation state), independent of the chatbot entirely — used by
+  `not-found.tsx` today, generic enough to reuse anywhere else a plain
+  contact form is wanted later.
+- **`frontend/src/app/not-found.tsx`** — `PageHeader` + an `EmptyState`
+  ("Back to homepage" button) beside the `ContactForm`. Renders inside
+  the root layout (so `SiteHeader`/`SiteFooter`/the chat bubble all
+  still show) and returns a real HTTP 404, confirmed live.
+- **Verified end-to-end against the real running stack**: `POST
+  /api/contact` — a valid submission correctly created a `CrmEntry`
+  (verified via `GET /agent/crm/entries?category=inquiry`, then cleaned
+  up), an invalid email and a blank message both correctly rejected (400
+  and 422 respectively) with no row created; a flood of 11 requests from
+  one IP correctly 429'd after the configured budget (test rows cleaned
+  up after). Both trigger paths for the frontend page — an unmatched
+  route (`/this-route-does-not-exist`) and a real unsaved `/p/[slug]` —
+  both correctly rendered the new page's content (confirmed via a direct
+  `curl` of the dev server's rendered HTML) and both returned a real 404
+  status code. A real production build (`docker compose run --rm
+  frontend npm run build`) shows `/_not-found` as a real compiled route,
+  clean `tsc`/`eslint`. **Not verified**: an actual in-browser click-
+  through of the submit button — the Chrome extension was not connected
+  this session either (the standing gap noted elsewhere in this file),
+  so this stops at API-level + rendered-HTML verification, same as most
+  of this app's other UI work.
+
+**Scope correction, same day, off a direct user follow-up**: the
+contact-form fallback above only ever covered "the page doesn't exist"
+(an unsaved slug, a broken link). The user clarified the actual intent
+was broader — a fallback for "site not ready / no LLM configured / no
+API key / the assistant broke down," i.e. the LIVE CHAT itself failing,
+not just a missing page. Fixed in `chat-panel.tsx`: `handleSend`'s catch
+block now distinguishes a genuine backend failure (`ApiError.status >=
+500` — `ProviderNotConfigured`'s 503, an unreachable provider's 502, or
+any other server error) from an ordinary 4xx (bad input, rate-limited).
+On a 5xx, a new `chatUnavailable` state renders `<ContactForm>` inline
+(title "Chat is temporarily unavailable") in place of the usual
+retryable `ErrorMessage` — retrying doesn't fix "no provider
+configured," so offering the alternative path is the honest response.
+Reset alongside `error` at the top of every new send attempt, so a
+later successful turn (chat recovers) clears it automatically. Since
+`ChatPanel` is the one component behind both `/chat` and the site-wide
+`ChatBubbleWidget`, this fallback applies everywhere chat appears with
+no separate wiring.
+
+### Basic error logging + email-on-severe-error (`backend/error_alerts.py`)
+
+Added 2026-09-09, same session — a direct user ask: "系统是否有基本的log和严重
+错误时的自动发邮件功能" (does the system have basic logs and automatic email
+on severe errors). It had neither before this.
+
+- **Scoped to genuinely UNHANDLED exceptions only** — a real bug, a
+  crash, a dependency failing in a way this app didn't already account
+  for. Every deliberate `raise HTTPException(...)` already in this
+  codebase (including `ProviderNotConfigured`'s 503 for "no AI provider
+  configured yet") is handled by Starlette's own dedicated exception
+  handler and never reaches `error_alerts.py`'s handler — an owner mid-
+  setup isn't "an error," and alerting on it would spam a fresh
+  install's inbox nonstop. That case's right response is the frontend
+  fallback above, not an email.
+- **`app.add_exception_handler(Exception, unhandled_exception_handler)`**
+  (`main.py`) — two always-attempted, best-effort effects, every time:
+  (1) **log** — one JSON line appended to a bind-mounted
+  `backend/logs/errors.jsonl` (mirrors `owner-agent/logging_.py`'s own
+  "stdout + a durable JSONL file" pattern), readable via `GET
+  /agent/error-log` (`apis/error_log.py`, admin/owner-gated,
+  most-recent-first) without needing `docker compose logs`; (2) **email
+  alert** — sent via whatever email provider is already configured
+  (`apis/notifications.py`'s `resolve_email_provider`) to
+  `AppSettings.alert_email` (new column, same "no separate enabled
+  flag" posture as `is_email_configured`) if the owner has set one.
+  Cooldown-gated (`ALERT_COOLDOWN_SECONDS = 900`, in-process/single-
+  worker — same assumption `rate_limit.py` already documents) so a
+  crash loop sends one alert, not hundreds.
+- **`POST /agent/error-log/test`** (`apis/error_log.py`) — deliberately
+  raises a real `RuntimeError` so a "test" exercises the ACTUAL pipeline
+  (global handler → log → cooldown-gated email), not a parallel
+  pretend-send like the notification panel's own test-email/test-sms
+  buttons. `ErrorLogPanel` (frontend, "Products & orders" — not
+  products/orders-specific, same "lives here anyway" posture as
+  `ScheduledTasksPanel` next to `DocumentManager`) has a "Trigger test
+  error" button plus a per-entry expandable traceback.
+  `NotificationSettingsPanel` gained the `alert_email` field itself
+  (reuses that panel's existing Mailgun config, no separate credential).
+- **Real bug caught and fixed during live verification**: the first cut
+  had `except NotificationProviderNotConfigured: pass` around the send
+  call — but that exception type is raised for BOTH "no credentials
+  configured" AND "the provider's real API rejected the request" (see
+  `MailgunEmailProvider`/`TwilioSMSProvider`'s own `raise
+  NotificationProviderNotConfigured(f"... rejected the send request:
+  ...")` for a bad/expired key). Silently `pass`ing meant a bad Mailgun
+  key would fail an alert with ZERO trace anywhere — worse than the
+  generic-`Exception` branch beside it, which at least logs. Fixed to
+  always `logger.error(...)` in that branch too — confirmed this was
+  the actual, load-bearing bug (not a logging-visibility issue) by
+  reproducing it against Mailgun's real API with a fake domain/key,
+  which correctly returned a genuine rejection ("Forbidden") that was
+  being swallowed before the fix and is now logged.
+- **Verified end-to-end against the real running stack, including a
+  real Mailgun rejection, not just the test-mode no-op path**: default
+  test-mode trigger logs to the JSONL file with no email attempt
+  (`is_email_configured` correctly gates on provider != "test"); a real
+  `mailgun`-configured-but-fake-credentials setup correctly attempted a
+  real HTTPS call to Mailgun's production API, got a real rejection, and
+  — after the fix above — logged it visibly (confirmed via a live
+  log-stream capture during the request, not just a `tail`, since the
+  traceback's own line count was long enough to push a `--tail=15/60`
+  snapshot past the relevant line on a couple of attempts — a real,
+  if minor, lesson about using `logs -f` rather than a short `--tail`
+  when hunting for one specific line among a large traceback); an
+  immediate second trigger correctly hit the cooldown and did NOT
+  re-attempt the send. Test credentials cleared after. `pytest`/`tsc`/
+  `eslint`/a real production build all clean.
+
+### Local model files convention (`models/`, `LOCAL_MODELS_DIR`)
+
+Added 2026-09-09, same session — the user asked for "一个可以放模型的文件夹和env
+指向" (a folder to put models in, and an env pointer) so an owner running
+this app on a real machine can download and use their own model. Scoped
+deliberately lightweight per a direct `AskUserQuestion` confirmation:
+**no new inference service added to `docker-compose.yml`** — bundling a
+managed local LLM runtime would mean this app's own compose stack takes
+on GPU/driver/memory-management concerns that vary a lot machine-to-
+machine, and the existing "custom endpoint" mechanism (`AppSettings.
+custom_base_url`/`custom_api_key`, see "AI provider is swappable" above)
+already lets an owner run ANY OpenAI-compatible inference server however
+they want and just point this app at it — nothing new needed there.
+- **`models/`** (repo root, sibling to `backend`/`frontend`/`owner-agent`)
+  — a conventioned folder for downloaded model files (`.gguf`, etc.),
+  gitignored except its own `README.md`/`.gitkeep` (model files are
+  large and machine-specific, never meant to be committed). The README
+  walks through the actual mechanism: download a model here, start your
+  own `llama-server`/vLLM/LM Studio pointed at it, then connect it via
+  the dashboard's already-existing "Custom endpoint" block in Model
+  settings — no code change, no restart.
+  - **`LOCAL_MODELS_DIR`** (root `.env`/`.env.example`, defaults
+    `./models`) — explicitly documented as NOT consumed by
+    `docker-compose.yml` or any service here, unlike every other var in
+    that file — it exists purely for the owner's own convenience when
+    scripting their own inference server's startup command (e.g. `-m
+    "$LOCAL_MODELS_DIR/your-model.gguf"`). A deliberately honest
+    distinction from every other `.env` var, called out explicitly in
+    both files' own comments so this one is never mistaken for
+    something this app's own services read.
+
+### First-run setup wizard (`/setup`)
+
+Added 2026-09-09, same session, off the user's own framing: an
+onboarding flow closer to an OS's first-boot experience ("choose your
+model, connect it, then the AI can help configure the rest") than the
+dashboard's existing flat settings panels. Scoped to **just the wizard
+UI** per a direct `AskUserQuestion` confirmation — no EC2/server
+deployment automation this round (see "Suggested next step" below for
+where that stands).
+
+- **`SetupWizard`** (`frontend/src/components/modules/setup-wizard.tsx`)
+  — a 3-step shell (Welcome → Connect a model → Finish). The "connect"
+  step's UI went through a real revision the same session: the first cut
+  just embedded `ModelSettingsPanel` directly; the user then proposed a
+  concrete two-branch flow instead ("1. use an API key → pick a vendor →
+  paste it → done", "2. install a local model → pick one → it
+  downloads → done"), which is what actually shipped:
+  - **`ApiKeyConnect`** — vendor `Select` (OpenAI/Anthropic/Gemini) + one
+    password input + "Save and connect". Two sequential `PUT
+    /agent/settings` calls, not one: the first saves just the API key,
+    the second sets `chat_provider`/`chat_model` to that vendor's now-
+    `selectable` default. Has to be two calls, not one combined save —
+    `update_settings`'s own validation checks `selectable` against
+    whatever's ALREADY persisted in the DB, so a single request
+    submitting both the new key and the new provider in one shot would
+    validate against the key's pre-save (still absent) state and 400
+    incorrectly.
+  - **`LocalModelConnect`** — suggested-model cards (or any typed Ollama
+    tag) → `POST /agent/ollama/pull` → 2s-interval polling of `GET
+    .../pull-status` with a real progress bar → "Use this model" sets
+    `chat_provider: "ollama"` once done. See "Bundled Ollama" below for
+    the backend half this drives.
+  - Both branches call `patchModelSettings()` (fetches current
+    `ModelSettings`, spreads a small patch on top, PUTs the whole
+    object) rather than hand-rolling the full request shape per call
+    site — `PUT /agent/settings` always takes the complete object.
+  - **Advanced/everything-else configuration (vision, embedding,
+    image-gen, a self-hosted non-Ollama runtime) stays reachable via a
+    collapsed `ModelSettingsPanel`** below the two-branch UI, not
+    duplicated into it — the quick-connect flow only ever sets the CHAT
+    model; an owner who also wants a different vision/embedding
+    provider still uses the full panel.
+  - `lib/setup.ts`'s `checkSetupStatus()` (unchanged from the original
+    cut) still determines "is chat actually connected" via `GET
+    /agent/models`'s `selectable` flag — the same signal
+    `ModelSettingsPanel` itself uses for "Not configured" badges.
+- **`/setup`** (`app/setup/page.tsx` → `SetupPage`) — gated the same as
+  the rest of the agent console (admin OR owner), display-only gating
+  (same posture as most of this app besides `AgentConsoleSection`'s
+  extra stale-token re-verification dance — the backend independently
+  re-checks on every real request `ModelSettingsPanel` makes).
+- **`SetupStatusBanner`** — rendered above the dashboard's accordion
+  (`AgentConsoleSection`) whenever no chat model is actually connected
+  yet, linking to `/setup`. Deliberately a dismissible-by-navigating-
+  away nudge, not a forced redirect on login — a real, deliberate scope
+  cut: this wizard doesn't need to own the login flow to be useful.
+- **Real lint catch during this pass, same recurring class as
+  elsewhere in this file**: the status-check effect originally called
+  `setStatus("loading")` synchronously before an async check, tripping
+  `react-hooks/set-state-in-effect`. Fixed the same way
+  `AgentConsoleSection`'s own verify-session effect already does it:
+  never set a "loading" state synchronously in the effect body at all —
+  rely on the state's own initial value, and only call `setState` from
+  inside a `.then()`/`.catch()`. The "Re-check" button (a real click
+  handler, not an effect) still sets "loading" synchronously, which is
+  fine there.
+- **Verified end-to-end against the real running stack**: `/setup`
+  correctly 404'd until a frontend restart (a known, already-documented
+  Turbopack dev-mode gotcha for brand-new route files — see "Known
+  gotchas" below), then correctly returned 200 and rendered the
+  logged-out gated state ("Admin or owner access needed" + a Log-in
+  link). A real production build (`docker compose run --rm frontend npm
+  run build`) shows `/setup` as a real compiled route. `tsc`/`eslint`
+  clean across the whole `src/` tree.
+
+### Cloud provider API keys — now DB-configurable, not just env vars
+
+Added 2026-09-09, same session, unblocking the setup wizard's
+`ApiKeyConnect` branch above: OpenAI/Anthropic/Gemini keys were
+previously env-var-only (`OPENAI_API_KEY`/etc., read once at module
+import), meaning a wizard "paste your key here" step would have had
+nowhere real to save it short of editing `.env` and restarting. Now
+settable via the dashboard/wizard, same as `AppSettings.custom_api_key`
+already was for self-hosted endpoints.
+
+- **`AppSettings.openai_api_key`/`anthropic_api_key`/`gemini_api_key`**
+  (new columns, write-only, never echoed back) — one key per vendor
+  covers chat+vision+embedding+image-gen for that vendor, matching how
+  each vendor's own API actually authenticates (one key, every
+  capability). **The env var still works as a fallback** — nothing was
+  removed, this only adds a no-restart alternative.
+- **`providers/openai.py`/`anthropic.py`/`gemini.py`** — every class
+  (`OpenAIChatProvider`, `OpenAIEmbeddingProvider`,
+  `OpenAIImageProvider`, and the Anthropic/Gemini equivalents) now takes
+  an optional `api_key` constructor override, falling back to the
+  module-level env var when not given. Same "swappable, not hardcoded"
+  pattern `providers/custom.py`'s `base_url`/`api_key` already
+  established, extended to the 4 named vendors.
+- **`apis/model_settings.py`'s `_cloud_api_key(db, provider)`** — the one
+  place that decides which key actually gets used (DB overrides env,
+  same precedence the provider classes themselves now implement).
+  Every "is this cloud provider configured" check in this file (the
+  model list's `configured`/`selectable`, `resolve_chat_provider`/
+  `resolve_vision_provider`/`resolve_embedding_provider`/
+  `resolve_image_provider`, `update_settings`'s own validation) now goes
+  through this one function instead of five separately-hardcoded
+  `bool(OPENAI_API_KEY)`-style checks that would have silently ignored
+  a DB-saved key.
+- **`ModelSettings.openai_api_key`/`_set` (+ anthropic/gemini pairs)** —
+  same write-only-secret shape as every other credential field in this
+  app (`stripe_secret_key`/etc.): the key itself is PUT-only, never
+  echoed on GET; a `*_api_key_set` boolean (GET-only) tells the frontend
+  whether a DB-saved key already exists, so `ModelSettingsPanel`'s new
+  `CloudApiKeysBlock` can show a "leave blank to keep" placeholder
+  without ever seeing the real value.
+- **Verified end-to-end against the real running stack, including a
+  genuine vendor rejection, not just the DB round-trip**: saved a fake
+  OpenAI key via `PUT /agent/settings` (confirmed `openai_api_key_set`
+  flips to `true`, the key itself never echoed, and the owner's actual
+  pre-existing `custom`-provider settings were left completely
+  untouched by the save); switched `chat_provider` to `"openai"` and
+  called `/agent/chat-completion` — the request reached a REAL HTTPS
+  call to `api.openai.com`, which correctly rejected the fake key with
+  401, surfaced as a clean 502 rather than a crash. Settings restored to
+  the owner's original real configuration afterward (a direct DB write,
+  not the API — reverting away from `openai` back to `custom` would have
+  needed the owner's own local llama.cpp server to be live-reachable for
+  `update_settings`'s own re-validation, which it wasn't during this
+  test; restoring via DB write was judged safe specifically because it
+  reproduced an already-known-good prior state, not a new unvalidated
+  claim). `pytest`/`tsc`/`eslint`/a real production build all clean.
+
+### Bundled Ollama — automated local-model download (`docker-compose.yml`'s `ollama` service, `backend/apis/ollama_admin.py`)
+
+Added 2026-09-09, same session, closing the other half of the setup
+wizard's local-model branch. The user asked directly why this couldn't
+be "fully automatic like LocalAI.io" — the answer, worked through with
+the user: a containerized backend genuinely CANNOT install software or
+manage arbitrary downloads on the HOST OS (no access, no privilege, and
+building a privileged host-agent to do that would be a much bigger,
+separate, security-sensitive component). But LocalAI's own trick — the
+model lives inside a container's own volume, not the host filesystem —
+IS fully achievable here: **Ollama itself now runs as another
+docker-compose service**, reachable over the internal Docker network,
+so the backend CAN trigger a real download via a plain HTTP call to a
+sibling container, no host access needed at all. Deliberately scoped to
+Ollama specifically, not llama.cpp/vLLM/etc. — Ollama's own API already
+does exactly this job (`POST /api/pull`, streaming real progress);
+those other runtimes have no equivalent built-in model manager and stay
+on the existing manual `models/README.md` + "Custom endpoint" path.
+
+- **`docker-compose.yml`'s new `ollama` service** — official
+  `ollama/ollama:latest` image, no custom build. `ollama_data` named
+  volume (pulled models are large, machine-specific binary blobs — same
+  "named volume, not the bind-mounted source tree" reasoning `pgdata`
+  already gets). Port `127.0.0.1:11434` only (same posture as
+  `postgres-db`'s own port mapping — debugging access only, backend
+  reaches it via `ollama:11434` over the internal network regardless).
+  **CPU-only by default, confirmed scope with the user** — no GPU
+  passthrough configured this round; a small/quantized suggested model
+  is still usable on CPU, just slower.
+- **`backend`'s `OLLAMA_BASE_URL` now points at `http://ollama:11434/v1`**,
+  not `http://host.docker.internal:11434/v1` — a real, deliberate
+  reversal of the previous assumption that Ollama runs on the owner's
+  own host machine. `providers/ollama.py`'s own env-var default is
+  unchanged (still `host.docker.internal`, for a non-compose deployment)
+  — only docker-compose.yml's explicit override changed.
+- **`backend/apis/ollama_admin.py`** (new router, `/agent/ollama/*`,
+  admin/owner-gated):
+  - `GET /status` — live reachability + currently-installed models
+    (`GET {ollama}/api/tags`).
+  - `GET /suggested-models` — a small hardcoded list (llama3.2,
+    qwen2.5:7b, gemma3:4b, nomic-embed-text) with size/description, for
+    the wizard's cards — not exhaustive, any Ollama tag can still be
+    typed in directly.
+  - `POST /pull` — starts a real background pull (`asyncio.create_task`,
+    not a `BackgroundTasks` response-scoped one, since this response
+    needs to return before the multi-minute download even starts) via
+    Ollama's own streaming `POST /api/pull`, tracking progress
+    (status/completed/total bytes) in an in-memory dict keyed by model
+    name — same "in-memory, single-process" acceptance `rate_limit.py`
+    already documents for this app's one-uvicorn-worker deployment.
+    409s if that exact model is already mid-pull.
+  - `GET /pull-status?model=` — polled by the wizard every 2s for a real
+    progress bar.
+- **Verified end-to-end against the real running stack, including an
+  actual multi-hundred-megabyte download, not a mock**: brought up the
+  new `ollama` service for real (Docker had to pull the `ollama/ollama`
+  image itself first); `GET /status` correctly reported reachable with
+  zero installed models on a fresh container; `POST /pull` for
+  `nomic-embed-text` correctly started a background download, a second
+  concurrent pull attempt correctly 409'd, and polling `/pull-status`
+  showed REAL progress (`completed: 159510528, total: 274290656`)
+  followed by `status: "success", done: true` — a genuine ~270MB
+  download completed in well under a minute. Confirmed the pulled model
+  then appeared as `selectable: true` in `GET /agent/models`'s
+  `embedding_models` list with the exact tag Ollama itself assigned
+  (`nomic-embed-text:latest`) — real Ollama tag-normalization behavior
+  that mattered for a later round's design (see "Modelfile automation"
+  below). `docker compose config --quiet` validated the compose file;
+  `pytest`/`tsc`/`eslint`/a real production build all clean.
+
+### Automatic database migrations on startup (`backend/migrate.py`)
+
+Added 2026-09-09, same session, off a direct principle the user stated:
+as fewer users know CLI/code, even a small amount of setup friction
+loses them — "如果一开始的安装有一点点复杂，用户都不买账." Every schema change in
+this project previously needed a manually-run `docker compose exec
+backend alembic upgrade head`; harmless for this project's own dev
+sessions (this file's history is full of exactly that command), but a
+real, disqualifying blocker for a non-technical owner who has no idea
+what a migration is.
+
+- **`run_migrations_with_retry()`** (`backend/main.py`'s `lifespan`, runs
+  before anything else touches the DB) — calls Alembic's own Python API
+  (`alembic.command.upgrade`, same `alembic.ini`/`env.py` the manual CLI
+  invocation already used) automatically on every backend startup.
+  `docker compose up` is now the one command an owner ever needs to
+  know — no separate migration step, ever.
+- **Retries up to 10 times, 2s apart** — `docker-compose.yml`'s
+  `depends_on: postgres-db` only guarantees the container has STARTED,
+  not that Postgres is actually ready to accept connections yet, a real
+  race this project's own multi-service startup can hit.
+- **Real bug caught during live verification**: the retry loop's first
+  cut never actually retried — a single `command.upgrade()` call against
+  an unreachable Postgres just HUNG indefinitely (confirmed live: the
+  backend sat at "Waiting for application startup" for minutes with zero
+  retry log lines) rather than raising a fast `OperationalError`, because
+  `alembic/env.py`'s `engine_from_config(...)` had no connection timeout
+  at all. Fixed by adding `connect_args={"connect_timeout": 5}` to that
+  `engine_from_config` call — this bounds ONLY the connection-attempt
+  phase (not DNS resolution, which is a separate, much rarer failure
+  mode only hit by literally stopping the postgres-db container
+  mid-session, not by a normal `docker compose up` cold start).
+- **Verified end-to-end against the real stack, including a genuine cold
+  start from nothing**: `docker compose down` (network + non-persistent
+  containers removed) followed by `docker compose up -d` — all 5
+  services created fresh, backend became fully responsive with ZERO
+  manual intervention, `alembic current` confirmed the schema landed at
+  head automatically. `pytest` clean immediately after. A separate,
+  synthetic "stop just postgres-db mid-session, restart backend" test
+  did surface real Docker-networking weirdness (a stale DNS/connection
+  state that a plain `docker compose restart` didn't clear, requiring
+  `--force-recreate` to resolve) — noted here as a known rough edge for
+  that specific, unusual sequence, not a flaw in the migration retry
+  logic itself, which behaved correctly once the connect-timeout fix
+  was in place and a genuine cold start was tested.
+
+### Modelfile automation — tuned + verified local models, never a broken one (`backend/apis/ollama_admin.py`)
+
+Added 2026-09-09, same session, off the user's own explicit bar: "默认生成，
+但一定是能够使用，能拉起来的系统" (generate by default, but it must always be a
+system that actually works, that actually starts). Two tiers, confirmed
+directly with the user:
+
+- **Tier 1 — every library model pulled via `/pull` gets an automatic
+  tuning attempt, invisibly.** Ollama's own per-model default context
+  window (`num_ctx`) is often smaller than this app's real usage pattern
+  needs (a long system prompt + RAG excerpts + conversation history all
+  in one request) — `_run_pull` now always follows a successful base
+  pull with an attempt to create `<model>-tuned` (`{"from": model,
+  "parameters": {"num_ctx": 8192}}`), then VERIFIES it with a real chat
+  completion (not just a reachability check — catches a model that
+  "created" but returns empty/garbled output). `PullStatus.final_model`
+  is always the model to actually use — the tuned variant if that
+  succeeded, the plain pulled model (already proven to work by the pull
+  itself) if tuning or verification failed for any reason. The owner
+  never sees the tuning attempt at all unless they check
+  `PullStatus.tuned` — a failure there is silent-and-safe, never
+  surfaced as a pull failure.
+- **Tier 2 — an owner-supplied ("UD"/custom) model gets Ollama's own
+  default treatment FIRST, confirmed directly with the user
+  ("modelfile先有ollama提供的原型的把")**: `POST /import-custom` (for a file
+  the owner dropped into `../models/`, now mounted read-only into BOTH
+  the backend and the bundled `ollama` service) tries a minimal `{"from":
+  "/models/<file>"}` — trusting Ollama's own GGUF metadata auto-detection
+  for template/etc. Only when that fails verification does this ask
+  whichever chat provider is ALREADY configured to draft a best-effort
+  `{"system", "template", "parameters"}` suggestion from the filename +
+  error (`_suggest_model_spec`, `json_mode=True` + `llm_json.
+  parse_lenient_json`, same lenient-JSON pattern used throughout this
+  app) — returned as a DRAFT for the owner to review, **never auto-
+  applied**, since there's no way to actually inspect the GGUF's real
+  architecture from here and a guess could easily be wrong. `POST
+  /create-custom` applies an owner-reviewed (AI-drafted-then-edited, or
+  hand-written) spec directly, through the identical create-then-verify
+  safety net.
+- **Shared `_create_and_verify(name, spec)`** — the one function both
+  tiers go through: create via Ollama's native API, verify with a real
+  `{"role": "user", "content": "Say OK."}` chat completion (generous
+  120s timeout — a freshly-created model's first load is a real cold
+  start), and **always clean up (`DELETE /api/delete`) a model that
+  failed verification** — a broken half-created model never lingers as
+  a selectable-looking option.
+- **Real, load-bearing API-shape bug caught during live verification —
+  worth remembering for any future Ollama integration work**: the
+  classic `{"name": ..., "modelfile": "<raw Modelfile text>"}` request
+  shape for `POST /api/create` — documented in a lot of older Ollama
+  material, and what this endpoint originally sent — is REJECTED
+  outright by the actual bundled version (0.33.3): `{"error": "neither
+  'from' or 'files' was specified"}`. The current API wants STRUCTURED
+  fields instead: `model` (not `name`), `from`, and optionally
+  `system`/`template`/`parameters` — confirmed by testing directly
+  against the real running Ollama instance, not assumed from
+  documentation. `/api/delete`, by contrast, still accepts `{"name":
+  ...}` — confirmed separately; the two endpoints were NOT assumed to
+  share the same field-naming convention just because they're siblings.
+  Every "Modelfile" reference in this app's own UI copy is a user-facing
+  concept name — the actual wire format is always the structured JSON
+  shape now, and the AI-suggestion prompt was written to draft that
+  structured JSON directly rather than raw Modelfile text.
+- **`GET /local-files`** — lists `.gguf`/`.bin` files in the shared
+  `/models` mount, filtered by real directory listing (never trusting a
+  caller-supplied filename as a path on its own — same paranoid
+  containment posture `chat_attachments.py`'s `resolve_local_path`
+  already established for this app's other client-supplied-path
+  surfaces).
+- **`docker-compose.yml`** — `./models:/models:ro` mounted into BOTH
+  `backend` (so it can list files) and `ollama` (so it can actually read
+  one to import it), read-only on both sides — neither service needs
+  write access to an owner's own source model files.
+- **Frontend**: `LocalModelConnect` (`setup-wizard.tsx`) now uses
+  `PullStatus.final_model` directly (already proven to work by the
+  backend) instead of re-deriving it from `GET /agent/models` — simpler
+  and more accurate than the original tag-matching heuristic. A new
+  `CustomModelImport` sub-component lists `models/` files, offers to
+  import one, and — only on a failed default attempt — shows the
+  AI-drafted suggestion as read-only JSON with an "Apply this
+  suggestion" button (`lib/ollama.ts`'s `importCustomModel`/
+  `createCustomModel`).
+- **Verified end-to-end against the real running stack, including both
+  the success and fallback paths, not just the happy path**:
+  - Tier 1 success: pulled `llama3.2` for real (~2GB), the tuned variant
+    `llama3.2-tuned` was created and passed a REAL verification call
+    ("What is 2+2? Answer in one word." → "Four.", confirmed via a
+    direct `curl` against Ollama's own OpenAI-compatible endpoint, not
+    just this app's own reporting) — `PullStatus` correctly reported
+    `final_model: "llama3.2-tuned"`, `tuned: true`, and `GET
+    /agent/models` correctly listed it as `selectable: true`.
+  - Tier 1 fallback: re-pulled `nomic-embed-text` (an embedding-only
+    model with no chat capability) specifically to force the tuning
+    verification to fail — confirmed `final_model: "nomic-embed-text"`
+    (the plain model), `tuned: false`, and confirmed via `ollama list`
+    that the failed tuned variant was NOT left lingering (cleaned up
+    correctly).
+  - Tier 2 failure path: dropped a fake (non-GGUF) file into `models/`,
+    confirmed `POST /import-custom` correctly surfaced Ollama's own real
+    400 rejection, and confirmed the AI-suggestion fallback correctly
+    degraded to `suggestion: null` (not a crash) when the currently-
+    configured chat provider was unreachable — the exact "best-effort,
+    never a second confusing failure" behavior this was designed for.
+  - Test models (`llama3.2`, `llama3.2-tuned`, the fake GGUF) cleaned up
+    after; `nomic-embed-text` left in place (small, genuinely useful).
+    `pytest`/`tsc`/`eslint`/a real production build all clean.
+- **Deliberately not verified this round**: an actual custom/"UD" GGUF
+  import succeeding via Ollama's own default auto-detection — no real
+  GGUF file was available inside the sandboxed test environment to
+  import (the user's own real model lives on their host filesystem, not
+  inside `../models/`). The failure path (above) and the shared
+  create-then-verify machinery (proven by Tier 1) are both real and
+  verified; the specific "a real GGUF imports cleanly on the first try"
+  case is inferred from Ollama's own documented capability, not
+  independently confirmed live.
+
+### Server-side model download from a URL + dashboard integration
+
+Added 2026-09-09, same session, off two direct follow-up questions: (1)
+"是否已经连同dashboard的一起改好了" (has this been wired into the dashboard too) —
+no, it hadn't; the Ollama pull/import UI only existed inside `/setup`.
+(2) "有没有给owner下载模型的入口或方法？一般是上传，ftp或网站点对点下载" (is there a way
+for the owner to actually get a model file in — upload, FTP, direct
+download) — no, `models/` could ONLY be filled by an owner with direct
+filesystem access to wherever this app runs, which silently breaks the
+entire "bring your own model" story on a remote/EC2-style deployment
+with no shell access.
+
+- **Confirmed design, directly with the user**: server-side URL download
+  (the owner pastes a link, the BACKEND fetches it), not a browser
+  upload. Reasoning: model files are typically many GB (a browser
+  upload would cost the OWNER's own upload bandwidth — often far slower
+  than a server-to-server fetch — and a dropped connection loses the
+  whole transfer), and an owner sourcing a custom model almost always
+  already has a URL (HuggingFace, a direct link) rather than the file
+  already sitting on their own machine. This mirrors `apis/documents.py`'s
+  already-established RAG-document URL-ingestion pattern exactly, just
+  for a model file. The user's own explicit bar: "下载progress需要做好"
+  (the download progress must be done well) — see the real accuracy fix
+  below.
+- **`docker-compose.yml`'s backend mount widened to read-write**
+  (`./models:/models`, was `:ro`) — the backend now needs to WRITE a
+  freshly-downloaded file into this folder, not just read what an owner
+  already placed there. `ollama`'s own mount stays read-only — it only
+  ever needs to read a file to import it.
+- **`POST /agent/ollama/download-from-url`** (`{url, filename?}`) — same
+  background-task + in-memory-progress-dict shape as `/pull` above.
+  Downloads to a `<filename>.part` sibling, renamed to the real name
+  only on success, so a still-downloading (or failed, half-written) file
+  never shows up in `GET /local-files`'s listing as something ready to
+  import. `GET /download-status?filename=` polls real byte-level
+  progress (`downloaded`/`total`).
+- **Real accuracy bug caught during live verification, directly serving
+  the "progress must be done well" bar**: a first real test (downloading
+  a small file from a real, public GitHub URL) reported `downloaded:
+  19225` against `total: 6832` — a nonsensical >100%. Root cause: the
+  source's `Content-Length` header describes the COMPRESSED
+  (gzip-encoded) size, but httpx transparently decompresses the stream,
+  so the actual bytes received exceed that header's value. Fixed by
+  sending `Accept-Encoding: identity` on the download request — this
+  costs nothing for the real target use case (GGUF binary model weights
+  don't meaningfully compress anyway) but guarantees an accurate
+  percentage for any source, not just ones that happen to skip
+  compression on their own. Re-verified after the fix: `downloaded ==
+  total` exactly on the same real URL.
+- **Frontend**: the "Or bring your own model file" section now leads
+  with a URL input + progress bar (byte counter when the source doesn't
+  report a total, never a fake/guessed percentage), and the existing
+  "pick a file from `models/`" button row refreshes automatically once a
+  download completes — no separate "import" step to remember, the newly
+  downloaded file just appears as another clickable option.
+- **Dashboard integration**: `OllamaModelManager` — the pull-a-suggested-
+  model UI, the URL-download section, and the custom-file-import section
+  — was extracted out of `setup-wizard.tsx` into its own file
+  (`ollama-model-manager.tsx`) specifically so it could be rendered in
+  BOTH places: `SetupWizard`'s "install a local model" branch (unchanged
+  behavior) AND a new "Local models (bundled Ollama)" section in
+  `ModelSettingsPanel` itself, directly in the dashboard's "AI &
+  knowledge base" accordion. Model management is an ongoing operational
+  task (an owner will want to try a different or additional model long
+  after their first setup), not a one-time onboarding step — burying it
+  inside `/setup` only made sense before this fix. `patchModelSettings`
+  (the "fetch current settings, spread a patch on top, PUT the whole
+  object" helper both consumers need) moved to `lib/models.ts` as a
+  shared export rather than staying duplicated/wizard-only.
+- **Verified end-to-end against the real running stack**: a real
+  download from a live public URL completed with byte-exact progress
+  (after the encoding fix above) and the file correctly appeared in
+  `local-files`; a deliberately unreachable domain correctly surfaced a
+  real DNS-resolution error with NO `.part`/partial file left behind;
+  confirmed `/models` is genuinely writable from inside the backend
+  container (`touch`/`ls`/`rm` round-trip) after the mount change.
+  `docker compose ps`/`/setup`/`/dashboard` all confirmed reachable
+  after the frontend restart. `pytest`/`tsc`/`eslint`/a real production
+  build all clean.
+
+**"Already available" models — a same-session follow-up, off a real
+misunderstanding worth recording.** The user's next message ("我的意思不是
+去掉原来ollama的模型下载...") clarified they weren't asking to replace the
+suggested-models/URL-download flows — they wanted an ADDITIONAL way to
+pick from whatever's already sitting in the bundled Ollama instance,
+regardless of how it got there (pulled via this app, imported from a
+custom file, or installed some other way entirely — e.g. an owner who
+mounted in a pre-existing `~/.ollama` directory or ran `ollama pull`
+directly against the container). A follow-up framing ("...ollama除了自己的
+目录，还可以有补充目录") asked about a second Ollama model directory —
+clarified directly rather than assumed: **Ollama itself has no concept
+of multiple model directories** (one internal blob store,
+`OLLAMA_MODELS`-configurable but still a single path, not a search
+list) — `../models/` was never a second Ollama directory, just a staging
+area `import-custom` copies FROM into Ollama's own store via `ollama
+create`. The actual fix for what the user wanted was surfacing what's
+already inside that one store, not adding a second one:
+- **`POST /agent/ollama/verify-installed`** (`{model}`) — for a model
+  already in `OllamaStatus.installed_models` (from `/api/tags`), runs
+  the same real chat-completion verification every other path in this
+  module uses before letting the frontend commit it as the active chat
+  model. Deliberately NOT a rubber-stamp — "already downloaded" isn't
+  the same guarantee as "behaves like a working chat model" (an
+  embedding-only model, or a corrupted download, would both still
+  appear in `/api/tags`).
+- **`OllamaModelManager` gained an "Already available" section** above
+  the suggested-models grid — one button per installed model, no
+  download/pull step, just verify-then-select. Refreshed after a new
+  pull or import completes (`refreshStatus()`, called before
+  `onConnected()`) so a freshly-added model shows up here without
+  needing a page reload.
+- **Verified end-to-end against the real running stack, both the
+  failure and success cases**: `verify-installed` against the already-
+  installed `nomic-embed-text:latest` (embedding-only) correctly
+  surfaced Ollama's own real 400 rejection; against a freshly re-pulled
+  `llama3.2:latest` correctly returned `{"ok": true}`. `GET /status`
+  correctly listed all 3 real installed models
+  (`llama3.2:latest`/`llama3.2-tuned:latest`/`nomic-embed-text:latest`)
+  before cleanup. Test models removed after; owner's real `custom`
+  settings confirmed untouched throughout. `pytest`/`tsc`/`eslint`/a
+  real production build all clean.
+
+### Model settings panel polish — status, testing, density, cleanup (`frontend/src/components/modules/model-settings-panel.tsx`)
+
+Added 2026-09-09, same session, off the user's own direct review request
+("你觉得模型这个section做好了吗？") — five real gaps identified in a self-
+critique and then fixed one by one, per the user's own follow-up ask:
+
+1. **At-a-glance status summary** — a new block at the top of the panel
+   (`StatusLine` × 4: Chat/Vision/Embedding/Image generation) shows each
+   capability's current provider/model plus whether it's actually
+   `selectable` right now, derived from data the panel already fetches
+   (`capabilityStatus(options, value)`) — no new request. Before this,
+   an owner had to mentally parse four separate dropdowns to answer "is
+   my chat model actually working."
+2. **"Send test chat message" button** — the one gap that mattered most:
+   every OTHER provider-config surface in this app (Payment,
+   Notification, Map, the custom-endpoint blocks here) already has a
+   "test it now" action; the chat/vision/embedding pickers themselves
+   never did, so a bad cloud API key was only ever discovered when a
+   real visitor's turn failed. `lib/models.ts`'s `testChatCompletion(
+   message)` reuses the already-real `POST /agent/chat-completion`
+   proxy (the same one owner-agent's own brain calls go through) — no
+   backend change needed. Deliberately tests the SAVED configuration,
+   not an in-progress unsaved edit (same "edit then save, no live
+   preview" posture the rest of this panel already has) — the button's
+   own caption says so plainly. **Immediately proved its worth in live
+   verification**: calling it against the real dev instance's actual
+   saved `custom` provider (the owner's own local llama.cpp endpoint,
+   not currently running) correctly surfaced "All connection attempts
+   failed" — exactly the kind of silent failure this button exists to
+   catch before a real visitor hits it.
+3. **"Already available" models can be deleted, not just selected**
+   (item 4) — `POST /agent/ollama/delete-model` (real DELETE against
+   Ollama's own `/api/delete`, reporting a genuine failure back rather
+   than `_delete_model`'s existing best-effort-swallow variant used
+   elsewhere in that module for internal cleanup) + a trash-icon button
+   next to each installed-model button in `OllamaModelManager`, behind
+   `window.confirm` (same no-undo-delete posture `CrmPanel`/`PageManager`
+   already established). Closes a real disk-space gap: before this, an
+   owner who tried several models over a session's lifetime had no way
+   to remove old ones short of a shell into the container.
+4. **Local models (Ollama) and both custom-endpoint blocks are now
+   collapsible, closed by default unless already in use** — a new
+   `CollapsibleSection` (collapsed unless `defaultOpen` says the
+   relevant capability is already set to `"ollama"`/`"custom"`,
+   `useState`'s initial value only — doesn't fight a user who
+   explicitly toggled it afterward) wraps: the whole Ollama manager
+   section, the chat/vision custom-endpoint block, and the embedding
+   custom-endpoint block. A cloud-only owner no longer sees three
+   permanently-expanded sections of config they never touch.
+5. **(Density, general)** — items 3+4 together are the concrete fix for
+   the 5th, more diffuse critique ("this panel shows every provider's
+   config at once regardless of what's actually in use") — the
+   ComfyUI-specific fields were ALREADY conditionally shown only when
+   `image_provider === "comfyui"` (confirmed by re-reading that code
+   before assuming a fix was needed there too), so the two custom-
+   endpoint blocks and the Ollama manager were the actual remaining
+   offenders, both now addressed by the same `CollapsibleSection`.
+- **Verified end-to-end against the real running stack**: the test-chat
+  button's real failure case above; `delete-model` — deleted the real
+  installed `nomic-embed-text:latest`, confirmed it vanished from
+  `GET /status`, confirmed a second delete attempt correctly 404'd
+  rather than silently no-op'ing, then re-pulled it to restore the
+  dev instance's own useful default. Owner's real `custom` chat/vision/
+  embedding settings confirmed untouched throughout every step.
+  `pytest`/`tsc`/`eslint`/a real production build all clean.
 
 ### URL-based document ingestion + scheduled tasks (`backend/scheduler.py`, `backend/apis/scheduled_tasks.py`)
 
@@ -2324,8 +3124,10 @@ onto `apis/documents.py`.
   scheduled fire. Same "budget minutes, not seconds" tradeoff this app
   already accepts for `generate_landing_page`/ComfyUI generation when the
   underlying task type is slow.
-- **`ScheduledTasksPanel`** (frontend, "AI & knowledge base" accordion
-  group, alongside `DocumentManager` — its motivating use case, though
+- **`ScheduledTasksPanel`** (frontend, "Knowledge base" accordion
+  group — renamed from "AI & knowledge base" 2026-09-09 once
+  `ModelSettingsPanel`/`ChatPromptSettingsPanel` split into their own
+  groups — alongside `DocumentManager`, its motivating use case, though
   the mechanism itself is generic) — `task_args` is a plain JSON
   `Textarea`, not a dynamic per-task_type form; the simplest thing that
   works at this app's current task-type count, same posture as
@@ -3094,15 +3896,21 @@ locking in, rather than only ever re-verifying by hand.
 
 ## Rate limiting (`backend/rate_limit.py`)
 
-Added 2026-08-08. Every other route in this backend sits behind
+Added 2026-08-08, extended several times since as new public-no-auth
+mutations shipped. Every other route in this backend sits behind
 `require_role` — a stolen/guessed JWT is a bigger problem than a fast
 caller, so this deliberately does **not** rate-limit the whole API, only
-the three fully public, no-auth routes: `POST /api/chat`, `POST
-/api/chat/upload` (both `apis/chat.py` — see the RBAC note near the top
-of this file), and `POST /api/auth/login` (the classic brute-force
-target). `RateLimitMiddleware` matches on exact `(method, path)`, not a
-prefix, so `/api/chat`'s budget can never accidentally also gate
-`/api/chat/upload`.
+the fully public, no-auth routes: `POST /api/chat`/`POST /api/chat/upload`
+(`apis/chat.py`), `POST /api/auth/login` (the classic brute-force
+target), `POST /api/cart/add` (`apis/products.py`), `POST
+/api/crm/resume/request`/`POST /api/crm/resume/verify`
+(`apis/crm_resume.py`), and `POST /api/contact` (`apis/contact.py`,
+2026-09-09). `RateLimitMiddleware` matches on exact `(method, path)`, not
+a prefix, so `/api/chat`'s budget can never accidentally also gate
+`/api/chat/upload`. See `rate_limit.py`'s own `RULES` dict for the
+current, authoritative list and each route's exact window/limit — this
+paragraph names them, not their numbers, so it doesn't drift out of sync
+every time a new one is added.
 
 - **In-memory, single-process, sliding-window-by-trimming** — deliberately
   not slowapi/Redis: this app runs as one uvicorn worker in one container
@@ -3360,10 +4168,18 @@ considering it fully settled.
   abstracted, RAG-merged, with automatic lead capture and optional
   logged-in-caller identity/personalization (see "Chat lead capture &
   optional caller identity" above). **Not done**: streaming (SSE/
-  WebSocket — single non-streaming call today); real LLM-driven intent
-  recognition (the frontend's category→tags→channel→free-text flow is a
-  **scripted local sequence**, not LLM-driven — it demonstrates the
-  `{type, options}` structured-control contract, nothing more).
+  WebSocket — single non-streaming call today, and deliberately staying
+  that way for the public path, see "Suggested next step" below for
+  why); real LLM-driven intent recognition (the frontend's
+  category→tags→channel→free-text flow is a **scripted local sequence**,
+  not LLM-driven — it demonstrates the `{type, options}` structured-
+  control contract, nothing more). **2026-09-09**: the config-layer
+  groundwork for the intent-recognition half now exists —
+  `AppSettings.chat_intent_prompt`, an AI-draft-from-documents endpoint,
+  and a dashboard editor (see "Intent-triage prompt" above) — but
+  `/api/chat`'s actual runtime still doesn't read it; the scripted
+  wizard is unchanged until a follow-up wires a real classification call
+  to it.
 - **Phase 4 — CTE editor**: done, extensively. See "CTE" above.
 - **Phase 5 — Visual polish**: page generation/schema done (see "Page
   schema" above). **Not done**: GSAP/ScrollTrigger (not started); Swiper
@@ -3711,11 +4527,30 @@ this is the one place the model itself decides which action(s) to take.
 
 ## Suggested next step
 
-Out of scope by explicit decision — don't suggest: real Firebase Auth, an
-actual cloud/EC2 deploy (Phase 1's scope decision), or chat streaming on
-the public `/api/chat` path (if/when streaming is ever built, it's scoped
-to `owner-agent`'s own run output only, per the user's own explicit call
-— see "Progress against the plan's phases," Phase 3).
+Out of scope by explicit decision — don't suggest: real Firebase Auth, or
+chat streaming on the public `/api/chat` path. **The reasoning, stated directly by the
+user (2026-09-09), is a genuine product stance, not just a scope
+cut**: as AI reasoning/output gets harder for a human to follow over
+time, and most users care about the result rather than the process
+anyway, streaming a token-by-token "thinking" trace to a visitor adds
+little value here — a single, complete, non-streaming reply is the
+right default for this app's public-facing chatbot. If/when streaming
+is ever built at all, it's scoped to `owner-agent`'s own run output only
+(an owner watching their own agent work, a different audience/use case)
+— see "Progress against the plan's phases," Phase 3.
+
+**Phase 1's original "no cloud/EC2 deploy" scope cut is REVERSED as of
+2026-09-09** — the user explicitly asked for this project to be
+deployable "像WP那样" (like WordPress) on AWS EC2 or another server, with
+a first-run setup wizard modeled on an OS's own out-of-box experience.
+Confirmed scope for this round, via `AskUserQuestion`: build the
+web-based setup wizard only (see "First-run setup wizard" above) —
+**a real one-command/scripted EC2 deployment (installing Docker,
+pulling this repo, running compose, configuring security groups/a
+domain, ...) is NOT built yet and remains a real, larger open item**,
+explicitly not started, not merely deferred-and-forgotten. Don't
+describe cloud deploy as "out of scope by explicit decision" anymore —
+describe it as "wizard done, deployment automation itself still open."
 
 **Known gaps, still open** (beyond the per-phase "Not done" bullets in
 "Progress against the plan's phases" above):
@@ -3730,11 +4565,22 @@ to `owner-agent`'s own run output only, per the user's own explicit call
   genuinely open; every nested-container example in this app so far was
   hand-authored, never generated by the model on its own.
 - **"Real LLM-driven intent recognition"** — `chat/chat-panel.tsx`'s
-  steps 0-2 (category → tags → channel) are a hand-authored, fixed
+  steps 0-2 (category → tags → channel) are STILL a hand-authored, fixed
   decision tree, not the LLM classifying anything; only step 3 onward
-  calls the real `/api/chat`. A real version would have the model itself
-  decide, from a visitor's free-text first message, which category/
-  follow-up questions apply, instead of always walking the same wizard.
+  calls the real `/api/chat`. **2026-09-09**: the config-layer
+  groundwork now exists (`AppSettings.chat_intent_prompt`, an AI-draft-
+  from-documents endpoint, a dashboard editor — see "Intent-triage
+  prompt" above), but `/api/chat`'s runtime still doesn't read it. A
+  real version needs: a new classification call (mirroring
+  `_lead_extraction_call`/`_order_extraction_call`'s existing shape), a
+  `ChatResponse.control` field, and a rewrite of `chat-panel.tsx`'s step
+  state machine to call the backend from turn 1 instead of walking the
+  same fixed wizard.
+- **Automated cloud/server deployment** (2026-09-09, see "Suggested next
+  step" above) — the setup wizard (`/setup`) exists; a real one-command
+  EC2/server deployment script does not. Genuinely unstarted, not just
+  deferred: installing Docker, pulling this repo, running compose,
+  handling a domain/TLS/security groups are all still fully manual.
 - Local resource coordination (`resource_broker.py`) is deliberately
   v1-scoped: the standalone embedding server isn't part of it (a
   one-line `--sleep-idle-seconds` fix would cover it, not broker logic),

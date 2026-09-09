@@ -17,6 +17,10 @@ export type NotificationSettings = {
   twilio_account_sid: string | null;
   twilio_from_number: string | null;
   twilio_auth_token_set: boolean;
+  /** Where error_alerts.py (2026-09-09) sends an automatic alert on a
+   * genuinely unhandled backend error. Not a secret — reuses whichever
+   * email provider is configured above, no separate credential. */
+  alert_email: string | null;
 };
 
 export type NotificationSettingsInput = {
@@ -29,6 +33,7 @@ export type NotificationSettingsInput = {
   twilio_account_sid?: string | null;
   twilio_from_number?: string | null;
   twilio_auth_token?: string;
+  alert_email?: string | null;
 };
 
 export function getNotificationSettings() {

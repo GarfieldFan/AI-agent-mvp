@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Mail, MessageSquare } from "lucide-react";
+import { Mail, MessageSquare, TriangleAlert } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -50,6 +50,8 @@ export function NotificationSettingsPanel() {
   const [twilioFromNumber, setTwilioFromNumber] = React.useState("");
   const [twilioAuthTokenInput, setTwilioAuthTokenInput] = React.useState("");
 
+  const [alertEmail, setAlertEmail] = React.useState("");
+
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
 
@@ -73,6 +75,7 @@ export function NotificationSettingsPanel() {
         setSmsProvider(result.sms_provider);
         setTwilioAccountSid(result.twilio_account_sid ?? "");
         setTwilioFromNumber(result.twilio_from_number ?? "");
+        setAlertEmail(result.alert_email ?? "");
         setLoadError(null);
       })
       .catch((err) => setLoadError(err instanceof ApiError ? err.message : "Failed to load notification settings."));
@@ -95,6 +98,7 @@ export function NotificationSettingsPanel() {
         twilio_account_sid: twilioAccountSid.trim() || null,
         twilio_from_number: twilioFromNumber.trim() || null,
         ...(twilioAuthTokenInput.trim() ? { twilio_auth_token: twilioAuthTokenInput.trim() } : {}),
+        alert_email: alertEmail.trim() || null,
       });
       setSettings(result);
       setMailgunApiKeyInput("");
@@ -317,6 +321,28 @@ export function NotificationSettingsPanel() {
         {testSmsStatus === "error" && testSmsError ? (
           <ErrorMessage description={testSmsError} onRetry={() => setTestSmsStatus("idle")} />
         ) : null}
+      </div>
+
+      <div className="space-y-3 border-t pt-4">
+        <h4 className="flex items-center gap-2 text-sm font-medium">
+          <TriangleAlert className="h-4 w-4" />
+          Error alerts
+        </h4>
+        <p className="text-xs text-muted-foreground">
+          Where an automatic alert goes when the backend hits a genuinely unhandled error (a crash, not
+          a routine 4xx). Reuses the email provider configured above — no separate credential needed.
+          Leave blank to disable alerting.
+        </p>
+        <div className="space-y-1">
+          <Label className="text-xs text-muted-foreground">Alert email</Label>
+          <Input
+            type="email"
+            value={alertEmail}
+            onChange={(e) => setAlertEmail(e.target.value)}
+            placeholder="owner@example.com"
+            className="w-64"
+          />
+        </div>
       </div>
 
       <div className="flex items-center gap-2 border-t pt-4">

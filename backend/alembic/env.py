@@ -68,10 +68,18 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    # connect_timeout=5 (2026-09-09) — without this, a connection attempt
+    # against a not-yet-ready/unreachable Postgres can hang far longer
+    # than any reasonable retry loop wants to wait (hit for real:
+    # backend/migrate.py's own startup retry loop never got a chance to
+    # log a single retry because the very first attempt just hung). A
+    # short, fast-failing timeout here is what actually makes that retry
+    # loop retry instead of blocking indefinitely on attempt one.
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"connect_timeout": 5},
     )
 
     with connectable.connect() as connection:

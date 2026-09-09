@@ -7,9 +7,27 @@ services:
     volumes:
       - ./backend:/app
       - "${COMFYUI_HOST_OUTPUT_DIR}:/comfy_output"
+      # Read-WRITE (2026-09-09, widened from read-only the same day) —
+      # apis/ollama_admin.py both lists model files an owner dropped into
+      # ./models (see models/README.md) AND, as of the URL-download
+      # feature, downloads a model file INTO this folder itself
+      # (server-side fetch, so it works from a remote/EC2-style
+      # deployment where the owner has no shell access to drop a file in
+      # manually). The bundled `ollama` service below only ever needs to
+      # READ a file here to import it, so its own mount stays read-only.
+      - ./models:/models
     environment:
       - DATABASE_URL=postgresql://my_user:my_password@postgres-db:5432/my_mvp_db
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      # Points at the BUNDLED `ollama` service below (2026-09-09), not
+      # host.docker.internal — Ollama now runs as its own container on
+      # this same Docker network, not something the owner installs on
+      # their host machine. See apis/ollama_admin.py's docstring and the
+      # root AGENTS.md's "First-run setup wizard" section for why this
+      # is what makes automated "pick a model -> it downloads -> it's
+      # ready" possible at all (a containerized backend has no way to
+      # install/run anything on the host OS, but it CAN make a plain
+      # HTTP call to another container on its own network).
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
       - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
       # Shared with the owner-agent service below — same default as
       # backend/auth.py's own hardcoded fallback, made explicit here so
@@ -65,6 +83,30 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - postgres-db
+      - ollama
+
+  ollama:
+    # Bundled local-model runtime (2026-09-09) — official image, no
+    # custom build. Confirmed scope with the user: CPU-only by default
+    # (no GPU passthrough configured this round); a small/quantized model
+    # (see apis/ollama_admin.py's SUGGESTED_MODELS) is still very usable
+    # on CPU, just slower than a GPU-accelerated setup.
+    image: ollama/ollama:latest
+    container_name: mvp_ollama
+    ports:
+      # 127.0.0.1-bound, not 0.0.0.0 — same reasoning as postgres-db's own
+      # port mapping below: backend reaches this over the internal Docker
+      # network (ollama:11434) and never needs this mapping at all; it
+      # exists purely so the owner can also point their own local `ollama`
+      # CLI (if installed) at this same bundled instance for debugging.
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+      # Same folder the backend mounts (read-write, above) — Ollama only
+      # ever needs to READ a file here to import it via `FROM
+      # /models/<file>.gguf` in a Modelfile, so its own mount stays
+      # read-only even though the backend's no longer is.
+      - ./models:/models:ro
 
   frontend:
     build: ./frontend
@@ -143,3 +185,9 @@ services:
 
 volumes:
   pgdata:
+  # Pulled Ollama models — kept in a named volume, not the bind-mounted
+  # ./backend tree, since these are large, machine-specific binary blobs
+  # with nothing to do with this app's own source (same reasoning
+  # pgdata already gets its own named volume rather than living under a
+  # bind mount).
+  ollama_data:

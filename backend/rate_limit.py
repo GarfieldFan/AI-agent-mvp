@@ -3,9 +3,11 @@ endpoints: `/api/chat`, `/api/chat/upload` (apis/chat.py — no `require_role`
 gate at all, see the root AGENTS.md's RBAC note), `/api/auth/login`
 (the classic brute-force target, and every other route's own front door),
 `/api/cart/add` (apis/products.py's public_router — a real mutation,
-2026-08-19), and `/api/crm/resume/request`/`/api/crm/resume/verify`
+2026-08-19), `/api/crm/resume/request`/`/api/crm/resume/verify`
 (apis/crm_resume.py, 2026-08-20 — an email-bombing target and a
-brute-force-a-code target respectively).
+brute-force-a-code target respectively), and `/api/contact`
+(apis/contact.py, 2026-09-09 — the same "public, no-auth, writes a real
+CrmEntry" shape as `/api/cart/add`).
 
 Everything else in this backend already sits behind `require_role` — a
 stolen/guessed JWT is a much bigger problem than a fast caller, and rate-
@@ -76,6 +78,9 @@ RULES: dict[tuple[str, str], RateLimitRule] = {
     # a caller spreads guesses across many source IPs) is the second.
     ("POST", "/api/crm/resume/request"): RateLimitRule(window_seconds=3600, max_requests=5),
     ("POST", "/api/crm/resume/verify"): RateLimitRule(window_seconds=900, max_requests=15),
+    # apis/contact.py's public "contact us" form — same tier as
+    # /api/chat/upload, bounds a scripted flood of CrmEntry rows.
+    ("POST", "/api/contact"): RateLimitRule(window_seconds=300, max_requests=10),
 }
 
 # (method, path, ip) -> recent request timestamps (monotonic clock, so a

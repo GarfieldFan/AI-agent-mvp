@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Eye, Save, Plug } from "lucide-react";
+import { Check, ChevronDown, CircleAlert, Eye, Save, Plug } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -18,10 +18,12 @@ import {
 } from "@/components/ui/select";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
+import { OllamaModelManager } from "@/components/modules/ollama-model-manager";
 import { ApiError } from "@/lib/api";
 import {
   getModelSettings,
   listModels,
+  testChatCompletion,
   testCustomProvider,
   updateModelSettings,
   type ComfyUIAssetOptions,
@@ -70,6 +72,80 @@ function UnavailableWarning({ optionKeyValue }: { optionKeyValue: string }) {
       Currently selected ({provider} / {model}) isn&apos;t reachable right now — it won&apos;t show as an
       option below. Reload after fixing the connection, or pick a different model to change it.
     </p>
+  );
+}
+
+/** Collapsed by default unless `defaultOpen` says the section is
+ * already relevant to what's currently configured (e.g. a "custom"
+ * endpoint block when chat/vision is already set to "custom") — 2026-09-09,
+ * per direct user feedback that this panel had grown too dense,
+ * permanently showing every provider's own config regardless of what's
+ * actually in use. `defaultOpen` only sets the INITIAL state (a later
+ * dropdown change doesn't fight a user who explicitly opened/closed
+ * this themselves) — same "advanced, collapsed unless already active"
+ * pattern `setup-wizard.tsx`'s own "Advanced" section already
+ * established. */
+function CollapsibleSection({
+  title,
+  defaultOpen,
+  children,
+}: {
+  title: string;
+  defaultOpen: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = React.useState(defaultOpen);
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+      >
+        <ChevronDown className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-180" : ""}`} />
+        {title}
+      </button>
+      {open ? <div className="mt-2 space-y-2">{children}</div> : null}
+    </div>
+  );
+}
+
+type CapabilityStatus = "ok" | "unavailable" | "unset";
+
+function capabilityStatus(options: ModelOption[], value: string): CapabilityStatus {
+  if (!value) return "unset";
+  return options.some((o) => optionKey(o.provider, o.model) === value && o.selectable) ? "ok" : "unavailable";
+}
+
+/** One line of the "at a glance" status summary (2026-09-09, added per
+ * direct user feedback: this panel had no single place that told an
+ * owner "is my chat model actually working right now" without parsing
+ * four separate dropdowns themselves). Purely derived from data this
+ * panel already fetches (`chatOptions`/etc. vs. the current dropdown
+ * value) — no extra request. */
+function StatusLine({ label, status, value }: { label: string; status: CapabilityStatus; value: string }) {
+  const [provider, model] = value ? parseKey(value) : ["", ""];
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      <span className="w-28 shrink-0 font-medium text-muted-foreground">{label}</span>
+      {status === "ok" ? (
+        <span className="flex min-w-0 items-center gap-1 text-emerald-600 dark:text-emerald-400">
+          <Check className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">
+            {provider} / {model}
+          </span>
+        </span>
+      ) : status === "unavailable" ? (
+        <span className="flex min-w-0 items-center gap-1 text-destructive">
+          <CircleAlert className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">
+            {provider} / {model} — not reachable
+          </span>
+        </span>
+      ) : (
+        <span className="text-muted-foreground">Not set</span>
+      )}
+    </div>
   );
 }
 
@@ -304,6 +380,99 @@ function CustomEndpointBlock({
  * capable, not just Ollama. Saving is global and immediate — it changes
  * what every visitor's chat and every future landing-page generation
  * uses, not just this admin session. */
+/** One password input per cloud vendor (2026-09-09) — a single key per
+ * vendor covers chat+vision+embedding+image-gen alike (matches how each
+ * vendor's own API actually works), so this is intentionally separate
+ * from the chat/vision/embedding pickers below rather than repeated per
+ * capability. Same write-only-secret UX as `CustomEndpointBlock`'s own
+ * key field (a `hasSavedKey`-driven placeholder, no dedicated "Test
+ * connection" — saving and then picking a model from the dropdowns
+ * above/below is the confirmation: a "Not configured" badge disappears
+ * once the key is actually accepted). Previously these were env-var-only
+ * (`OPENAI_API_KEY`/etc.) — still supported as a fallback, this doesn't
+ * remove that path, it just adds a no-restart alternative (see
+ * `backend/providers/openai.py`'s docstring). */
+type CloudVendor = "openai" | "anthropic" | "gemini";
+
+const CLOUD_VENDOR_OPTIONS: { value: CloudVendor; label: string; placeholder: string }[] = [
+  { value: "openai", label: "OpenAI", placeholder: "sk-…" },
+  { value: "anthropic", label: "Anthropic", placeholder: "sk-ant-…" },
+  { value: "gemini", label: "Gemini", placeholder: "AIza…" },
+];
+
+/** A vendor `Select` + a single password `Input` for whichever vendor is
+ * currently picked (2026-09-09, simplified from three always-visible
+ * inputs side by side per direct user feedback) — each vendor's typed
+ * value is still tracked independently (switching the dropdown and back
+ * doesn't lose what was typed for the other one), this just changes
+ * which one is shown at a time. */
+function CloudApiKeysBlock({
+  openaiKey,
+  onOpenaiKeyChange,
+  hasSavedOpenaiKey,
+  anthropicKey,
+  onAnthropicKeyChange,
+  hasSavedAnthropicKey,
+  geminiKey,
+  onGeminiKeyChange,
+  hasSavedGeminiKey,
+  disabled,
+}: {
+  openaiKey: string;
+  onOpenaiKeyChange: (v: string) => void;
+  hasSavedOpenaiKey: boolean;
+  anthropicKey: string;
+  onAnthropicKeyChange: (v: string) => void;
+  hasSavedAnthropicKey: boolean;
+  geminiKey: string;
+  onGeminiKeyChange: (v: string) => void;
+  hasSavedGeminiKey: boolean;
+  disabled: boolean;
+}) {
+  const [vendor, setVendor] = React.useState<CloudVendor>("openai");
+
+  const byVendor: Record<CloudVendor, { value: string; onChange: (v: string) => void; hasSaved: boolean }> = {
+    openai: { value: openaiKey, onChange: onOpenaiKeyChange, hasSaved: hasSavedOpenaiKey },
+    anthropic: { value: anthropicKey, onChange: onAnthropicKeyChange, hasSaved: hasSavedAnthropicKey },
+    gemini: { value: geminiKey, onChange: onGeminiKeyChange, hasSaved: hasSavedGeminiKey },
+  };
+  const current = byVendor[vendor];
+  const currentOption = CLOUD_VENDOR_OPTIONS.find((o) => o.value === vendor)!;
+
+  return (
+    <div className="space-y-2 rounded-lg border border-dashed p-3">
+      <p className="text-xs font-medium text-muted-foreground">Cloud provider API keys</p>
+      <p className="text-xs text-muted-foreground">
+        One key per vendor covers chat, vision, embedding, and image generation for that vendor.
+        Saved here, not in an env var — takes effect immediately, no restart.
+      </p>
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <Select value={vendor} onValueChange={(v) => v && setVendor(v as CloudVendor)} disabled={disabled}>
+          <SelectTrigger className="sm:w-40">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {CLOUD_VENDOR_OPTIONS.map((o) => (
+              <SelectItem key={o.value} value={o.value}>
+                {o.label}
+                {byVendor[o.value].hasSaved ? " (saved)" : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Input
+          type="password"
+          value={current.value}
+          onChange={(e) => current.onChange(e.target.value)}
+          placeholder={current.hasSaved ? "•••••••• (leave blank to keep)" : currentOption.placeholder}
+          disabled={disabled}
+          className="sm:flex-1"
+        />
+      </div>
+    </div>
+  );
+}
+
 export function ModelSettingsPanel() {
   const [chatModels, setChatModels] = React.useState<ModelOption[] | null>(null);
   const [visionModels, setVisionModels] = React.useState<ModelOption[] | null>(null);
@@ -336,6 +505,17 @@ export function ModelSettingsPanel() {
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
+
+  const [testChatStatus, setTestChatStatus] = React.useState<"idle" | "sending" | "error">("idle");
+  const [testChatReply, setTestChatReply] = React.useState<string | null>(null);
+  const [testChatError, setTestChatError] = React.useState<string | null>(null);
+
+  const [openaiApiKeyInput, setOpenaiApiKeyInput] = React.useState("");
+  const [hasSavedOpenaiKey, setHasSavedOpenaiKey] = React.useState(false);
+  const [anthropicApiKeyInput, setAnthropicApiKeyInput] = React.useState("");
+  const [hasSavedAnthropicKey, setHasSavedAnthropicKey] = React.useState(false);
+  const [geminiApiKeyInput, setGeminiApiKeyInput] = React.useState("");
+  const [hasSavedGeminiKey, setHasSavedGeminiKey] = React.useState(false);
 
   const [customBaseUrl, setCustomBaseUrl] = React.useState("");
   const [customApiKey, setCustomApiKey] = React.useState("");
@@ -375,6 +555,12 @@ export function ModelSettingsPanel() {
         setImageComfyuiPromptField(settings.image_comfyui_prompt_field ?? "");
         setResourceCoordinationEnabled(settings.resource_coordination_enabled);
         setResourceCoordinationHeadroomMb(String(settings.resource_coordination_headroom_mb));
+        setHasSavedOpenaiKey(settings.openai_api_key_set ?? false);
+        setOpenaiApiKeyInput("");
+        setHasSavedAnthropicKey(settings.anthropic_api_key_set ?? false);
+        setAnthropicApiKeyInput("");
+        setHasSavedGeminiKey(settings.gemini_api_key_set ?? false);
+        setGeminiApiKeyInput("");
         setCustomBaseUrl(settings.custom_base_url ?? "");
         setHasSavedCustomKey(
           (settings.chat_provider === "custom" || settings.vision_provider === "custom") &&
@@ -430,6 +616,9 @@ export function ModelSettingsPanel() {
       image_comfyui_prompt_field: imageComfyuiPromptField.trim() || null,
       resource_coordination_enabled: resourceCoordinationEnabled,
       resource_coordination_headroom_mb: Number(resourceCoordinationHeadroomMb) || 4096,
+      openai_api_key: openaiApiKeyInput.trim() || undefined,
+      anthropic_api_key: anthropicApiKeyInput.trim() || undefined,
+      gemini_api_key: geminiApiKeyInput.trim() || undefined,
     };
     if (chat_provider === "custom" || vision_provider === "custom") {
       payload.custom_base_url = customBaseUrl.trim();
@@ -448,6 +637,25 @@ export function ModelSettingsPanel() {
     } catch (err) {
       setSaveError(err instanceof ApiError ? err.message : "Failed to save model settings.");
       setSaveStatus("error");
+    }
+  }
+
+  /** Sends one real chat completion through the SAVED chat provider/model
+   * (2026-09-09) — proves a just-saved cloud API key (or any other pick)
+   * actually works, rather than an owner finding out only when a real
+   * visitor's chat turn fails. Reflects the saved config, not an
+   * in-progress edit above — save first if something was just changed. */
+  async function handleTestChat() {
+    setTestChatStatus("sending");
+    setTestChatError(null);
+    setTestChatReply(null);
+    try {
+      const result = await testChatCompletion("Reply with just the word OK.");
+      setTestChatReply(result.reply);
+      setTestChatStatus("idle");
+    } catch (err) {
+      setTestChatError(err instanceof ApiError ? err.message : "Test failed — is the backend reachable?");
+      setTestChatStatus("error");
     }
   }
 
@@ -476,6 +684,53 @@ export function ModelSettingsPanel() {
           landing-page generation uses whatever&apos;s selected here.
         </p>
       </div>
+
+      <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+        <StatusLine label="Chat" status={capabilityStatus(chatOptions, chatValue)} value={chatValue} />
+        <StatusLine label="Vision" status={capabilityStatus(visionOptions, visionValue)} value={visionValue} />
+        <StatusLine label="Embedding" status={capabilityStatus(embeddingOptions, embeddingValue)} value={embeddingValue} />
+        <StatusLine label="Image generation" status={capabilityStatus(imageProviders, imageValue)} value={imageValue} />
+
+        <div className="flex flex-wrap items-center gap-2 border-t pt-2">
+          <Button variant="outline" size="sm" onClick={handleTestChat} disabled={testChatStatus === "sending"}>
+            {testChatStatus === "sending" ? "Sending…" : "Send test chat message"}
+          </Button>
+          <span className="text-xs text-muted-foreground">Tests your saved chat model — save changes above first.</span>
+        </div>
+        {testChatReply ? (
+          <p className="rounded bg-background p-2 text-xs">
+            <span className="font-medium">Reply: </span>
+            {testChatReply}
+          </p>
+        ) : null}
+        {testChatStatus === "error" && testChatError ? (
+          <ErrorMessage description={testChatError} onRetry={() => setTestChatStatus("idle")} />
+        ) : null}
+      </div>
+
+      <CloudApiKeysBlock
+        openaiKey={openaiApiKeyInput}
+        onOpenaiKeyChange={setOpenaiApiKeyInput}
+        hasSavedOpenaiKey={hasSavedOpenaiKey}
+        anthropicKey={anthropicApiKeyInput}
+        onAnthropicKeyChange={setAnthropicApiKeyInput}
+        hasSavedAnthropicKey={hasSavedAnthropicKey}
+        geminiKey={geminiApiKeyInput}
+        onGeminiKeyChange={setGeminiApiKeyInput}
+        hasSavedGeminiKey={hasSavedGeminiKey}
+        disabled={saveStatus === "saving"}
+      />
+
+      <CollapsibleSection
+        title="Local models (bundled Ollama) — download a new one, or bring your own GGUF, any time"
+        defaultOpen={
+          parseKey(chatValue)[0] === "ollama" ||
+          parseKey(visionValue)[0] === "ollama" ||
+          parseKey(embeddingValue)[0] === "ollama"
+        }
+      >
+        <OllamaModelManager onConnected={refresh} />
+      </CollapsibleSection>
 
       <div className="space-y-3">
         <div className="space-y-1.5">
@@ -512,16 +767,21 @@ export function ModelSettingsPanel() {
           ) : null}
         </div>
 
-        <CustomEndpointBlock
-          baseUrl={customBaseUrl}
-          onBaseUrlChange={setCustomBaseUrl}
-          apiKey={customApiKey}
-          onApiKeyChange={setCustomApiKey}
-          hasSavedKey={hasSavedCustomKey}
-          onModels={setCustomModels}
-          disabled={saveStatus === "saving"}
-          scopeLabel="chat, or vision"
-        />
+        <CollapsibleSection
+          title="Advanced: custom endpoint for chat/vision (llama.cpp, vLLM, ...)"
+          defaultOpen={parseKey(chatValue)[0] === "custom" || parseKey(visionValue)[0] === "custom"}
+        >
+          <CustomEndpointBlock
+            baseUrl={customBaseUrl}
+            onBaseUrlChange={setCustomBaseUrl}
+            apiKey={customApiKey}
+            onApiKeyChange={setCustomApiKey}
+            hasSavedKey={hasSavedCustomKey}
+            onModels={setCustomModels}
+            disabled={saveStatus === "saving"}
+            scopeLabel="chat, or vision"
+          />
+        </CollapsibleSection>
 
         <div className="space-y-1.5">
           <label className="text-xs font-medium text-muted-foreground">
@@ -545,21 +805,26 @@ export function ModelSettingsPanel() {
           </p>
         </div>
 
-        <CustomEndpointBlock
-          baseUrl={embeddingBaseUrl}
-          onBaseUrlChange={setEmbeddingBaseUrl}
-          apiKey={embeddingApiKey}
-          onApiKeyChange={setEmbeddingApiKey}
-          hasSavedKey={hasSavedEmbeddingKey}
-          onModels={setEmbeddingCustomModels}
-          disabled={saveStatus === "saving"}
-          scopeLabel="embedding"
-        />
-        <p className="-mt-2 text-xs text-muted-foreground">
-          Embedding has its own endpoint, separate from chat/vision above — point this at a dedicated
-          embedding-mode server (e.g. a second <code>llama-server --embedding</code> instance on its own
-          port) if it&apos;s not the same process as your chat/vision one.
-        </p>
+        <CollapsibleSection
+          title="Advanced: custom endpoint for embedding (llama.cpp, vLLM, ...)"
+          defaultOpen={parseKey(embeddingValue)[0] === "custom"}
+        >
+          <CustomEndpointBlock
+            baseUrl={embeddingBaseUrl}
+            onBaseUrlChange={setEmbeddingBaseUrl}
+            apiKey={embeddingApiKey}
+            onApiKeyChange={setEmbeddingApiKey}
+            hasSavedKey={hasSavedEmbeddingKey}
+            onModels={setEmbeddingCustomModels}
+            disabled={saveStatus === "saving"}
+            scopeLabel="embedding"
+          />
+          <p className="text-xs text-muted-foreground">
+            Embedding has its own endpoint, separate from chat/vision above — point this at a dedicated
+            embedding-mode server (e.g. a second <code>llama-server --embedding</code> instance on its own
+            port) if it&apos;s not the same process as your chat/vision one.
+          </p>
+        </CollapsibleSection>
 
         <div className="space-y-1.5">
           <label className="text-xs font-medium text-muted-foreground">

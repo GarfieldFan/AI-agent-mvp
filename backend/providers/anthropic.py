@@ -40,13 +40,17 @@ def _to_anthropic_content(content: str | list[dict]) -> str | list[dict]:
 class AnthropicChatProvider:
     name = "anthropic"
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("ANTHROPIC_CHAT_MODEL", "claude-sonnet-5")
+        # Falls back to the module-level env var when not given — see
+        # providers/openai.py's docstring for the full reasoning (lets
+        # apis/model_settings.py pass a DB-stored key instead).
+        self.api_key = api_key or ANTHROPIC_API_KEY
 
     async def chat(
         self, messages: list[dict], *, system: str | None = None, json_mode: bool = False
     ) -> str:
-        if not ANTHROPIC_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("Anthropic", "ANTHROPIC_API_KEY")
 
         # json_mode is a documented no-op here — Claude's Messages API has
@@ -64,7 +68,7 @@ class AnthropicChatProvider:
             resp = await client.post(
                 f"{ANTHROPIC_BASE_URL}/messages",
                 headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
+                    "x-api-key": self.api_key,
                     "anthropic-version": ANTHROPIC_VERSION,
                 },
                 json={

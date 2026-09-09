@@ -1,7 +1,16 @@
 """OpenAI provider. Real API calls (no SDK dependency, just httpx against
-OpenAI's REST API) gated on OPENAI_API_KEY being set — raises
+OpenAI's REST API) gated on an API key being set — raises
 ProviderNotConfigured before attempting a call if it isn't, rather than
 failing with a confusing 401 from OpenAI itself.
+
+Each class takes an optional `api_key` override (2026-09-09) — falls
+back to the module-level `OPENAI_API_KEY` env var when not given, so an
+env-var-only setup keeps working unchanged. The override exists so
+`apis/model_settings.py`'s `resolve_chat_provider`/etc. can pass a
+DB-stored key (`AppSettings.openai_api_key`, set via the dashboard/setup
+wizard) — the same "swappable, not hardcoded" pattern already applied to
+`providers/custom.py`'s `base_url`/`api_key`, extended here so cloud
+providers don't require an env-var restart to configure.
 """
 
 import base64
@@ -18,13 +27,14 @@ OPENAI_BASE_URL = "https://api.openai.com/v1"
 class OpenAIChatProvider:
     name = "openai"
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+        self.api_key = api_key or OPENAI_API_KEY
 
     async def chat(
         self, messages: list[dict], *, system: str | None = None, json_mode: bool = False
     ) -> str:
-        if not OPENAI_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("OpenAI", "OPENAI_API_KEY")
 
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
@@ -39,7 +49,7 @@ class OpenAIChatProvider:
         async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(
                 f"{OPENAI_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                headers={"Authorization": f"Bearer {self.api_key}"},
                 json=payload,
             )
             resp.raise_for_status()
@@ -54,17 +64,18 @@ class OpenAIEmbeddingProvider:
     # providers/base.py's module docstring.
     dimensions = 1536
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        self.api_key = api_key or OPENAI_API_KEY
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        if not OPENAI_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("OpenAI", "OPENAI_API_KEY")
 
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 f"{OPENAI_BASE_URL}/embeddings",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                headers={"Authorization": f"Bearer {self.api_key}"},
                 json={"model": self.model, "input": texts},
             )
             resp.raise_for_status()
@@ -76,11 +87,12 @@ class OpenAIEmbeddingProvider:
 class OpenAIImageProvider:
     name = "openai"
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("OPENAI_IMAGE_MODEL", "dall-e-3")
+        self.api_key = api_key or OPENAI_API_KEY
 
     async def generate(self, prompt: str) -> tuple[str, bytes]:
-        if not OPENAI_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("OpenAI", "OPENAI_API_KEY")
 
         # b64_json (not the default "url") — OpenAI's own hosted URLs are
@@ -90,7 +102,7 @@ class OpenAIImageProvider:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{OPENAI_BASE_URL}/images/generations",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                headers={"Authorization": f"Bearer {self.api_key}"},
                 json={"model": self.model, "prompt": prompt, "n": 1, "size": "1024x1024", "response_format": "b64_json"},
             )
             resp.raise_for_status()

@@ -17,6 +17,7 @@ import { IntentSchemaPanel } from "@/components/modules/intent-schema-panel";
 import { MapSettingsPanel } from "@/components/modules/map-settings-panel";
 import { ModelSettingsPanel } from "@/components/modules/model-settings-panel";
 import { NotificationSettingsPanel } from "@/components/modules/notification-settings-panel";
+import { ErrorLogPanel } from "@/components/modules/error-log-panel";
 import { OAuthSettingsPanel } from "@/components/modules/oauth-settings-panel";
 import { OrderPanel } from "@/components/modules/order-panel";
 import { OwnerAgentPanel } from "@/components/modules/owner-agent-panel";
@@ -28,6 +29,7 @@ import { ProductPanel } from "@/components/modules/product-panel";
 import { ReportPanel } from "@/components/modules/report-panel";
 import { ReviewQueuePanel } from "@/components/modules/review-queue-panel";
 import { ScheduledTasksPanel } from "@/components/modules/scheduled-tasks-panel";
+import { SetupStatusBanner } from "@/components/modules/setup-status-banner";
 import { UserManagementPanel } from "@/components/modules/user-management-panel";
 import { ApiError, apiFetch } from "@/lib/api";
 import { clearAuth, useAuth } from "@/lib/auth";
@@ -110,17 +112,34 @@ export function AgentConsoleSection() {
       {verifying ? (
         <LoadingSpinner label="Checking your session…" className="p-10" />
       ) : canView ? (
-        // Grouped into a collapsible accordion (2026-08-19) — 8 panels
-        // stacked flat had grown hard to navigate. `multiple` so more
-        // than one group can stay open at once (e.g. Model settings open
-        // while checking Document manager); everything starts collapsed
-        // rather than guessing which group matters most on load.
-        <Accordion multiple defaultValue={[]}>
-          <AccordionItem value="ai-kb">
-            <AccordionTrigger>AI & knowledge base</AccordionTrigger>
+        <div className="space-y-4">
+        <SetupStatusBanner />
+        {/* Grouped into a collapsible accordion (2026-08-19) — 8 panels
+            stacked flat had grown hard to navigate. `multiple` so more
+            than one group can stay open at once (e.g. Model settings open
+            while checking Document manager). `defaultValue={["model"]}`
+            (2026-09-09, per direct user feedback) — the model picker is
+            the one thing almost every session actually needs first
+            (nothing else works until a model is connected), so it starts
+            open while every other group starts collapsed. */}
+        <Accordion multiple defaultValue={["model"]}>
+          <AccordionItem value="model">
+            <AccordionTrigger>AI model</AccordionTrigger>
             <AccordionPanel>
               <ModelSettingsPanel />
+            </AccordionPanel>
+          </AccordionItem>
+
+          <AccordionItem value="chat-prompts">
+            <AccordionTrigger>Chat prompts</AccordionTrigger>
+            <AccordionPanel>
               <ChatPromptSettingsPanel />
+            </AccordionPanel>
+          </AccordionItem>
+
+          <AccordionItem value="ai-kb">
+            <AccordionTrigger>Knowledge base</AccordionTrigger>
+            <AccordionPanel>
               <DocumentManager />
               <ScheduledTasksPanel />
             </AccordionPanel>
@@ -163,6 +182,7 @@ export function AgentConsoleSection() {
               <OrderPanel />
               <PaymentSettingsPanel />
               <NotificationSettingsPanel />
+              <ErrorLogPanel />
               <MapSettingsPanel />
             </AccordionPanel>
           </AccordionItem>
@@ -191,6 +211,7 @@ export function AgentConsoleSection() {
             </AccordionItem>
           ) : null}
         </Accordion>
+        </div>
       ) : (
         <EmptyState
           icon={Lock}

@@ -43,13 +43,17 @@ def _to_gemini_contents(messages: list[dict]) -> list[dict]:
 class GeminiChatProvider:
     name = "gemini"
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
+        # Falls back to the module-level env var when not given — see
+        # providers/openai.py's docstring (lets apis/model_settings.py
+        # pass a DB-stored key instead).
+        self.api_key = api_key or GEMINI_API_KEY
 
     async def chat(
         self, messages: list[dict], *, system: str | None = None, json_mode: bool = False
     ) -> str:
-        if not GEMINI_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("Gemini", "GEMINI_API_KEY")
 
         payload: dict = {"contents": _to_gemini_contents(messages)}
@@ -66,7 +70,7 @@ class GeminiChatProvider:
         async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(
                 f"{GEMINI_BASE_URL}/models/{self.model}:generateContent",
-                params={"key": GEMINI_API_KEY},
+                params={"key": self.api_key},
                 json=payload,
             )
             resp.raise_for_status()
@@ -81,11 +85,12 @@ class GeminiEmbeddingProvider:
     # also re-embedding every stored chunk — see providers/base.py.
     dimensions = 768
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
+        self.api_key = api_key or GEMINI_API_KEY
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        if not GEMINI_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("Gemini", "GEMINI_API_KEY")
 
         requests = [
@@ -94,7 +99,7 @@ class GeminiEmbeddingProvider:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 f"{GEMINI_BASE_URL}/models/{self.model}:batchEmbedContents",
-                params={"key": GEMINI_API_KEY},
+                params={"key": self.api_key},
                 json={"requests": requests},
             )
             resp.raise_for_status()
@@ -105,17 +110,18 @@ class GeminiEmbeddingProvider:
 class GeminiImageProvider:
     name = "gemini"
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
         self.model = model or os.environ.get("GEMINI_IMAGE_MODEL", "imagen-4.0-generate-001")
+        self.api_key = api_key or GEMINI_API_KEY
 
     async def generate(self, prompt: str) -> tuple[str, bytes]:
-        if not GEMINI_API_KEY:
+        if not self.api_key:
             raise ProviderNotConfigured("Gemini", "GEMINI_API_KEY")
 
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{GEMINI_BASE_URL}/models/{self.model}:predict",
-                params={"key": GEMINI_API_KEY},
+                params={"key": self.api_key},
                 json={"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}},
             )
             resp.raise_for_status()

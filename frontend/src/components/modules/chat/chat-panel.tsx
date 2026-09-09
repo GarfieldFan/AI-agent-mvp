@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChatMessageBubble } from "@/components/modules/chat/chat-message-bubble";
+import { ContactForm } from "@/components/modules/contact-form";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ErrorMessage } from "@/components/common/error-message";
 import { ApiError } from "@/lib/api";
@@ -81,6 +82,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
   const [draft, setDraft] = React.useState("");
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // Set when the backend itself is the problem (no AI provider
+  // configured yet, or a genuine 5xx failure — see handleSend's catch
+  // block below), never for an ordinary 4xx (bad input, rate limit).
+  // Distinct from `error` above: this renders a real fallback (a
+  // contact form) instead of a bare "try again" message, since "try
+  // again" isn't a real option when the assistant itself is down —
+  // matches the same "site not ready / no LLM configured / it broke"
+  // fallback `app/not-found.tsx` offers for a missing page.
+  const [chatUnavailable, setChatUnavailable] = React.useState(false);
   const bottomRef = React.useRef<HTMLDivElement>(null);
 
   // Uploaded ahead of send (POST /api/chat/upload) — see lib/chat.ts's
@@ -272,6 +282,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
     setPendingAttachment(null);
     setUploadError(null);
     setError(null);
+    setChatUnavailable(false);
 
     // step 3's "anything else?" used to short-circuit here with a canned
     // "that's been captured" reply and never actually call the backend —
@@ -296,8 +307,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
         searchLink: searchLink ?? undefined,
       });
     } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Could not reach the chat backend.";
-      setError(message);
+      // A 5xx means the assistant itself is the problem (no provider
+      // configured, the configured one unreachable, or any other server
+      // failure) — no amount of retrying by the visitor fixes that, so
+      // offer the contact-form fallback instead of a "try again" prompt.
+      // Anything else (4xx: bad input, rate-limited, ...) keeps the
+      // ordinary retryable error message.
+      if (err instanceof ApiError && err.status >= 500) {
+        setChatUnavailable(true);
+      } else {
+        setError(err instanceof ApiError ? err.message : "Could not reach the chat backend.");
+      }
     } finally {
       setPending(false);
     }
@@ -327,7 +347,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps) {
             />
           ))}
           {pending ? <LoadingSpinner label="Thinking…" className="pl-1" /> : null}
-          {error ? (
+          {chatUnavailable ? (
+            <ContactForm
+              title="Chat is temporarily unavailable"
+              description="Our assistant can't respond right now — send a message here instead and we'll follow up."
+            />
+          ) : error ? (
             <ErrorMessage description={error} onRetry={() => setError(null)} />
           ) : null}
           <div ref={bottomRef} />
