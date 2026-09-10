@@ -26,6 +26,7 @@ import { PageManager } from "@/components/modules/page-manager";
 import { PaymentSettingsPanel } from "@/components/modules/payment-settings-panel";
 import { PosterGeneratorPanel } from "@/components/modules/poster-generator-panel";
 import { ProductPanel } from "@/components/modules/product-panel";
+import { StockItemPanel } from "@/components/modules/stock-item-panel";
 import { ReportPanel } from "@/components/modules/report-panel";
 import { ReviewQueuePanel } from "@/components/modules/review-queue-panel";
 import { ScheduledTasksPanel } from "@/components/modules/scheduled-tasks-panel";
@@ -186,6 +187,7 @@ export function AgentConsoleSection() {
             <AccordionTrigger>Products & orders</AccordionTrigger>
             <AccordionPanel>
               <ProductPanel />
+              <StockItemPanel />
               <OrderPanel />
               <PaymentSettingsPanel />
               <NotificationSettingsPanel />

@@ -42,7 +42,7 @@ from apis.pages import _get_or_create_page
 from crm_retention import cleanup_stale_crm_entries
 from db import get_db
 from llm_json import parse_lenient_json
-from models import ChatMessage, ChatSession, CrmEntry, Document, OwnerAgentRun, PageVersion
+from models import ChatMessage, ChatSession, CrmEntry, Document, Order, OwnerAgentRun, PageVersion
 from providers.base import ProviderNotConfigured
 from resource_broker import maybe_release_llm_memory
 
@@ -1735,23 +1735,28 @@ def cleanup_stale_crm_entries_route(
 
 
 class ReportRequest(BaseModel):
-    # Only one report exists today — a Literal (not a bare `str`) so an
-    # unsupported value 422s immediately instead of silently returning an
-    # empty report. Extend this union, not the meaning of "chat-volume"
-    # itself, when a second report type ships.
-    report_type: Literal["chat-volume"] = "chat-volume"
+    # A Literal (not a bare `str`) so an unsupported value 422s
+    # immediately instead of silently returning an empty report.
+    # "revenue" (2026-09-10) is the second report type — see
+    # generate_report's own docstring for why it was previously scoped
+    # out and what unblocked it.
+    report_type: Literal["chat-volume", "revenue"] = "chat-volume"
     start_date: date
     end_date: date
 
 
 class ReportDayPoint(BaseModel):
     date: date
-    session_count: int
-    message_count: int
+    session_count: int | None = None
+    message_count: int | None = None
+    # Revenue report only (2026-09-10) — null for a chat-volume point,
+    # never both sets of fields populated on the same point.
+    order_count: int | None = None
+    revenue_total: float | None = None
 
 
 class ReportResponse(BaseModel):
-    report_type: Literal["chat-volume"]
+    report_type: Literal["chat-volume", "revenue"]
     start_date: date
     end_date: date
     points: list[ReportDayPoint]
@@ -1759,26 +1764,48 @@ class ReportResponse(BaseModel):
 
 @router.post("/agent/reports/generate", response_model=ReportResponse)
 def generate_report(req: ReportRequest, db: Session = Depends(get_db)) -> ReportResponse:
-    """Real as of 2026-08-06 — returns structured per-day data (new chat
-    sessions, chat messages) for the frontend to chart directly, not a
-    `report_url` pointing at a generated file: this project has no
+    """Real as of 2026-08-06 (chat-volume) / 2026-09-10 (revenue) —
+    returns structured per-day data for the frontend to chart directly,
+    not a `report_url` pointing at a generated file: this project has no
     static-report-file generation infrastructure, and the actual
-    underlying data (`ChatSession`/`ChatMessage`, see "Visitor
-    conversation persistence" in the root AGENTS.md) is already
-    relational — handing back numbers for the frontend's own chart
-    library to render is both simpler and more honest about what's
-    actually available than inventing a file/URL step with nothing
-    behind it.
+    underlying data is already relational — handing back numbers for the
+    frontend's own chart library to render is both simpler and more
+    honest about what's actually available than inventing a file/URL
+    step with nothing behind it.
 
-    Deliberately scoped to chat volume only — the request contract's
-    original docstring also mentioned "RAG query trends," but whether a
-    given `/api/chat` turn actually used retrieved context was never
-    persisted (`ChatMessage` stores the reply text, not `sources`), so
-    that series genuinely can't be computed from data this project has
-    today. Extending this later means adding that column to `ChatMessage`
-    first, not just adding a case here."""
+    "revenue" sums `Order.total_amount` for `payment_status == "paid"`
+    orders per day — this was previously out of scope on purpose (this
+    function's own original docstring said so), unblocked once a real
+    e-commerce simulation made the gap concrete (an owner asking "how was
+    yesterday's revenue" had literally no endpoint to answer that from).
+    "RAG query trends" is still out of scope — whether a given `/api/chat`
+    turn actually used retrieved context was never persisted, so that
+    series genuinely can't be computed from data this project has today."""
     if req.end_date < req.start_date:
         raise HTTPException(status_code=422, detail="end_date must not be before start_date")
+
+    points = []
+    current = req.start_date
+
+    if req.report_type == "revenue":
+        day = func.date(Order.created_at)
+        revenue_query = (
+            db.query(day, func.count(Order.id), func.coalesce(func.sum(Order.total_amount), 0))
+            .filter(Order.payment_status == "paid")
+            .filter(func.date(Order.created_at).between(req.start_date, req.end_date))
+            .group_by(day)
+            .all()
+        )
+        revenue_rows = {row[0]: (row[1], row[2]) for row in revenue_query}
+        while current <= req.end_date:
+            order_count, revenue_total = revenue_rows.get(current, (0, 0))
+            points.append(
+                ReportDayPoint(date=current, order_count=order_count, revenue_total=float(revenue_total))
+            )
+            current += timedelta(days=1)
+        return ReportResponse(
+            report_type=req.report_type, start_date=req.start_date, end_date=req.end_date, points=points
+        )
 
     day = func.date(ChatSession.created_at)
     session_rows = dict(
@@ -1795,8 +1822,6 @@ def generate_report(req: ReportRequest, db: Session = Depends(get_db)) -> Report
         .all()
     )
 
-    points = []
-    current = req.start_date
     while current <= req.end_date:
         points.append(
             ReportDayPoint(

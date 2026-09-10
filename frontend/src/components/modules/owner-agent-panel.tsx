@@ -28,7 +28,14 @@ import {
   type OwnerAgentRunResult,
   type OwnerAgentRunSummary,
 } from "@/lib/owner-agent";
-import { createProduct, updateProduct, type ProductInput } from "@/lib/products";
+import {
+  createProduct,
+  createStockItem,
+  updateProduct,
+  updateStockItem,
+  type ProductInput,
+  type ProposedStockAdjustment,
+} from "@/lib/products";
 
 const HISTORY_PAGE_SIZE = 20;
 
@@ -56,11 +63,13 @@ type ProposedProduct = {
 /** Owner only (see owner-agent/deps.py — stricter than every other panel
  * in this section, which are admin OR owner). Sends a natural-language
  * command to the owner-agent container's `POST /run`, a real LLM
- * tool-calling loop over a fixed 9-tool allowlist (poster generation,
- * landing-page generation from an already-uploaded design, CRM
- * capture/list/delete, chat-volume reporting, GEO page regeneration,
- * attachment scanning, upload cleanup) — the first capability in this app
- * where the model itself decides which action(s) to take, not a single
+ * tool-calling loop over a fixed 25-tool allowlist (poster/landing-page
+ * generation, CRM capture/list/delete, reporting, GEO page regeneration,
+ * attachment scanning, upload cleanup, intake-schema/product/stock
+ * proposals — including drafting products/restocks straight from an
+ * already-uploaded PDF — and more, see owner-agent/tools.py for the
+ * current, authoritative list) — the first capability in this app where
+ * the model itself decides which action(s) to take, not a single
  * deterministic pipeline call. Renders the full step trace so a run's
  * reasoning is visible, not just its final answer. Also lists past runs
  * (2026-08-19, backend/models.py's OwnerAgentRun) — a queryable history
@@ -96,6 +105,15 @@ export function OwnerAgentPanel() {
   const [pendingProducts, setPendingProducts] = React.useState<ProposedProduct[] | null>(null);
   const [productApplyStatus, setProductApplyStatus] = React.useState<"idle" | "saving" | "error">("idle");
   const [productApplyError, setProductApplyError] = React.useState<string | null>(null);
+
+  // Stock-adjustment-proposal review (2026-09-10) — same propose-then-
+  // owner-applies posture, see propose_stock_from_document's description
+  // in owner-agent/tools.py: a misread quantity from a purchase order
+  // would silently corrupt a real stock count, so owner-agent never
+  // writes to StockItem itself.
+  const [pendingStock, setPendingStock] = React.useState<ProposedStockAdjustment[] | null>(null);
+  const [stockApplyStatus, setStockApplyStatus] = React.useState<"idle" | "saving" | "error">("idle");
+  const [stockApplyError, setStockApplyError] = React.useState<string | null>(null);
 
   const refreshHistory = React.useCallback(() => {
     listOwnerAgentRuns(HISTORY_PAGE_SIZE, (historyPage - 1) * HISTORY_PAGE_SIZE)
@@ -138,10 +156,21 @@ export function OwnerAgentPanel() {
         setProposalDraft(proposal.proposed_schema);
       }
 
-      const productsStep = runResult.steps.find((step) => step.tool === "propose_products" && step.ok);
+      // "propose_products_from_document" (2026-09-10) returns the exact
+      // same {proposals: ProposedProduct[]} shape as propose_products —
+      // reading a PDF first doesn't change what gets reviewed/applied.
+      const productsStep = runResult.steps.find(
+        (step) => (step.tool === "propose_products" || step.tool === "propose_products_from_document") && step.ok,
+      );
       if (productsStep?.result) {
         const { proposals } = productsStep.result as unknown as { proposals: ProposedProduct[] };
         setPendingProducts(proposals);
+      }
+
+      const stockStep = runResult.steps.find((step) => step.tool === "propose_stock_from_document" && step.ok);
+      if (stockStep?.result) {
+        const { proposals } = stockStep.result as unknown as { proposals: ProposedStockAdjustment[] };
+        setPendingStock(proposals);
       }
     } catch (err) {
       setError(
@@ -242,6 +271,47 @@ export function OwnerAgentPanel() {
     } catch (err) {
       setProductApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
       setProductApplyStatus("error");
+    }
+  }
+
+  function updateStockDraftAt(index: number, patch: Partial<ProposedStockAdjustment>) {
+    setPendingStock((list) => (list ? list.map((s, i) => (i === index ? { ...s, ...patch } : s)) : list));
+  }
+
+  function removeStockDraftAt(index: number) {
+    setPendingStock((list) => (list ? list.filter((_, i) => i !== index) : list));
+  }
+
+  function discardStock() {
+    setPendingStock(null);
+    setStockApplyStatus("idle");
+    setStockApplyError(null);
+  }
+
+  async function applyStock() {
+    if (!pendingStock || pendingStock.length === 0) return;
+    setStockApplyStatus("saving");
+    setStockApplyError(null);
+    try {
+      for (const proposal of pendingStock) {
+        if (proposal.existing_id !== null && proposal.existing_quantity !== null) {
+          // Restock adds the parsed quantity ON TOP OF whatever's
+          // already there — the document represents a delivery, not a
+          // fresh inventory count.
+          await updateStockItem(proposal.existing_id, {
+            name: proposal.name.trim(),
+            quantity: proposal.existing_quantity + proposal.quantity,
+            unit: proposal.unit.trim(),
+          });
+        } else {
+          await createStockItem({ name: proposal.name.trim(), quantity: proposal.quantity, unit: proposal.unit.trim() });
+        }
+      }
+      setPendingStock(null);
+      setStockApplyStatus("idle");
+    } catch (err) {
+      setStockApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
+      setStockApplyStatus("error");
     }
   }
 
@@ -461,6 +531,73 @@ export function OwnerAgentPanel() {
               </div>
               {productApplyStatus === "error" && productApplyError ? (
                 <ErrorMessage description={productApplyError} onRetry={() => setProductApplyStatus("idle")} />
+              ) : null}
+            </div>
+          ) : null}
+
+          {pendingStock && pendingStock.length > 0 ? (
+            <div className="space-y-3 rounded-lg border border-dashed p-3">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  Stock restock draft{pendingStock.length > 1 ? "s" : ""} — review before applying
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  The agent never writes to real stock levels itself. A matched existing ingredient
+                  gets the parsed quantity ADDED to what&apos;s already there (a delivery, not a fresh
+                  count); an unmatched name creates a new ingredient.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                {pendingStock.map((proposal, i) => (
+                  <div key={i} className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-2">
+                    <Input
+                      placeholder="Name"
+                      value={proposal.name}
+                      onChange={(e) => updateStockDraftAt(i, { name: e.target.value })}
+                    />
+                    <Input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      className="w-24"
+                      placeholder="Quantity"
+                      value={proposal.quantity}
+                      onChange={(e) => updateStockDraftAt(i, { quantity: Number(e.target.value) })}
+                    />
+                    <Input
+                      className="w-20"
+                      placeholder="Unit"
+                      value={proposal.unit}
+                      onChange={(e) => updateStockDraftAt(i, { unit: e.target.value })}
+                    />
+                    <Button variant="ghost" size="icon-xs" aria-label="Remove entry" onClick={() => removeStockDraftAt(i)}>
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                    {proposal.existing_id !== null ? (
+                      <p className="col-span-4 text-xs text-muted-foreground">
+                        Will restock &quot;{proposal.name}&quot;: {proposal.existing_quantity} + {proposal.quantity}{" "}
+                        {proposal.unit} = {(proposal.existing_quantity ?? 0) + proposal.quantity} {proposal.unit}.
+                      </p>
+                    ) : (
+                      <p className="col-span-4 text-xs text-muted-foreground">
+                        Will create a new ingredient &quot;{proposal.name}&quot;.
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button onClick={applyStock} disabled={stockApplyStatus === "saving"}>
+                  {stockApplyStatus === "saving" ? "Applying…" : "Apply"}
+                </Button>
+                <Button variant="ghost" onClick={discardStock}>
+                  Discard
+                </Button>
+              </div>
+              {stockApplyStatus === "error" && stockApplyError ? (
+                <ErrorMessage description={stockApplyError} onRetry={() => setStockApplyStatus("idle")} />
               ) : null}
             </div>
           ) : null}

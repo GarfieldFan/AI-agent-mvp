@@ -29,6 +29,14 @@ export type Product = {
   created_at: string;
   bundle_items: RelationSummary[];
   upsells: RelationSummary[];
+  /** Inventory + pay-what-you-want (2026-09-10) — see backend/models.py's
+   * Product docstring. stock_quantity/low_stock_threshold null means
+   * untracked, same as never setting them (available stays the only
+   * signal). variable_price means `price` is only a suggested default —
+   * the real per-order amount comes from whatever the visitor states. */
+  stock_quantity: number | null;
+  low_stock_threshold: number | null;
+  variable_price: boolean;
 };
 
 export type ProductInput = {
@@ -39,6 +47,9 @@ export type ProductInput = {
   available: boolean;
   image_url?: string | null;
   custom_fields?: Record<string, string>;
+  stock_quantity?: number | null;
+  low_stock_threshold?: number | null;
+  variable_price?: boolean;
 };
 
 export type ProductListResult = {
@@ -212,4 +223,79 @@ export function updateProduct(id: number, input: ProductInput) {
  * just lose the link back to a product that no longer exists. */
 export function deleteProduct(id: number) {
   return apiFetch<void>(`/api/agent/products/${id}`, { method: "DELETE" });
+}
+
+// --- Document-to-structured-data proposals (owner-agent) ------------------
+// See backend/apis/products.py's own module comment — one shared
+// extraction primitive on the backend, two purpose-built propose-then-
+// owner-applies endpoints on top of it.
+
+export type ProposedProduct = {
+  product: ProductInput;
+  already_exists: boolean;
+  existing_id: number | null;
+};
+
+export function proposeProductsFromDocument(fileUrl: string, instructions?: string) {
+  return apiFetch<{ proposals: ProposedProduct[] }>("/api/agent/products/propose-from-document", {
+    method: "POST",
+    body: { file_url: fileUrl, instructions: instructions || null },
+  });
+}
+
+// --- Raw-material/ingredient inventory (admin) -----------------------------
+// Deliberately a separate, much simpler table from Product — see
+// backend/models.py's StockItem docstring for why an ingredient (milk,
+// coffee beans, eggs) doesn't belong in the sellable-catalog table.
+
+export type StockItem = {
+  id: number;
+  name: string;
+  quantity: number;
+  unit: string;
+  low_stock_threshold: number | null;
+  created_at: string;
+};
+
+export type StockItemInput = {
+  name: string;
+  quantity: number;
+  unit: string;
+  low_stock_threshold?: number | null;
+};
+
+export type StockItemListResult = {
+  items: StockItem[];
+  total: number;
+};
+
+export function listStockItems(limit = 100, offset = 0) {
+  return apiFetch<StockItemListResult>(`/api/agent/stock-items?limit=${limit}&offset=${offset}`);
+}
+
+export function createStockItem(input: StockItemInput) {
+  return apiFetch<StockItem>("/api/agent/stock-items", { method: "POST", body: input });
+}
+
+export function updateStockItem(id: number, input: StockItemInput) {
+  return apiFetch<StockItem>(`/api/agent/stock-items/${id}`, { method: "PUT", body: input });
+}
+
+export function deleteStockItem(id: number) {
+  return apiFetch<void>(`/api/agent/stock-items/${id}`, { method: "DELETE" });
+}
+
+export type ProposedStockAdjustment = {
+  name: string;
+  quantity: number;
+  unit: string;
+  existing_id: number | null;
+  existing_quantity: number | null;
+};
+
+export function proposeStockFromDocument(fileUrl: string, instructions?: string) {
+  return apiFetch<{ proposals: ProposedStockAdjustment[] }>("/api/agent/stock-items/propose-from-document", {
+    method: "POST",
+    body: { file_url: fileUrl, instructions: instructions || null },
+  });
 }

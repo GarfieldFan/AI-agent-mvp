@@ -788,8 +788,22 @@ class Product(Base):
 
     v1 scope cut, deliberate: no variant/attribute matrix (WooCommerce's
     "variable product") — a "Latte Large" vs "Latte Small" are two
-    separate rows here, not one product with a size attribute. No
-    inventory/stock tracking either. Both deferred, not rejected.
+    separate rows here, not one product with a size attribute.
+
+    **Inventory (2026-09-10)** — deliberately just ONE nullable column,
+    not a second table or a type-classifying column, for a product that
+    IS directly sellable (a finished good — a cake, a sandwich — as
+    opposed to a raw ingredient, which isn't a `Product` at all, see
+    `StockItem` below). `stock_quantity: int | None` — `None` (the
+    default, unchanged behavior) means untracked, `available` stays the
+    only signal, exactly as before this existed; a real integer means
+    this app actively tracks and decrements it. Deliberately NO automatic
+    link to `StockItem` (ingredients) — selling a Latte does not
+    decrement milk/coffee-bean `StockItem` rows, since that needs a full
+    recipe/bill-of-materials system this app doesn't have and isn't
+    building; ingredient levels are the owner's own manual concern (or
+    the purchase-order-parsing tool restocking them), independent of what
+    sells through the `Product` catalog.
 
     Created either directly (admin/owner's own dashboard form, ProductPanel)
     or via owner-agent's propose_products tool — but even then, only ever
@@ -822,6 +836,52 @@ class Product(Base):
     # from, this column holds one product's actual {field_key: value}
     # data.
     custom_fields: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # Inventory (2026-09-10) — see the class docstring above for why this
+    # is one nullable column, not a second table.
+    stock_quantity: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Fires the same notify_owner alert already used for orders/payments
+    # when stock_quantity crosses below this on a decrement — null means
+    # no alert configured for this product, same "null means no gate"
+    # posture as shipping_allowed_regions etc. Meaningless when
+    # stock_quantity itself is null (untracked).
+    low_stock_threshold: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Pay-what-you-want products (2026-09-10) — a tip jar, a donation, a
+    # custom-quote line item. When True, `price` above is only a
+    # fallback/suggested default; the real per-order unit price is
+    # whatever the visitor actually states, captured directly into
+    # OrderItem.unit_price_snapshot at add-time — never derived from this
+    # column. See cart.py's apply_order_delta for the one place a caller-
+    # supplied price is ever trusted, and only for a product with this
+    # flag set.
+    variable_price: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+
+class StockItem(Base):
+    """Raw-material/ingredient inventory (2026-09-10) — deliberately a
+    separate, much simpler table from `Product`, not a type-classifying
+    column bolted onto it: an ingredient (milk, coffee beans, eggs) has
+    no price, isn't shown on any menu, and a customer never orders it by
+    name — it doesn't belong in a *sellable catalog* table at all. See
+    `Product.stock_quantity`'s own docstring for the sellable/finished-
+    goods half of inventory, and for why the two are deliberately never
+    automatically linked (no recipe/bill-of-materials system here) —
+    this table is purely something the owner (or the purchase-order-
+    parsing tool) adjusts directly.
+
+    `quantity`/`low_stock_threshold` are `Numeric`, not `Integer` — unlike
+    a `Product`'s whole-unit stock count, an ingredient quantity is
+    routinely fractional (2.5 kg of coffee beans, 1.75 L of milk)."""
+
+    __tablename__ = "stock_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    quantity: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
+    unit: Mapped[str] = mapped_column(String(32))
+    # Fires notify_owner when quantity crosses below this on an update —
+    # null means no alert configured, same posture as Product's own field.
+    low_stock_threshold: Mapped[float | None] = mapped_column(Numeric(10, 2), default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

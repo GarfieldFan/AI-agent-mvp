@@ -127,9 +127,11 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "generate_report": ToolSpec(
         name="generate_report",
         description=(
-            'Returns per-day chat session/message counts for a date range. Args: '
-            '{"report_type": "chat-volume", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}. '
-            'Keep ranges reasonable (a few weeks at most) unless explicitly asked for a longer span.'
+            'Returns per-day numbers for a date range. Args: {"report_type": "chat-volume" | "revenue", '
+            '"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}. "chat-volume" gives session_count/'
+            'message_count per day; "revenue" gives order_count/revenue_total per day (paid orders only) '
+            "— use \"revenue\" for a question like \"how was yesterday's revenue/sales\". Keep ranges "
+            "reasonable (a few weeks at most) unless explicitly asked for a longer span."
         ),
         method="POST",
         path="/api/agent/reports/generate",
@@ -253,6 +255,48 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         ),
         method="POST",
         path="/api/agent/products/propose",
+    ),
+    "propose_products_from_document": ToolSpec(
+        name="propose_products_from_document",
+        description=(
+            "Reads an already-uploaded document (a product catalog, price list, or spec sheet — the "
+            "owner uploads it via the dashboard's media library first, then gives you the resulting URL) "
+            "and drafts a product catalog from it — never creates or changes real products itself, only "
+            'a draft, same as propose_products. Args: {"file_url": "<the uploaded file\'s URL>", '
+            '"instructions": "<optional extra guidance, e.g. \'these are wholesale prices, mark up 40%\'>"}. '
+            "Only PDF documents are supported. After calling this, tell the owner a draft is ready to "
+            "review in the Owner agent panel — never claim any product has already been created."
+        ),
+        method="POST",
+        path="/api/agent/products/propose-from-document",
+        timeout=180,
+    ),
+    "list_stock_items": ToolSpec(
+        name="list_stock_items",
+        description=(
+            'Returns the owner\'s tracked raw-material/ingredient inventory (id, name, quantity, unit, '
+            'low_stock_threshold) as {"items": [...], "total": <count>} — this is how you answer a '
+            "question like \"how's our stock today\" or \"are we low on anything\". This is separate "
+            "from list_products' finished-goods stock_quantity field — ingredients (milk, coffee beans, "
+            "eggs) live here, sellable menu items live in list_products."
+        ),
+        method="GET",
+        path="/api/agent/stock-items",
+    ),
+    "propose_stock_from_document": ToolSpec(
+        name="propose_stock_from_document",
+        description=(
+            "Reads an already-uploaded document (a purchase order or delivery receipt — the owner "
+            "uploads it via the dashboard's media library first, then gives you the resulting URL) and "
+            "drafts raw-material/ingredient restock entries from it — never writes to real stock levels "
+            'itself, only a draft for the owner to review. Args: {"file_url": "<the uploaded file\'s '
+            'URL>", "instructions": "<optional extra guidance>"}. Only PDF documents are supported. '
+            "After calling this, tell the owner a draft is ready to review — never claim stock has "
+            "already been adjusted."
+        ),
+        method="POST",
+        path="/api/agent/stock-items/propose-from-document",
+        timeout=180,
     ),
     "set_order_status_options": ToolSpec(
         name="set_order_status_options",

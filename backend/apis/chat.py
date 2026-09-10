@@ -841,7 +841,10 @@ def _order_extraction_system_prompt(active_order: Order | None) -> str:
         '{"items": [{"item_phrase": "<plain product name/description the visitor mentioned, e.g. '
         '\'latte\'>", "quantity_delta": <positive to add, negative to remove/reduce>, "comment": "<any '
         'per-item customization the visitor mentioned for THIS item specifically, e.g. \'no sugar\', '
-        '\'extra spicy\', or null>"}], "search_phrase": '
+        '\'extra spicy\', or null>", "unit_price": <a specific dollar amount the visitor stated for THIS '
+        "item, e.g. for a tip/donation/pay-what-you-want item (\"I'll leave a $5 tip\" -> 5), or null if "
+        'they didn\'t state an amount — irrelevant for an ordinary fixed-price item, leave null>}], '
+        '"search_phrase": '
         '"<plain text describing what the visitor is asking about, or null>", "pickup_time": "<what the '
         'visitor said about timing, e.g. "9am" or "in 5 minutes", or null>", "note": "<any special '
         'instructions that apply to the WHOLE order rather than one item, or null>"}\n\n'
@@ -871,6 +874,12 @@ class _ResolvedOrderItem:
     # extraction call just never had a field to put the customization in,
     # so it was silently dropped before ever reaching that logic.
     comment: str | None = None
+    # Pay-what-you-want products only (2026-09-10) — see
+    # Product.variable_price's own docstring. apply_order_delta silently
+    # ignores this for any product without that flag, so an ordinary
+    # fixed-price item can never have its quoted price overridden by a
+    # visitor's stated number.
+    unit_price: float | None = None
 
 
 @dataclass
@@ -956,9 +965,19 @@ def _resolve_order_turn(db: Session, parsed: dict | None, active_order: Order | 
                 continue
             item_comment = raw_item.get("comment")
             item_comment = item_comment.strip() if isinstance(item_comment, str) and item_comment.strip() else None
+            try:
+                item_unit_price = float(raw_item.get("unit_price"))
+                if item_unit_price <= 0:
+                    item_unit_price = None
+            except (TypeError, ValueError):
+                item_unit_price = None
             matches = search_products(db, phrase, limit=_SEARCH_DISPLAY_CAP + 1)
             if len(matches) == 1:
-                resolved.append(_ResolvedOrderItem(product=matches[0], quantity_delta=delta, comment=item_comment))
+                resolved.append(
+                    _ResolvedOrderItem(
+                        product=matches[0], quantity_delta=delta, comment=item_comment, unit_price=item_unit_price
+                    )
+                )
             elif len(matches) > 1:
                 ambiguous.extend(matches[:_SEARCH_DISPLAY_CAP])
             # 0 matches: nothing resolved, nothing to show — the main
@@ -991,10 +1010,19 @@ def _order_turn_context_block(active_order: Order | None, turn: OrderTurnResult)
     computed here in Python, never left for the model to add up itself)."""
     parts: list[str] = []
     if turn.resolved:
+        # A variable-price item's real per-unit price is whatever the
+        # visitor stated (item.unit_price), not the catalog's own
+        # suggested-default Product.price — using the wrong one here
+        # would state a wrong running total to the visitor.
+        def _effective_unit_price(item: _ResolvedOrderItem) -> float:
+            if item.product.variable_price and item.unit_price is not None:
+                return item.unit_price
+            return float(item.product.price)
+
         current_total = float(active_order.total_amount) if active_order else 0.0
-        delta_total = sum(float(item.product.price) * item.quantity_delta for item in turn.resolved)
+        delta_total = sum(_effective_unit_price(item) * item.quantity_delta for item in turn.resolved)
         lines = "; ".join(
-            f"{item.quantity_delta:+d} {item.product.name} (${float(item.product.price):.2f} each)"
+            f"{item.quantity_delta:+d} {item.product.name} (${_effective_unit_price(item):.2f} each)"
             + (f" [{item.comment}]" if item.comment else "")
             for item in turn.resolved
         )
@@ -1044,7 +1072,9 @@ def apply_resolved_order_turn(
             db.flush()  # populates order.id before apply_order_delta's OrderItem rows reference it
 
         for item in turn.resolved:
-            apply_order_delta(db, order, item.product, item.quantity_delta, comment=item.comment)
+            apply_order_delta(
+                db, order, item.product, item.quantity_delta, comment=item.comment, unit_price=item.unit_price
+            )
 
         if turn.pickup_time:
             order.pickup_time = turn.pickup_time

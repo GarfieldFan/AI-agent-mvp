@@ -17,11 +17,20 @@ export type CartAddResult = {
 /** `comment` (2026-08-20, e.g. "less sugar", "extra spicy") — see
  * backend/cart.py's apply_order_delta docstring: two lines for the same
  * product with different comments stay separate lines, never merged
- * into one quantity. */
-export function addToCart(productId: number, quantity = 1, comment?: string | null) {
+ * into one quantity. `unitPrice` (2026-09-10) is only meaningful — and
+ * only accepted server-side — for a `variable_price: true` product; see
+ * ProductCard/ProductDetail for the "customer names their own amount"
+ * input that supplies it. */
+export function addToCart(productId: number, quantity = 1, comment?: string | null, unitPrice?: number | null) {
   return apiFetch<CartAddResult>("/api/cart/add", {
     method: "POST",
-    body: { session_id: getChatSessionId(), product_id: productId, quantity, comment: comment || null },
+    body: {
+      session_id: getChatSessionId(),
+      product_id: productId,
+      quantity,
+      comment: comment || null,
+      unit_price: unitPrice ?? null,
+    },
   });
 }
 

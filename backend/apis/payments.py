@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 import stripe
 from apis.deps import Role, require_role
 from apis.notifications import notify_owner
+from cart import decrement_stock_and_notify
 from db import get_db
 from models import AppSettings, Order
 from payments import (
@@ -164,6 +165,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)) -> Non
                     + (f"\nPickup/delivery: {order.pickup_time}" if order.pickup_time else "")
                     + (f"\nShip to: {order.shipping_address}" if order.shipping_address else ""),
                 )
+                await decrement_stock_and_notify(db, order)
     elif event["type"] in ("checkout.session.async_payment_failed", "checkout.session.expired"):
         session = event["data"]["object"]
         order_id = getattr(session, "client_reference_id", None)

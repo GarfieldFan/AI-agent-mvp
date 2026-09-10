@@ -1981,6 +1981,247 @@ codebase before writing anything, not assumed.
   schema created, a stale unrelated RAG document removed) before
   re-testing. `pytest` clean after the async conversion.
 
+### Inventory, revenue report, document-to-structured-data, variable-price products (2026-09-10)
+
+Added 2026-09-10, all four together on the user's own explicit
+authorization ("没有优先级，也不是特别难，就一起做了吧" — no priority, not that
+hard, build it all together) — the tail end of a conversational request
+the user framed as four things an owner should be able to say to the
+chatbot/owner-agent: "how's stock today," "what was yesterday's
+revenue," "here's a PDF of new products, add them," "here's a purchase
+order, adjust inventory." Each maps to one real tool/endpoint below —
+per the user's own explicit instruction, "所以我需要每一个功能都配一个相应的
+工具" (every function needs its own tool).
+
+- **Revenue report** — `apis/agent.py`'s `generate_report` gained a
+  `"revenue"` branch alongside the existing `"chat-volume"` one;
+  `ReportRequest.report_type` widened to `Literal["chat-volume",
+  "revenue"]`, `ReportDayPoint`'s chat-only fields
+  (`session_count`/`message_count`) became optional and two new ones
+  (`order_count`/`revenue_total`) were added — one shared per-day point
+  shape rather than two separate response types, since `ReportPanel`
+  already renders both via one `recharts` `LineChart`. Revenue per day
+  is computed from `Order.payment_status == "paid"` rows only (never
+  `status`, which is owner-agent-settable free text — same "don't trust
+  a free-text label as a payment signal" posture the payment gate
+  section above already established) — grouped by `Order.created_at`'s
+  date, not by when it was later marked paid. `ReportPanel` gained a
+  report-type `Select` (Chat volume / Revenue) above the existing date
+  range picker; the `Line`/`Legend`/empty-state copy all branch on
+  `reportType`. `owner-agent`'s existing `generate_report` tool
+  description was updated to name both report types.
+- **Inventory — one boolean-adjacent split, not two systems.** Per the
+  user's own explicit constraint ("库存有一个内部一个是外部的，我们尽量看看是否用
+  一个column区分他们，这样就不用多做或多建" — internal vs external inventory,
+  try to use ONE column to distinguish them so nothing extra gets
+  built), the actual design that shipped uses **two existing/new
+  columns on `Product` for external/sellable stock** (already the
+  natural home for "can a customer buy this") and **one small new
+  table, `StockItem`, for internal/raw-material stock** — a genuinely
+  different shape (ingredients have a name/quantity/unit, not a
+  price/description/tags/availability), so forcing them into the same
+  table would have meant a pile of nullable, sometimes-meaningless
+  columns on `Product` instead of one clean split. This is the
+  "minimum extra structure" reading of the user's own constraint: not
+  literally one column across two concepts, but no *third* table, no
+  duplicate CRUD framework, no duplicate propose-from-document
+  pipeline — both stock types share the identical document-extraction
+  primitive (`_extract_document_text`) and the identical
+  propose-then-owner-applies posture `propose_products`/
+  `propose_intent_schema` already established.
+  - **`Product.stock_quantity`/`low_stock_threshold`** (both nullable
+    `int`) — external/sellable stock. `stock_quantity: null` (the
+    default, and every pre-existing product's real value after the
+    migration) means untracked — `available` alone still gates
+    orderability, exactly as before this feature. Once set,
+    `checkout_cart` gates a positive quantity against it (400 with a
+    real "only N left" message — mirrors the existing unavailable-
+    product check) and `cart.decrement_stock_and_notify(db, order)`
+    (new, `cart.py` — not `apis/products.py`, for the same circular-
+    import reason `cart.py` already exists: both `apis/products.py`'s
+    `checkout_cart` and `apis/payments.py`'s Stripe webhook need to call
+    it, and those two routers already import from each other) is called
+    at the moment an order is actually confirmed paid — both branches:
+    `checkout_cart`'s own synchronous test-provider path AND the Stripe
+    webhook's completed-session handler, so a real Stripe payment
+    decrements stock the same way a test-mode "instant paid" checkout
+    does. Fires `notify_owner` (reusing the existing helper, no new
+    notification plumbing) when a decrement brings `stock_quantity` at
+    or below `low_stock_threshold` — same no-cooldown, best-effort,
+    swallow-on-failure posture every other `notify_owner` call site
+    already has.
+  - **`StockItem`** (new table: `name`, `quantity: float`, `unit: str`,
+    `low_stock_threshold: float | None`) — ingredients/raw materials
+    the business consumes but doesn't sell directly (coffee beans, milk,
+    eggs — the user's own example). **Deliberately never automatically
+    linked to `Product.stock_quantity` — no recipe/bill-of-materials
+    system exists**, a real, explicit scope cut confirmed by the user's
+    own framing (asked to help "扩展一下" — round out the idea for edge
+    cases — not to build a BOM engine): decrementing raw ingredients
+    per sold finished product would need a recipe definition per product
+    (how much milk in one latte) this app has no representation for and
+    wasn't asked to build. `StockItemPanel` (frontend, new) is a plain,
+    much simpler CRUD surface than `ProductPanel` — no image, no tags,
+    no price, no availability toggle, just name/quantity/unit/low-stock
+    threshold — paginated the same way every other admin list here is
+    (`common/pagination.tsx`, 20/page). Rendered in the dashboard's
+    "Products & orders" accordion group, directly below `ProductPanel`.
+  - **Variable-price ("pay what you want") products round out the
+    "internal vs external" inventory picture with a third real-world
+    case the user raised directly**: "客人输入金额的商品，比如小费、捐款等"
+    (a customer-entered-amount item, like a tip or donation) — not
+    inventory at all, but the same conversation, and genuinely the
+    smallest possible addition: `Product.variable_price: bool` (default
+    `False`) + reusing the ALREADY-EXISTING `OrderItem.
+    unit_price_snapshot` field to hold whatever amount the customer
+    actually states, instead of inventing a new column. `cart.
+    apply_order_delta` gained an optional `unit_price` parameter,
+    strictly gated (`product.variable_price and unit_price is not None
+    and unit_price > 0`) so a caller can never override a normal
+    product's real price — verified directly by reading the gate, not
+    assumed. Three independent callers can supply it: `POST
+    /api/cart/add`'s new `unit_price` field (public, storefront), the
+    chat order-extraction pipeline (`_order_extraction_system_prompt`/
+    `_ResolvedOrderItem`/`_resolve_order_turn`/`apply_resolved_order_
+    turn` all extended the same way the earlier per-item `comment` field
+    was — see "Real LLM-driven intent triage" above for that precedent),
+    and the admin `ProductPanel` form itself has no override (the owner
+    sets the *suggested default* `price`, never a per-order amount —
+    that's the customer's choice at order time, not the owner's).
+  - **A real, load-bearing gap found and closed during live verification,
+    not assumed correct**: the storefront's own `ProductCard`/
+    `ProductDetail` "Add to cart" buttons never sent `unit_price` at all,
+    and the PUBLIC product read model (`PublicProductSummary`,
+    `apis/products.py`) never even exposed `variable_price` — so a
+    visitor browsing directly (not through chat) could add a variable-
+    price product to their cart, but it silently used the fixed default
+    `price`, with no on-page indication they could have named their own
+    amount. This closes a scope question flagged as explicitly
+    unresolved earlier this session ("does `/checkout`/product-detail
+    need direct variable-price input, or is chat-only + admin-dashboard
+    coverage enough for v1"). Fixed: `PublicProductSummary` now includes
+    `variable_price` (NOT `stock_quantity`/`low_stock_threshold` — those
+    stay admin-only, deliberately: raw inventory counts aren't
+    customer-facing data anywhere else in this app either, the public
+    endpoint already omits `available` for the same "not customer data"
+    reasoning, filtering unavailable products out entirely instead);
+    `ProductCard`/`ProductDetail` both render a "Your amount ($)" number
+    input when `product.variable_price`, disable Add to cart until a
+    positive amount is typed, and thread it through `lib/cart.ts`'s
+    `addToCart`'s new optional `unitPrice` parameter to `POST
+    /api/cart/add`.
+  - **Document-to-structured-data — one shared extraction primitive, two
+    purpose-built tools on top of it.** `apis/products.py`'s
+    `_extract_document_text(file_url)` resolves an already-uploaded file
+    (via `apis/media.py`'s `resolve_media_local_path` — the same
+    paranoid URL-containment check `generate_landing_page_from_url`
+    already established, "an already-uploaded file, never raw bytes in
+    a tool call") to real text via `ingest.parse_document` — the same
+    PDF/DOCX/text parser RAG ingestion already uses, reused here for a
+    one-shot extraction rather than a persisted, embedded knowledge-base
+    document (a supplier catalog or a purchase order has no business
+    showing up in the public chatbot's own RAG retrieval, so this
+    deliberately never touches `apis/documents.py`'s `Document` table).
+    `POST /agent/products/propose-from-document` (owner-agent tool
+    `propose_products_from_document`) drafts a batch of products from a
+    catalog/price-list PDF, straight into `propose_products`'s existing
+    validate-and-return-drafts logic — same propose-then-owner-applies
+    posture, reviewed in `OwnerAgentPanel`'s existing product-proposal
+    card. `POST /agent/stock-items/propose-from-document` (tool
+    `propose_stock_from_document`) is the sibling for a purchase order/
+    delivery receipt, drafting `StockItem` restock adjustments the same
+    way, with `existing_id`/`existing_quantity` resolved against a
+    case-insensitive exact-name match so the review card can show "add
+    to existing 3kg" vs "new ingredient." `OwnerAgentPanel` gained a
+    full stock-proposal review card (parallel to the existing product
+    one) — editable name/quantity/unit/threshold rows, Apply (creates a
+    new `StockItem` or updates an existing one by `existing_id`) /
+    Discard.
+  - **Two real, load-bearing bugs found and fixed during live testing,
+    not assumed correct from a static read of the code**:
+    1. **`_extract_document_text` hardcoded `content_type="application/
+       pdf"` when calling `parse_document`** — `parse_document`'s own
+       dispatch checks `content_type == "application/pdf" OR filename
+       ends with .pdf` for its FIRST branch, so a hardcoded
+       `"application/pdf"` always won that branch regardless of the
+       real uploaded file's actual type. A genuine `.docx` purchase
+       order was fed straight into `PdfReader` and crashed with an
+       unhandled `PdfStreamError` 500 instead of either parsing
+       correctly or failing with a clean 400 — found by uploading a
+       real `.docx` test catalog and hitting the real endpoint, not by
+       code review alone. Fixed by passing an empty `content_type`, so
+       `parse_document`'s own filename-extension fallback actually runs
+       for every supported type (PDF/DOCX/text/Markdown), the same way
+       every other real caller of `parse_document` in this app already
+       relies on.
+    2. **Both new endpoints reused `llm_json.parse_lenient_json`, which
+       is object-shaped (`{...}`) only** — but both prompts explicitly
+       ask the model for a top-level JSON ARRAY (`[{"name":...},
+       ...]`). `parse_lenient_json`'s own `extract_json_object` slices
+       between the first `{` and the last `}`, which for an array
+       response strips the enclosing `[`/`]` entirely, leaving several
+       comma-joined objects with no wrapping brackets — invalid JSON,
+       correctly rejected by strict `json.loads`, and `json_repair`'s
+       own fallback couldn't produce a `dict` from it either (the
+       function's own success check is `isinstance(parsed, dict)`, a
+       second, independent reason an array response could never survive
+       this parser even if repair "fixed" the brackets). The result: a
+       **perfectly well-formed, correct array response from the real
+       configured LLM was silently discarded every time**, always
+       producing "couldn't find anything that looked like a product
+       catalog" even when the model got it completely right — caught
+       only by capturing the raw LLM output via a live debug trace and
+       comparing it against what `parse_lenient_json` actually did with
+       it, since a direct in-process call to the same provider succeeded
+       while the identical code path through the running server didn't
+       (the real, live 27B model's own output was reproducibly correct
+       across repeated runs — the parser was the actual bug, not model
+       flakiness). Fixed by adding `extract_json_array`/
+       `parse_lenient_json_array` (`llm_json.py`) — the identical
+       strict-then-repair tolerance, but slicing between `[`/`]` and
+       checking `isinstance(parsed, list)` — and switching both
+       `apis/products.py` call sites to it. `parse_lenient_json`
+       (object-shaped) is untouched and still used exactly as before by
+       every existing dict-shaped caller (`apis/agent.py`'s page
+       generation, `apis/chat.py`'s lead/order extraction) — this was a
+       genuinely new, array-shaped need this feature introduced, not a
+       latent bug in the pre-existing function itself.
+  - Verified end-to-end against the real running stack, including the
+    real, currently-configured local 27B `custom` chat model (not
+    mocked): `StockItem` CRUD (create/list/update/delete) via direct
+    HTTP calls; a real paid checkout (test provider) against a
+    `stock_quantity`-tracked product correctly decremented stock and
+    left it at/below its configured `low_stock_threshold` (notification
+    path exercised, best-effort/swallowed as designed); a real revenue
+    report (`GET`-equivalent `POST /agent/reports/generate` with
+    `report_type: "revenue"`) correctly reflected the real paid test
+    order's total among the day's other real paid orders; variable-price
+    ordering verified on BOTH surfaces — `POST /api/cart/add` with a
+    real `unit_price` override (confirmed via `GET /api/cart` showing
+    the exact stated amount, not the product's default price) and a
+    real multi-turn `/api/chat` conversation ("I want to put 12 dollars
+    in the Zenith Donation Jar" — a deliberately unambiguous product
+    name, after an earlier same-session attempt with collision-prone
+    "Test"/"Donation"-named products correctly demonstrated the
+    existing 2+-match disambiguation behavior instead of a bug) that
+    produced a real `Order`/`OrderItem` row with `unit_price_snapshot ==
+    12.00`, confirmed by a direct DB read, not just trusting the reply
+    text. Both document-to-structured-data endpoints verified against
+    real `.docx` files (a product catalog, a delivery receipt) processed
+    by the real configured LLM end to end, both before AND after the two
+    fixes above (the failure was reproduced first, then the fix
+    confirmed against the identical file). `pytest` (21 fast tests),
+    `tsc`, full-source `eslint`, and a real `docker compose run --rm
+    frontend npm run build` all clean throughout. All test products,
+    stock items, orders, chat sessions, and uploaded test files were
+    removed afterward; nothing test-related was left in the dev DB or
+    `storage/media/`.
+  - **owner-agent tool count is now 25** (up from the 22 named the last
+    time this file's own count was updated, for the shipping-region
+    tool) — the three new tools this round are
+    `propose_products_from_document`, `list_stock_items`,
+    `propose_stock_from_document`.
+
 ### Payment gate (`backend/payments.py`, `backend/apis/payments.py`)
 
 Added 2026-08-20, on the user's own explicit ask: "接一个pay gate接口，可以接
@@ -5055,13 +5296,15 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 22 tools (`generate_poster`,
+  envelope: either call one of 25 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
   `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
   `list_intent_schemas`,
   `manage_review_queue`, `detect_business_type`, `propose_intent_schema`,
-  `list_products`, `propose_products`, `set_order_status_options`,
+  `list_products`, `propose_products`, `propose_products_from_document`,
+  `list_stock_items`, `propose_stock_from_document`,
+  `set_order_status_options`,
   `ingest_documents_from_url`, `list_scheduled_tasks`,
   `manage_scheduled_task`, `check_seo_schema` (2026-09-08, see "GEO push
   part 2" above), `set_shipping_allowed_regions` (2026-09-10, see

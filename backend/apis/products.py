@@ -38,6 +38,7 @@ afterward, unlike a schema, a price, or a custom-field definition.
 import os
 from datetime import datetime
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import Text, cast, func, or_, select
@@ -45,12 +46,17 @@ from sqlalchemy.orm import Session, selectinload
 
 from apis.chat import _get_or_create_session
 from apis.deps import Role, require_role
+from apis.media import resolve_media_local_path
+from apis.model_settings import resolve_chat_provider
 from apis.notifications import notify_owner
 from apis.payments import resolve_payment_provider
-from cart import apply_order_delta, count_search_products, find_active_order, search_products
+from cart import apply_order_delta, count_search_products, decrement_stock_and_notify, find_active_order, search_products
 from db import get_db
-from models import AppSettings, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation
+from ingest import parse_document
+from llm_json import parse_lenient_json_array
+from models import AppSettings, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation, StockItem
 from payments import PaymentProviderNotConfigured
+from providers.base import ProviderNotConfigured
 
 FRONTEND_PUBLIC_URL = os.environ.get("FRONTEND_PUBLIC_URL", "http://localhost:3000")
 
@@ -104,6 +110,12 @@ class ProductPayload(BaseModel):
     available: bool = True
     image_url: str | None = None
     custom_fields: dict = {}
+    # Inventory + pay-what-you-want (2026-09-10) — see Product's own
+    # model docstring. stock_quantity/low_stock_threshold null means
+    # untracked, same as never setting them.
+    stock_quantity: int | None = None
+    low_stock_threshold: int | None = None
+    variable_price: bool = False
 
 
 class ProductSummary(ProductPayload):
@@ -126,6 +138,9 @@ def _to_product_summary(db: Session, row: Product) -> ProductSummary:
         created_at=row.created_at,
         bundle_items=_relations_for(db, row.id, "bundle"),
         upsells=_relations_for(db, row.id, "upsell"),
+        stock_quantity=row.stock_quantity,
+        low_stock_threshold=row.low_stock_threshold,
+        variable_price=row.variable_price,
     )
 
 
@@ -167,6 +182,9 @@ def create_product(req: ProductPayload, db: Session = Depends(get_db)) -> Produc
         available=req.available,
         image_url=req.image_url,
         custom_fields=req.custom_fields or {},
+        stock_quantity=req.stock_quantity,
+        low_stock_threshold=req.low_stock_threshold,
+        variable_price=req.variable_price,
     )
     db.add(row)
     db.commit()
@@ -190,6 +208,9 @@ def update_product(product_id: int, req: ProductPayload, db: Session = Depends(g
     row.available = req.available
     row.image_url = req.image_url
     row.custom_fields = req.custom_fields or {}
+    row.stock_quantity = req.stock_quantity
+    row.low_stock_threshold = req.low_stock_threshold
+    row.variable_price = req.variable_price
     db.commit()
     db.refresh(row)
     return _to_product_summary(db, row)
@@ -302,6 +323,104 @@ def delete_product_field(field_id: int, db: Session = Depends(get_db)) -> None:
     db.commit()
 
 
+# --- Raw-material/ingredient inventory (admin) — 2026-09-10 ---------------
+# See models.StockItem's own docstring for why this is a separate, much
+# simpler table from Product, never automatically linked to it.
+
+
+class StockItemPayload(BaseModel):
+    name: str
+    quantity: float = 0
+    unit: str
+    low_stock_threshold: float | None = None
+
+
+class StockItemSummary(StockItemPayload):
+    id: int
+    created_at: datetime
+
+
+def _to_stock_item_summary(row: StockItem) -> StockItemSummary:
+    return StockItemSummary(
+        id=row.id,
+        name=row.name,
+        quantity=float(row.quantity),
+        unit=row.unit,
+        low_stock_threshold=float(row.low_stock_threshold) if row.low_stock_threshold is not None else None,
+        created_at=row.created_at,
+    )
+
+
+class StockItemListResponse(BaseModel):
+    items: list[StockItemSummary]
+    total: int
+
+
+@admin_router.get("/agent/stock-items", response_model=StockItemListResponse)
+def list_stock_items(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)) -> StockItemListResponse:
+    total = db.execute(select(func.count()).select_from(StockItem)).scalar_one()
+    rows = (
+        db.execute(select(StockItem).order_by(StockItem.name).limit(limit).offset(offset)).scalars().all()
+    )
+    return StockItemListResponse(items=[_to_stock_item_summary(r) for r in rows], total=total)
+
+
+@admin_router.post("/agent/stock-items", response_model=StockItemSummary)
+def create_stock_item(req: StockItemPayload, db: Session = Depends(get_db)) -> StockItemSummary:
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="name must not be empty.")
+    if not req.unit.strip():
+        raise HTTPException(status_code=400, detail="unit must not be empty.")
+    row = StockItem(
+        name=req.name.strip(), quantity=req.quantity, unit=req.unit.strip(), low_stock_threshold=req.low_stock_threshold
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _to_stock_item_summary(row)
+
+
+@admin_router.put("/agent/stock-items/{item_id}", response_model=StockItemSummary)
+async def update_stock_item(item_id: int, req: StockItemPayload, db: Session = Depends(get_db)) -> StockItemSummary:
+    """A plain full-replace update, same shape as update_product — no
+    separate "adjust by delta" endpoint, since the owner-agent purchase-
+    order-parsing tool (and the dashboard form) both already know the new
+    total and can just send it. Fires the same `notify_owner` low-stock
+    alert `decrement_stock_and_notify` uses for `Product.stock_quantity`
+    whenever this update crosses the quantity at-or-below
+    `low_stock_threshold` — checked here (not just on create) since a
+    restock/consumption is exactly when the level actually changes."""
+    row = db.get(StockItem, item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Stock item not found.")
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="name must not be empty.")
+    if not req.unit.strip():
+        raise HTTPException(status_code=400, detail="unit must not be empty.")
+    row.name = req.name.strip()
+    row.quantity = req.quantity
+    row.unit = req.unit.strip()
+    row.low_stock_threshold = req.low_stock_threshold
+    db.commit()
+    db.refresh(row)
+    if row.low_stock_threshold is not None and float(row.quantity) <= float(row.low_stock_threshold):
+        await notify_owner(
+            db,
+            f"[AI MVP] Low stock — {row.name}",
+            f"{row.name} is down to {float(row.quantity):g} {row.unit} (threshold: {float(row.low_stock_threshold):g} {row.unit}).",
+        )
+    return _to_stock_item_summary(row)
+
+
+@admin_router.delete("/agent/stock-items/{item_id}", status_code=204)
+def delete_stock_item(item_id: int, db: Session = Depends(get_db)) -> None:
+    row = db.get(StockItem, item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Stock item not found.")
+    db.delete(row)
+    db.commit()
+
+
 # --- Product relations (bundle/upsell, admin) ----------------------------
 
 
@@ -395,6 +514,231 @@ def propose_products(req: ProposeProductsRequest, db: Session = Depends(get_db))
             ProposedProduct(product=draft, already_exists=match is not None, existing_id=match.id if match else None)
         )
     return ProposeProductsResponse(proposals=proposals)
+
+
+# --- Document-to-structured-data (owner-agent, 2026-09-10) ---------------
+# One shared extraction primitive, two purpose-built tools on top of it —
+# "a new product from a PDF catalog" and "adjust ingredient stock from a
+# purchase order" both need the identical first step (an already-uploaded
+# file -> real extracted text), so that step lives once, here, rather
+# than being built twice. Both tools propose, never write directly, same
+# higher-stakes posture as propose_products itself: a misread document
+# has real consequences (a wrong price quoted to a customer, a wrong
+# stock count silently blocking real orders).
+
+
+async def _extract_document_text(file_url: str) -> str:
+    """Resolves an already-uploaded file (the owner's own media-library
+    upload — the same mechanism `generate_landing_page_from_url` already
+    established, see apis/media.py's own docstring for why a design
+    image/document has to be uploaded first rather than handed to
+    owner-agent as raw bytes: a text-generation model has no business
+    reproducing a whole file inline in its own tool-call JSON) to real
+    extracted text via ingest.parse_document — the exact same PDF/DOCX
+    parser apis/documents.py's RAG ingestion already uses, reused here
+    for a one-shot extraction task rather than a persisted, embedded
+    knowledge-base document (a supplier price list or a purchase order
+    has no business showing up in the public chatbot's own RAG
+    retrieval, which is why this deliberately does NOT go through
+    apis/documents.py's Document table at all)."""
+    path = resolve_media_local_path(file_url)
+    if path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't resolve that file URL to an uploaded file — upload it via the media library first.",
+        )
+    try:
+        # A hardcoded "application/pdf" here would always win
+        # parse_document's first branch regardless of the real file type
+        # (that check is `content_type == "application/pdf" OR
+        # filename.endswith(".pdf")`) — a real bug found in live testing:
+        # a genuine .docx purchase order was fed straight into PdfReader
+        # and crashed with an unhandled PdfStreamError 500 instead of
+        # either parsing correctly or a clean 400. An empty content_type
+        # correctly falls through to parse_document's own filename-
+        # extension dispatch for every supported type.
+        return parse_document(path.read_bytes(), "", path.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Couldn't extract text from that file: {e}")
+
+
+_PRODUCTS_FROM_DOCUMENT_SYSTEM_PROMPT = (
+    "You read raw text extracted from a document (a product catalog, a price list, a spec sheet) and "
+    "draft a product catalog from it. Respond with ONLY a JSON array, no markdown fences, no commentary:\n"
+    '[{"name": "...", "description": "...", "price": <number>, "tags": ["..."]}, ...]\n\n'
+    "Extract ONLY products explicitly named with a real stated price — never invent a product, a price, "
+    "or a description detail that isn't actually in the text. If nothing in the text looks like a "
+    "product catalog, respond with an empty array []."
+)
+
+
+class ProposeProductsFromDocumentRequest(BaseModel):
+    file_url: str
+    instructions: str | None = None
+
+
+@admin_router.post("/agent/products/propose-from-document", response_model=ProposeProductsResponse)
+async def propose_products_from_document(
+    req: ProposeProductsFromDocumentRequest, db: Session = Depends(get_db)
+) -> ProposeProductsResponse:
+    """Reads an already-uploaded PDF (a product catalog/price list) and
+    drafts a batch of products from it — the same review-then-Apply flow
+    `propose_products` already provides, this just adds the "read a real
+    document" step in front of it instead of requiring owner-agent to
+    already have the product list in hand."""
+    text = await _extract_document_text(req.file_url)
+    system = _PRODUCTS_FROM_DOCUMENT_SYSTEM_PROMPT
+    if req.instructions:
+        system += f"\n\nAdditional instructions from the owner: {req.instructions}"
+    try:
+        provider = resolve_chat_provider(db)
+        raw = await provider.chat(
+            [{"role": "user", "content": text[:20000]}], system=system, json_mode=True
+        )
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+
+    try:
+        parsed = parse_lenient_json_array(raw)
+    except ValueError:
+        parsed = []
+    if not isinstance(parsed, list):
+        parsed = []
+
+    drafts: list[ProductPayload] = []
+    for row in parsed:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        price = row.get("price")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            continue
+        if price < 0:
+            continue
+        tags = row.get("tags")
+        drafts.append(
+            ProductPayload(
+                name=name.strip(),
+                description=row.get("description") if isinstance(row.get("description"), str) else None,
+                price=price,
+                tags=[t for t in tags if isinstance(t, str)] if isinstance(tags, list) else [],
+            )
+        )
+
+    if not drafts:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't find anything that looked like a product catalog in that document.",
+        )
+    return propose_products(ProposeProductsRequest(products=drafts), db)
+
+
+_STOCK_FROM_DOCUMENT_SYSTEM_PROMPT = (
+    "You read raw text extracted from a purchase order / delivery receipt and draft stock restock "
+    "entries from it. Respond with ONLY a JSON array, no markdown fences, no commentary:\n"
+    '[{"name": "...", "quantity": <number>, "unit": "..."}, ...]\n\n'
+    "Each entry is one ingredient/raw-material line item that was received — extract ONLY items "
+    "explicitly listed with a real stated quantity and unit; never invent one. If nothing in the text "
+    "looks like a purchase order or delivery receipt, respond with an empty array []."
+)
+
+
+class ProposedStockAdjustment(BaseModel):
+    name: str
+    quantity: float
+    unit: str
+    # The StockItem this would restock, if one already exists by this
+    # exact name — same "propose against real existing rows" posture as
+    # ProposedProduct.already_exists/existing_id.
+    existing_id: int | None
+    existing_quantity: float | None
+
+
+class ProposeStockFromDocumentRequest(BaseModel):
+    file_url: str
+    instructions: str | None = None
+
+
+class ProposeStockFromDocumentResponse(BaseModel):
+    proposals: list[ProposedStockAdjustment]
+
+
+@admin_router.post("/agent/stock-items/propose-from-document", response_model=ProposeStockFromDocumentResponse)
+async def propose_stock_from_document(
+    req: ProposeStockFromDocumentRequest, db: Session = Depends(get_db)
+) -> ProposeStockFromDocumentResponse:
+    """Reads an already-uploaded PDF (a purchase order / delivery
+    receipt) and drafts stock restock entries from it — never writes
+    directly, same posture as propose_products_from_document above. The
+    owner reviews each line (correcting the quantity if the model
+    misread it) and applies via the ordinary StockItem create/update
+    endpoints — this deliberately does NOT auto-apply even a matched
+    existing item, since a misread quantity would silently corrupt a
+    real stock count."""
+    text = await _extract_document_text(req.file_url)
+    system = _STOCK_FROM_DOCUMENT_SYSTEM_PROMPT
+    if req.instructions:
+        system += f"\n\nAdditional instructions from the owner: {req.instructions}"
+    try:
+        provider = resolve_chat_provider(db)
+        raw = await provider.chat(
+            [{"role": "user", "content": text[:20000]}], system=system, json_mode=True
+        )
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+
+    try:
+        parsed = parse_lenient_json_array(raw)
+    except ValueError:
+        parsed = []
+    if not isinstance(parsed, list):
+        parsed = []
+
+    existing = db.execute(select(StockItem)).scalars().all()
+    existing_by_name = {s.name.strip().lower(): s for s in existing}
+
+    proposals: list[ProposedStockAdjustment] = []
+    for row in parsed:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        quantity = row.get("quantity")
+        unit = row.get("unit")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(unit, str) or not unit.strip():
+            continue
+        try:
+            quantity = float(quantity)
+        except (TypeError, ValueError):
+            continue
+        if quantity <= 0:
+            continue
+        match = existing_by_name.get(name.strip().lower())
+        proposals.append(
+            ProposedStockAdjustment(
+                name=name.strip(),
+                quantity=quantity,
+                unit=unit.strip(),
+                existing_id=match.id if match else None,
+                existing_quantity=float(match.quantity) if match else None,
+            )
+        )
+
+    if not proposals:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't find anything that looked like a purchase order or delivery receipt in that document.",
+        )
+    return ProposeStockFromDocumentResponse(proposals=proposals)
 
 
 # --- Order status options (owner-agent-set) ----------------------------
@@ -680,6 +1024,13 @@ class PublicProductSummary(BaseModel):
     custom_fields: dict
     bundle_items: list[RelationSummary] = []
     upsells: list[RelationSummary] = []
+    # variable_price (2026-09-10) is exposed publicly — unlike
+    # stock_quantity/low_stock_threshold (deliberately omitted, raw
+    # inventory counts aren't customer-facing data in this app), this
+    # tells the storefront it should let the visitor name their own
+    # price instead of just using the fixed `price` above. See
+    # ProductCard/ProductDetail's own price-input handling.
+    variable_price: bool = False
 
 
 def _to_public_summary(db: Session, row: Product) -> PublicProductSummary:
@@ -693,6 +1044,7 @@ def _to_public_summary(db: Session, row: Product) -> PublicProductSummary:
         custom_fields=row.custom_fields,
         bundle_items=_relations_for(db, row.id, "bundle"),
         upsells=_relations_for(db, row.id, "upsell"),
+        variable_price=row.variable_price,
     )
 
 
@@ -805,6 +1157,10 @@ class CartAddRequest(BaseModel):
     # cart.apply_order_delta's docstring for why this is part of what
     # identifies a distinct line, not just product_id.
     comment: str | None = None
+    # Pay-what-you-want products only (2026-09-10) — silently ignored by
+    # apply_order_delta for any product without variable_price set, so
+    # this can never override a real customer's quote for a normal item.
+    unit_price: float | None = None
 
 
 class CartAddResponse(BaseModel):
@@ -833,7 +1189,7 @@ def add_to_cart(req: CartAddRequest, db: Session = Depends(get_db)) -> CartAddRe
         db.add(order)
         db.flush()  # populates order.id before apply_order_delta's OrderItem rows reference it
 
-    apply_order_delta(db, order, product, req.quantity, comment=req.comment)
+    apply_order_delta(db, order, product, req.quantity, comment=req.comment, unit_price=req.unit_price)
     db.commit()
     db.refresh(order)
     return CartAddResponse(order_id=order.id, total_amount=float(order.total_amount))
@@ -1020,6 +1376,24 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
                 detail=f"Sorry, we don't currently ship to '{effective_region.strip()}'.",
             )
 
+    # Stock-sufficiency gate (2026-09-10) — checked here, at checkout,
+    # not at /cart/add time: this app doesn't reserve stock while an
+    # item merely sits in an open cart (no per-cart reservation tracking
+    # — a real, accepted v1 limitation at this app's scale), so the only
+    # point stock can actually be validated against is the moment a
+    # visitor commits to buying. A product with `stock_quantity is None`
+    # (untracked) is completely unaffected, same as before this existed.
+    for item in order.items:
+        if item.product_id is None:
+            continue
+        product = db.get(Product, item.product_id)
+        if product is not None and product.stock_quantity is not None and item.quantity > product.stock_quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sorry, only {product.stock_quantity} of '{product.name}' left in stock "
+                f"(your cart has {item.quantity}) — please adjust the quantity.",
+            )
+
     if req.contact_email is not None:
         order.contact_email = req.contact_email.strip() or None
     if req.contact_name is not None:
@@ -1061,8 +1435,9 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
     if result.already_paid:
         # A real Stripe order isn't "placed" yet at this point — payment
         # hasn't happened, just a Checkout Session was created — so that
-        # notification belongs on the webhook's own paid branch instead
-        # (apis/payments.py's stripe_webhook), not here.
+        # notification (and the stock decrement below) belongs on the
+        # webhook's own paid branch instead (apis/payments.py's
+        # stripe_webhook), not here.
         await notify_owner(
             db,
             f"[AI MVP] New order #{order.id} — ${float(order.total_amount):.2f}",
@@ -1073,5 +1448,6 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
             + (f"\nPickup/delivery: {order.pickup_time}" if order.pickup_time else "")
             + (f"\nShip to: {order.shipping_address}" if order.shipping_address else ""),
         )
+        await decrement_stock_and_notify(db, order)
 
     return CheckoutResponse(order=_to_order_summary(order), client_secret=result.client_secret)

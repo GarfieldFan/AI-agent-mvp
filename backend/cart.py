@@ -22,7 +22,47 @@ built directly inside apis/chat.py.
 from sqlalchemy import Text, cast, func, select
 from sqlalchemy.orm import Session, selectinload
 
+from apis.notifications import notify_owner
 from models import Order, OrderItem, Product
+
+
+async def decrement_stock_and_notify(db: Session, order: Order) -> None:
+    """Decrements tracked `Product.stock_quantity` for every line in a
+    just-confirmed-PAID order — the one place stock actually moves,
+    called from both `apis/products.py`'s `checkout_cart` (synchronous
+    "test"-provider path) and `apis/payments.py`'s Stripe webhook, which
+    is why this lives here rather than in either router file — those two
+    already import from each other's package in a way that would make a
+    direct import cycle (`apis/products.py` imports
+    `apis.payments.resolve_payment_provider`), the same reasoning this
+    whole module exists for. Matches exactly the same "a real purchase is
+    confirmed" scoping the order notification itself already uses.
+
+    A product with `stock_quantity is None` (untracked) is untouched.
+    Auto-disables (`available = False`) a product that hits exactly 0 —
+    protects against overselling on the storefront immediately — but
+    never auto-re-enables one on a later restock; the owner consciously
+    flips that back on. Fires the same `notify_owner` alert used
+    elsewhere in this app when stock crosses at-or-below
+    `low_stock_threshold` (null means no alert configured for this
+    product, same posture as every other optional gate here)."""
+    for item in order.items:
+        if item.product_id is None:
+            continue
+        product = db.get(Product, item.product_id)
+        if product is None or product.stock_quantity is None:
+            continue
+        product.stock_quantity = max(0, product.stock_quantity - item.quantity)
+        if product.stock_quantity == 0:
+            product.available = False
+        if product.low_stock_threshold is not None and product.stock_quantity <= product.low_stock_threshold:
+            await notify_owner(
+                db,
+                f"[AI MVP] Low stock — {product.name}",
+                f"{product.name} is down to {product.stock_quantity} unit"
+                f"{'s' if product.stock_quantity != 1 else ''} (threshold: {product.low_stock_threshold}).",
+            )
+    db.commit()
 
 
 def _search_condition(query: str):
@@ -130,7 +170,12 @@ def find_active_order(db: Session, chat_session_id: int | None) -> Order | None:
 
 
 def apply_order_delta(
-    db: Session, order: Order, product: Product, quantity_delta: int, comment: str | None = None
+    db: Session,
+    order: Order,
+    product: Product,
+    quantity_delta: int,
+    comment: str | None = None,
+    unit_price: float | None = None,
 ) -> None:
     """Applies one quantity delta to `order` for `product` — creates,
     updates, or removes the matching OrderItem (clamped at 0), then
@@ -161,8 +206,21 @@ def apply_order_delta(
     nothing left for a visitor to remove once the only line is served.
     Direct edits to an already-served line (`/cart/update`,
     `/cart/item/{id}/comment`) are blocked at the route level instead,
-    since those act on a specific `item_id` this function never sees."""
+    since those act on a specific `item_id` this function never sees.
+
+    **`unit_price`** (2026-09-10) — only ever honored when
+    `product.variable_price` is True (a tip jar, a donation, a
+    custom-quote line item — see `Product.variable_price`'s own
+    docstring); ignored entirely for an ordinary fixed-price product, so
+    a caller can never override what a real customer is quoted for a
+    normal item. Applied to `unit_price_snapshot` whether this creates a
+    new line or updates an existing (merged) one — restating a different
+    amount for an already-open variable-price line updates its price,
+    it doesn't get diluted by averaging against the old one."""
     normalized_comment = comment.strip() if comment and comment.strip() else None
+    effective_price = float(product.price)
+    if product.variable_price and unit_price is not None and unit_price > 0:
+        effective_price = float(unit_price)
     existing_item = next(
         (
             i
@@ -179,9 +237,9 @@ def apply_order_delta(
                 order_id=order.id,
                 product_id=product.id,
                 item_name_snapshot=product.name,
-                unit_price_snapshot=float(product.price),
+                unit_price_snapshot=effective_price,
                 quantity=quantity_delta,
-                subtotal=float(product.price) * quantity_delta,
+                subtotal=effective_price * quantity_delta,
                 comment=normalized_comment,
             )
         )
@@ -190,6 +248,8 @@ def apply_order_delta(
         if new_quantity <= 0:
             order.items.remove(existing_item)
         else:
+            if product.variable_price and unit_price is not None and unit_price > 0:
+                existing_item.unit_price_snapshot = effective_price
             existing_item.quantity = new_quantity
             existing_item.subtotal = float(existing_item.unit_price_snapshot) * new_quantity
 

@@ -27,12 +27,16 @@ export function ProductDetail({ product, fieldDefinitions }: ProductDetailProps)
   const [quantity, setQuantity] = React.useState(1);
   const [status, setStatus] = React.useState<"idle" | "adding" | "added" | "error">("idle");
   const [error, setError] = React.useState<string | null>(null);
+  const [customAmount, setCustomAmount] = React.useState("");
+  const parsedAmount = Number(customAmount);
+  const amountValid = customAmount.trim() !== "" && Number.isFinite(parsedAmount) && parsedAmount > 0;
 
   async function handleAddToCart() {
+    if (product.variable_price && !amountValid) return;
     setStatus("adding");
     setError(null);
     try {
-      await addToCart(product.id, quantity);
+      await addToCart(product.id, quantity, null, product.variable_price ? parsedAmount : null);
       setStatus("added");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't add to cart.");
@@ -57,7 +61,9 @@ export function ProductDetail({ product, fieldDefinitions }: ProductDetailProps)
               <p className="text-sm text-muted-foreground">{product.tags.join(", ")}</p>
             ) : null}
           </div>
-          <p className="text-xl font-semibold">${product.price.toFixed(2)}</p>
+          <p className="text-xl font-semibold">
+            {product.variable_price ? `From $${product.price.toFixed(2)}` : `$${product.price.toFixed(2)}`}
+          </p>
           {product.description ? <p className="text-sm leading-relaxed">{product.description}</p> : null}
 
           {customFieldEntries.length > 0 ? (
@@ -79,6 +85,19 @@ export function ProductDetail({ product, fieldDefinitions }: ProductDetailProps)
             </dl>
           ) : null}
 
+          {product.variable_price ? (
+            <div className="max-w-40 space-y-1">
+              <label className="text-xs text-muted-foreground">Your amount ($)</label>
+              <Input
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder={product.price.toFixed(2)}
+                value={customAmount}
+                onChange={(e) => setCustomAmount(e.target.value)}
+              />
+            </div>
+          ) : null}
           <div className="flex items-center gap-2">
             <Input
               type="number"
@@ -87,7 +106,10 @@ export function ProductDetail({ product, fieldDefinitions }: ProductDetailProps)
               onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))}
               className="w-20"
             />
-            <Button disabled={status === "adding"} onClick={handleAddToCart}>
+            <Button
+              disabled={status === "adding" || (product.variable_price ? !amountValid : false)}
+              onClick={handleAddToCart}
+            >
               <ShoppingCart className="size-4" />
               {status === "added" ? "Added" : status === "adding" ? "Adding…" : "Add to cart"}
             </Button>

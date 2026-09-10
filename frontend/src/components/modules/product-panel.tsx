@@ -25,7 +25,17 @@ import {
 } from "@/lib/products";
 
 function blankDraft(): ProductInput {
-  return { name: "", description: "", price: 0, tags: [], available: true, image_url: null };
+  return {
+    name: "",
+    description: "",
+    price: 0,
+    tags: [],
+    available: true,
+    image_url: null,
+    stock_quantity: null,
+    low_stock_threshold: null,
+    variable_price: false,
+  };
 }
 
 function draftFromProduct(product: Product): ProductInput {
@@ -36,6 +46,9 @@ function draftFromProduct(product: Product): ProductInput {
     tags: product.tags,
     available: product.available,
     image_url: product.image_url,
+    stock_quantity: product.stock_quantity,
+    low_stock_threshold: product.low_stock_threshold,
+    variable_price: product.variable_price,
   };
 }
 
@@ -110,6 +123,9 @@ export function ProductPanel() {
         .filter(Boolean),
       available: draft.available,
       image_url: draft.image_url || null,
+      stock_quantity: draft.stock_quantity,
+      low_stock_threshold: draft.low_stock_threshold,
+      variable_price: draft.variable_price,
     };
     try {
       if (editingId === "new") {
@@ -211,7 +227,20 @@ export function ProductPanel() {
                 <div>
                   <p className="text-sm font-medium">
                     {product.name} — ${product.price.toFixed(2)}
+                    {product.variable_price ? <Badge variant="outline" className="ml-2 text-xs">customer sets price</Badge> : null}
                     {!product.available ? <Badge variant="outline" className="ml-2 text-xs">unavailable</Badge> : null}
+                    {product.stock_quantity !== null ? (
+                      <Badge
+                        variant={
+                          product.low_stock_threshold !== null && product.stock_quantity <= product.low_stock_threshold
+                            ? "destructive"
+                            : "outline"
+                        }
+                        className="ml-2 text-xs"
+                      >
+                        {product.stock_quantity} in stock
+                      </Badge>
+                    ) : null}
                   </p>
                   <p className="text-xs text-muted-foreground">
                     {product.tags.length > 0 ? `${product.tags.join(", ")} — ` : ""}
@@ -283,6 +312,42 @@ export function ProductPanel() {
               onChange={(e) => setDraft((d) => ({ ...d, description: e.target.value }))}
               rows={2}
             />
+          </div>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground">Stock quantity (optional)</Label>
+              <Input
+                type="number"
+                min="0"
+                placeholder="Untracked — uses Available above"
+                value={draft.stock_quantity ?? ""}
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, stock_quantity: e.target.value === "" ? null : Number(e.target.value) }))
+                }
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground">Low-stock alert at (optional)</Label>
+              <Input
+                type="number"
+                min="0"
+                placeholder="No alert"
+                value={draft.low_stock_threshold ?? ""}
+                onChange={(e) =>
+                  setDraft((d) => ({
+                    ...d,
+                    low_stock_threshold: e.target.value === "" ? null : Number(e.target.value),
+                  }))
+                }
+              />
+            </div>
+            <div className="flex items-center gap-1.5 pt-5">
+              <Switch
+                checked={draft.variable_price}
+                onCheckedChange={(checked) => setDraft((d) => ({ ...d, variable_price: checked }))}
+              />
+              <Label className="text-xs text-muted-foreground">Customer sets price (tip/donation)</Label>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
