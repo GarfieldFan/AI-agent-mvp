@@ -16,6 +16,7 @@ import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { StripeCheckoutDialog } from "@/components/modules/stripe-checkout-dialog";
 import { ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { checkoutCart, getCart, type Cart } from "@/lib/cart";
 import { getPaymentConfig } from "@/lib/payments";
 
@@ -29,8 +30,20 @@ import { getPaymentConfig } from "@/lib/payments";
  * response, not a redirect URL, see backend/payments.py's own docstring
  * for the "why" behind embedded over a full-page redirect). A prefilled
  * `contact_email`/`contact_name` (if the cart already carries one, e.g.
- * from an earlier chat turn) is editable, never locked. */
+ * from an earlier chat turn) is editable, never locked.
+ *
+ * **Email also prefills from a logged-in member's own account**
+ * (2026-09-10, `useAuth()` — real gap found while simulating a "member
+ * vs. non-member" e-commerce purchase: `/my/orders` matches by
+ * `Order.contact_email == current.email`, so a signed-in visitor who
+ * typed anything other than their account's exact email at checkout
+ * previously had their own order silently missing from "My account,"
+ * with no warning either way, confirmed live before this fix). Only
+ * applied when the cart doesn't already carry its own contact_email
+ * (never overwrites an explicit value from an earlier chat turn) —
+ * still fully editable either way, same as every other prefill here. */
 export function CheckoutPage() {
+  const { email: accountEmail } = useAuth();
   const [cart, setCart] = React.useState<Cart | null | undefined>(undefined);
   const [loadError, setLoadError] = React.useState<string | null>(null);
 
@@ -62,7 +75,7 @@ export function CheckoutPage() {
     getCart()
       .then((result) => {
         setCart(result);
-        setEmail(result?.contact_email ?? "");
+        setEmail(result?.contact_email || accountEmail || "");
         setName(result?.contact_name ?? "");
         setPickupTime(result?.pickup_time ?? "");
         setNote(result?.note ?? "");
@@ -71,6 +84,12 @@ export function CheckoutPage() {
         setLoadError(null);
       })
       .catch((err) => setLoadError(err instanceof ApiError ? err.message : "Couldn't load your cart."));
+    // Deliberately mount-time-only: `accountEmail` is read once to seed
+    // the prefill, same as the cart's own fields. Re-running this whole
+    // fetch (and resetting every field) just because auth state changed
+    // while someone's mid-edit on this page would be worse than a stale
+    // closure value here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handlePlaceOrder() {

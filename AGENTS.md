@@ -2053,8 +2053,42 @@ that package is specifically AI providers, and payment isn't one.
   actually baked into a rebuilt image, not just live-installed) all
   clean. Test orders/sessions/settings cleaned up after. **Not
   independently verified this round**: an actual successful embedded-
-  Checkout payment completing inside the modal and a real webhook firing
-  — needs the real Stripe test-mode keys only the user can obtain.
+  Checkout payment completing inside the modal — still needs the real
+  Stripe test-mode keys only the user can obtain. **The webhook itself
+  WAS independently verified, 2026-09-10, and a real, serious bug was
+  found and fixed doing it** — see the next bullet.
+
+- **Real, critical bug found and fixed, 2026-09-10 — `stripe_webhook`
+  crashed on EVERY genuine Stripe event, success or failure.** Every
+  prior verification of this webhook only ever exercised the
+  signature-REJECTION path (a bad/missing signature raises before
+  reaching this code at all) — never a real, validly-signed event all
+  the way through. Found by actually constructing one: a real HMAC-SHA256
+  signature over a crafted payload, using the exact scheme
+  `stripe.Webhook.construct_event` verifies, sent to the real running
+  endpoint. `event["data"]["object"]` is a real `stripe.checkout.Session`
+  (a `StripeObject`), not a plain dict — this SDK version's
+  `StripeObject.__getattr__` explicitly raises `AttributeError` on
+  `.get(...)` ("'get' is a dict method, but a Session is not a dict"),
+  and BOTH branches (`checkout.session.completed` and
+  `async_payment_failed`/`expired`) called `session.get("client_reference_id")`/
+  `session.get("id")`. In a real deployment, this meant **no real Stripe
+  order could ever be marked paid or failed** — every single real
+  payment webhook would 500, silently leaving every order stuck
+  `payment_status: "unpaid"` forever, regardless of what actually
+  happened with the customer's card. Fixed by switching to
+  `getattr(session, "client_reference_id", None)`/`getattr(session, "id",
+  None)` — plain attribute access, which `StripeObject` does support.
+  **Verified live, both branches, not just reviewed**: seeded a real
+  `payment_status: "unpaid"` order, fired a genuinely HMAC-signed
+  `checkout.session.async_payment_failed` event at the real endpoint —
+  reproduced the 500 first (confirmed via `GET /agent/error-log`'s real
+  captured traceback), applied the fix, re-fired the identical event,
+  got a clean 204 and the order correctly flipped to
+  `payment_status: "failed"`. Repeated for `checkout.session.completed`
+  against a second seeded unpaid order — correctly flipped to `"paid"`,
+  `is_open: False`, and `payment_reference` correctly captured from the
+  event. `pytest` (21 tests) still clean after the fix.
 
 ### Email + SMS gate (`backend/notifications.py`, `backend/apis/notifications.py`)
 

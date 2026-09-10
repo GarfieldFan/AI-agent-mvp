@@ -136,12 +136,21 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)) -> Non
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        order_id = session.get("client_reference_id")
+        # `session` is a real stripe.checkout.Session (a StripeObject), not
+        # a plain dict — `.get(...)` is a genuine AttributeError on this
+        # SDK version ("'get' is a dict method, but a Session is not a
+        # dict"), only ever caught here 2026-09-10 because earlier
+        # verification only ever exercised the signature-REJECTION path
+        # (a bad/missing signature never reaches this code at all), never
+        # a real, validly-signed event all the way through. Plain
+        # attribute access (`session.client_reference_id`) is what
+        # StripeObject actually supports.
+        order_id = getattr(session, "client_reference_id", None)
         if order_id:
             order = db.get(Order, int(order_id))
             if order is not None:
                 order.payment_status = "paid"
-                order.payment_reference = session.get("id")
+                order.payment_reference = getattr(session, "id", None)
                 order.is_open = False
                 db.commit()
                 db.refresh(order)
@@ -157,7 +166,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)) -> Non
                 )
     elif event["type"] in ("checkout.session.async_payment_failed", "checkout.session.expired"):
         session = event["data"]["object"]
-        order_id = session.get("client_reference_id")
+        order_id = getattr(session, "client_reference_id", None)
         if order_id:
             order = db.get(Order, int(order_id))
             if order is not None and order.payment_status == "unpaid":
