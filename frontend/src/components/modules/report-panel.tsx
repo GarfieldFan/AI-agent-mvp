@@ -1,25 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { BarChart3 } from "lucide-react";
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { ReportChart } from "@/components/common/report-chart";
 import { ApiError } from "@/lib/api";
 import { generateReport, type Report, type ReportType } from "@/lib/reports";
 
@@ -68,16 +57,6 @@ export function ReportPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const isEmpty =
-    reportType === "chat-volume"
-      ? report?.points.every((p) => !p.session_count && !p.message_count) ?? false
-      : report?.points.every((p) => !p.order_count && !p.revenue_total) ?? false;
-
-  const totalSessions = report?.points.reduce((sum, p) => sum + (p.session_count ?? 0), 0) ?? 0;
-  const totalMessages = report?.points.reduce((sum, p) => sum + (p.message_count ?? 0), 0) ?? 0;
-  const totalOrders = report?.points.reduce((sum, p) => sum + (p.order_count ?? 0), 0) ?? 0;
-  const totalRevenue = report?.points.reduce((sum, p) => sum + (p.revenue_total ?? 0), 0) ?? 0;
-
   return (
     <div className="space-y-4 rounded-xl border bg-muted/40 p-4">
       <div className="space-y-1">
@@ -122,60 +101,7 @@ export function ReportPanel() {
 
       {status === "error" && error ? <ErrorMessage description={error} onRetry={generate} /> : null}
 
-      {report && isEmpty ? (
-        <EmptyState
-          icon={BarChart3}
-          title={reportType === "chat-volume" ? "No chat activity in this range" : "No paid orders in this range"}
-          description={
-            reportType === "chat-volume"
-              ? "Nobody has used the public chatbot during the selected dates yet."
-              : "No orders were paid during the selected dates yet."
-          }
-        />
-      ) : null}
-
-      {report && !isEmpty && reportType === "chat-volume" ? (
-        <div className="space-y-2">
-          <p className="text-xs text-muted-foreground">
-            {totalSessions} session{totalSessions === 1 ? "" : "s"}, {totalMessages} message
-            {totalMessages === 1 ? "" : "s"} in this range.
-          </p>
-          <div className="h-64 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={report.points}>
-                <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
-                <XAxis dataKey="date" tick={{ fontSize: 12 }} />
-                <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="session_count" name="Sessions" stroke="var(--primary)" strokeWidth={2} />
-                <Line type="monotone" dataKey="message_count" name="Messages" stroke="#8884d8" strokeWidth={2} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      ) : null}
-
-      {report && !isEmpty && reportType === "revenue" ? (
-        <div className="space-y-2">
-          <p className="text-xs text-muted-foreground">
-            {totalOrders} order{totalOrders === 1 ? "" : "s"}, ${totalRevenue.toFixed(2)} revenue in this range.
-          </p>
-          <div className="h-64 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={report.points}>
-                <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
-                <XAxis dataKey="date" tick={{ fontSize: 12 }} />
-                <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="revenue_total" name="Revenue ($)" stroke="var(--primary)" strokeWidth={2} />
-                <Line type="monotone" dataKey="order_count" name="Orders" stroke="#8884d8" strokeWidth={2} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      ) : null}
+      {report ? <ReportChart report={report} /> : null}
     </div>
   );
 }

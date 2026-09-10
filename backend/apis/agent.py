@@ -37,14 +37,21 @@ from sqlalchemy.orm import Session
 import chat_attachments
 from apis.api import TextOverlayRequest, add_text_overlay
 from apis.deps import CurrentUser, Role, get_current_user, require_role
-from apis.model_settings import _list_image_providers, resolve_chat_provider, resolve_image_provider, resolve_vision_provider
+from apis.model_settings import (
+    _list_image_providers,
+    resolve_chat_provider,
+    resolve_embedding_provider,
+    resolve_image_provider,
+    resolve_vision_provider,
+)
 from apis.pages import _get_or_create_page
 from crm_retention import cleanup_stale_crm_entries
 from db import get_db
 from llm_json import parse_lenient_json
-from models import ChatMessage, ChatSession, CrmEntry, Document, Order, OwnerAgentRun, PageVersion
+from models import ChatMessage, ChatSession, CrmEntry, Document, Order, OwnerAgentRun, Page, PageVersion
 from providers.base import ProviderNotConfigured
 from resource_broker import maybe_release_llm_memory
+from retrieval import retrieve
 
 router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
 
@@ -1324,6 +1331,211 @@ async def ai_adjust_layout(req: AiAdjustLayoutRequest, db: Session = Depends(get
             status_code=502,
             detail=f"Model output didn't match the expected shape ({e}). Raw output: {raw_content[:2000]}",
         )
+
+
+# --- Owner-agent: knowledge-base search + targeted page edit (2026-09-10) ---
+# Two of the three gaps found auditing owner-agent's "can it actually DO
+# what an owner would ask via chat" coverage (the third, create_document,
+# lives in apis/documents.py's create_document_from_text) — see the root
+# AGENTS.md for the fuller design discussion. Both are thin wrappers
+# around already-existing machinery: this one reuses retrieval.py's
+# retrieve() (the exact function apis/chat.py's public chatbot already
+# calls), the public chatbot just never exposed it to owner-agent before.
+
+
+class SearchKnowledgeRequest(BaseModel):
+    query: str
+    limit: int = 5
+
+
+class SearchKnowledgeResultItem(BaseModel):
+    document_title: str
+    excerpt: str
+    score: float
+    is_company_material: bool
+    status_note: str | None = None
+
+
+class SearchKnowledgeResponse(BaseModel):
+    results: list[SearchKnowledgeResultItem]
+
+
+@router.post("/agent/knowledge/search", response_model=SearchKnowledgeResponse)
+async def search_knowledge(req: SearchKnowledgeRequest, db: Session = Depends(get_db)) -> SearchKnowledgeResponse:
+    """Lets owner-agent answer "what does our documentation say about X"
+    the same way the public chatbot's own RAG grounding does — before
+    this, owner-agent had no way to read the knowledge base at all, only
+    structured data (products/schemas/CRM/etc). Read-only, no side
+    effects; degrades to a clean error rather than a crash when
+    embeddings aren't configured, same as retrieval already does for
+    /api/chat."""
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    try:
+        embedder = resolve_embedding_provider(db)
+        chunks = await retrieve(db, query, embedder, top_k=max(1, min(req.limit, 20)))
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Embedding provider request failed: {e}")
+
+    return SearchKnowledgeResponse(
+        results=[
+            SearchKnowledgeResultItem(
+                document_title=c.document_title,
+                excerpt=c.excerpt,
+                score=c.score,
+                is_company_material=c.is_company_material,
+                status_note=c.status_note,
+            )
+            for c in chunks
+        ]
+    )
+
+
+class AiEditPageRequest(BaseModel):
+    instructions: str
+
+
+class AiEditPageResponse(BaseModel):
+    version_id: int
+    changed_indices: list[int]
+    sections: list[PageSection]
+
+
+_AI_EDIT_PAGE_SYSTEM_PROMPT = """You are editing an existing, already-published webpage on behalf of its owner. \
+You will be given the page's current content as a JSON array of sections (each entry tagged with its own \
+0-based "index"), and ONE instruction describing a small, targeted change (e.g. "change the headline to ...", \
+"update the CTA button text to ...", "change the hero photo caption").
+
+Identify ONLY the section(s) that actually need to change to satisfy the instruction — usually just ONE. Do \
+NOT return sections that don't change; the caller already has those. For each section you ARE changing, \
+return its original "index" plus the COMPLETE updated section object with the exact same "type" as before \
+— you may ONLY change existing text/image/color/link VALUES already present in it, never add, remove, or \
+reorder fields, never add/remove nested items (feature-grid items, CTAs, badges, container children), and \
+never invent a field that wasn't already there. If the instruction genuinely can't be satisfied without \
+restructuring, make the closest safe change you can within these rules rather than refusing outright.
+
+Respond with ONLY a single JSON object, no markdown fences, no commentary:
+{"changes": [{"index": <int>, "section": {<the complete updated section object, same "type" as the original>}}, ...]}"""
+
+
+@router.post("/agent/pages/{slug}/ai-edit", response_model=AiEditPageResponse)
+async def ai_edit_page(slug: str, req: AiEditPageRequest, db: Session = Depends(get_db)) -> AiEditPageResponse:
+    """Owner-agent's edit_page_field tool — a targeted single-instruction
+    edit to an already-saved page, applied directly (creates a new
+    PageVersion, same as every other save in this app — one click to
+    restore an earlier version if the edit goes wrong, so this is safe to
+    apply immediately rather than needing a propose-then-review step).
+
+    Deliberately NOT the same mechanism as ai_fill_content above (which
+    needs a live CTE editing session and a client-computed field
+    manifest) — this endpoint is fully self-contained, since owner-agent
+    has no browser session to hand it a manifest from.
+
+    A real, load-bearing bug was found and fixed the same round this was
+    built: the first cut asked the model to echo the WHOLE sections array
+    back on every edit (same shape as generate_landing_page's own
+    response). Against a real, moderately-sized page (9 sections) this
+    reliably timed out — regenerating every untouched section verbatim
+    is slow, sequential token-by-token output, not a cheap operation,
+    and scales linearly with page size for what should be a
+    constant-cost edit. Redesigned as a targeted diff instead: the model
+    only ever echoes back the index+full-object of whichever section(s)
+    it actually changed (usually one), which is what the timeout above
+    was really testing for and what the "changed_indices" field below
+    reports back to the caller. Every other section is copied through
+    unchanged from the existing content, never regenerated. Each changed
+    index is still validated for (a) being a real, in-range index, (b)
+    keeping the exact same "type" as the original at that index (a
+    hallucinated restructure is rejected, not silently applied), then
+    run through _coerce_sections (the same validator generate_landing_page
+    already relies on) before ever being saved."""
+    if not req.instructions.strip():
+        raise HTTPException(status_code=400, detail="instructions must not be empty")
+
+    page = db.scalar(select(Page).where(Page.slug == slug))
+    if page is None or not page.versions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No content saved for page {slug!r} yet — generate or save one first.",
+        )
+    current_content = page.versions[0].content
+    current_sections = current_content.get("sections") if isinstance(current_content, dict) else None
+    if not isinstance(current_sections, list) or not current_sections:
+        raise HTTPException(status_code=400, detail=f"Page {slug!r} has no editable sections.")
+
+    indexed = [{"index": i, **s} if isinstance(s, dict) else {"index": i} for i, s in enumerate(current_sections)]
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                f"Current page content (JSON array, each entry has its own \"index\"):\n"
+                f"{json.dumps(indexed, ensure_ascii=False)}\n\n"
+                f"Requested change: {req.instructions.strip()}"
+            ),
+        }
+    ]
+    try:
+        provider = resolve_chat_provider(db)
+        raw_content = await provider.chat(messages, system=_AI_EDIT_PAGE_SYSTEM_PROMPT, json_mode=True)
+    except ProviderNotConfigured as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
+
+    try:
+        parsed = parse_lenient_json(raw_content)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    raw_changes = parsed.get("changes")
+    if not isinstance(raw_changes, list) or not raw_changes:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Model output had no 'changes' array. Raw output: {raw_content[:2000]}",
+        )
+
+    # Apply each change onto a COPY of the current sections, never trust
+    # the model to have echoed back every untouched section correctly —
+    # only the ones it explicitly names ever get replaced.
+    updated_sections = list(current_sections)
+    changed_indices: list[int] = []
+    for change in raw_changes:
+        if not isinstance(change, dict):
+            continue
+        index = change.get("index")
+        new_section = change.get("section")
+        if not isinstance(index, int) or not (0 <= index < len(current_sections)) or not isinstance(new_section, dict):
+            continue
+        original_type = current_sections[index].get("type") if isinstance(current_sections[index], dict) else None
+        if new_section.get("type") != original_type:
+            # A hallucinated restructure at this one index — skip it
+            # rather than failing the whole edit, same "salvage what's
+            # valid" posture _coerce_sections already uses below.
+            continue
+        updated_sections[index] = new_section
+        changed_indices.append(index)
+
+    if not changed_indices:
+        raise HTTPException(
+            status_code=502,
+            detail="The model's response didn't name any valid, in-range section to change (or every named "
+            "change tried to alter a section's type, which this tool never allows). Try a more specific "
+            "instruction.",
+        )
+
+    sections = _coerce_sections(updated_sections)
+    if not sections:
+        raise HTTPException(status_code=502, detail="None of the page's sections passed validation after the edit.")
+
+    new_content = {**current_content, "sections": [s.model_dump(mode="json") for s in sections]}
+    version = PageVersion(page_id=page.id, content=new_content, note=f"AI edit: {req.instructions.strip()[:200]}")
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+    return AiEditPageResponse(version_id=version.id, changed_indices=changed_indices, sections=sections)
 
 
 class IntegrationStatus(BaseModel):

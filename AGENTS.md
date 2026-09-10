@@ -93,7 +93,7 @@ ai-employee/
 │       └── deps.py            RBAC: Role enum + require_role() dependency, backed by real JWTs
 ├── owner-agent/               isolated LLM tool-calling loop, own container/port 8100 — see "Owner agent" below
 │   ├── deps.py                 owner-only JWT check (duplicated from backend, not imported — see below)
-│   ├── tools.py                 fixed 22-tool allowlist + execute_tool() (HTTP calls onto backend)
+│   ├── tools.py                 fixed 29-tool allowlist + execute_tool() (HTTP calls onto backend)
 │   ├── agent_loop.py             the loop itself: JSON-envelope tool selection against Ollama
 │   ├── logging_.py                action log: stdout + logs/runs.jsonl (never the bearer token)
 │   └── main.py                  FastAPI app: GET /health, POST /run
@@ -359,7 +359,7 @@ belongs in a separate, narrowly-scoped worker.
 
 That worker now exists: **`owner-agent/`** (its own docker-compose
 service, port 8100). It's a real LLM tool-calling loop — the owner types a
-command, a local Ollama model decides which of a fixed 22-tool allowlist to
+command, a local Ollama model decides which of a fixed 29-tool allowlist to
 call, in what order, chaining results turn-to-turn (see "Owner agent" in
 Phase 6 below for the full design). It independently re-verifies the
 caller's JWT and requires `Role.owner` specifically (stricter than
@@ -5272,7 +5272,7 @@ considering it fully settled.
 - **Phase 6 — Agent security layer**: **started, not complete**. The
   isolated worker now exists — `owner-agent/` (own container/port 8100,
   see "Architecture decisions" above and "Owner agent" below) — with a
-  real LLM tool-calling loop over a fixed 22-tool allowlist, its own
+  real LLM tool-calling loop over a fixed 29-tool allowlist, its own
   owner-only auth check, and action logging to stdout + a bind-mounted
   `logs/runs.jsonl` (per-step, durable). The worker's "brain" model
   selection is now wired to the owner-facing model picker too
@@ -5296,7 +5296,7 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 25 tools (`generate_poster`,
+  envelope: either call one of 29 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
   `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
@@ -5308,7 +5308,9 @@ this is the one place the model itself decides which action(s) to take.
   `ingest_documents_from_url`, `list_scheduled_tasks`,
   `manage_scheduled_task`, `check_seo_schema` (2026-09-08, see "GEO push
   part 2" above), `set_shipping_allowed_regions` (2026-09-10, see
-  "Shipping + regional restriction" below) — each
+  "Shipping + regional restriction" below), `search_knowledge`,
+  `edit_page_field`, `create_document`, `suggest_business_profile`
+  (2026-09-10, see "Owner talks, AI operates" below) — each
   a thin HTTP call onto an already-real `backend/apis/agent.py`/
   `apis/intent_schemas.py`/`apis/products.py`/`apis/documents.py`/
   `apis/scheduled_tasks.py`/`apis/seo_audit.py` endpoint) or give a final
@@ -5474,6 +5476,167 @@ this is the one place the model itself decides which action(s) to take.
   now fully real (see "Agent console capabilities" above). Not done:
   online-AI fallback for chat (falls back to nothing today if the
   configured provider is unavailable, just a clean error).
+
+### "Owner talks, AI operates" — closing coverage gaps + orchestration (2026-09-10)
+
+Added off a direct design discussion with the user: the earlier-floated
+idea of an owner-agent onboarding wizard with tooltip/spotlight UI
+pointing at dashboard locations was explicitly **dropped**, not deferred
+— the user's own reasoning: if the AI actually performs the operation
+itself, there's nothing left for a tooltip to point at; a plain chat
+reply ("I've changed the headline to X") already tells the owner what
+happened, more directly than an arrow ever could. This reframed the
+whole direction into one question: **does owner-agent's existing
+tool-calling loop actually cover what an owner would plausibly ask for
+in a real conversation** (edit a page, search the knowledge base, write
+a document, and — the big one — "I want to sell watches, set up
+everything")? Three real, concrete gaps were found and closed, plus a
+turn/time-budget increase and an orchestration prompt to let the model
+chain them on its own instead of doing one step and stopping.
+
+- **`search_knowledge`** (`POST /agent/knowledge/search`, `apis/agent.py`)
+  — owner-agent could read structured data (products, schemas, CRM) via
+  its existing `list_*` tools, but had NO way to query the ingested RAG
+  knowledge base at all — that was only ever wired into the public
+  chatbot (`retrieval.py`'s `retrieve()`). This endpoint is a thin
+  wrapper calling the exact same `retrieve()` function with the exact
+  same embedding-provider resolution `/api/chat` already uses — zero new
+  retrieval mechanism, just a new authenticated entry point onto it.
+- **`create_document`** (`POST /agent/documents/create-from-text`,
+  `apis/documents.py`) — lets owner-agent save a document directly from
+  text it composes ("write this policy down so it's searchable"),
+  without needing an already-uploaded file. Deliberately NOT built by
+  asking the model to produce base64 in its own tool-call JSON — same
+  "a text-generation model shouldn't be asked to emit a binary encoding"
+  reasoning `generate_landing_page_from_url` already established for
+  images. `apis/documents.py`'s `ingest_document` (the base64-upload
+  route) was refactored to share a new `_ingest_content()` helper with
+  this one, rather than duplicating the parse/chunk/embed/store
+  pipeline — the only real difference between the two routes is where
+  the raw bytes come from.
+- **`edit_page_field`** (`POST /agent/pages/{slug}/ai-edit`, `apis/
+  agent.py`) — a targeted single-instruction edit to an already-saved
+  page (e.g. "change the homepage headline to X"), applied directly as
+  a new `PageVersion` (never a propose-then-review step — a page edit
+  is already one click from being undone via the dashboard's Page
+  manager, same "cheap to reverse, so apply immediately" reasoning
+  `set_order_status_options`/`set_shipping_allowed_regions` already use).
+  Deliberately not the same mechanism as `ai_fill_content` (which needs
+  a live CTE browser session and a client-computed field manifest) —
+  this endpoint is fully self-contained, since owner-agent has no
+  browser session to hand it one.
+  - **A real, load-bearing timeout bug was found and fixed via live
+    testing, not assumed correct from the design alone.** The first cut
+    asked the model to echo the WHOLE sections array back on every
+    edit, same shape as `generate_landing_page`'s own response — against
+    a real, only moderately large page (9 sections, ~8KB of JSON),
+    this reliably timed out past 180s: regenerating every untouched
+    section verbatim, token by token, doesn't scale for what should be
+    a constant-cost edit, and gets linearly worse as a real page grows —
+    exactly the kind of "predict everything up front instead of
+    fetching what's needed" anti-pattern the earlier scaling discussion
+    with the user was specifically about avoiding. Redesigned as a
+    targeted diff: the page is still sent as context (the model needs
+    to see what's there to know what to change), but the model only
+    ever echoes back the `index` + full object of whichever section(s)
+    it actually changed — every other section is copied through
+    unchanged server-side, never regenerated. This alone fixed the
+    timeout (confirmed: the identical instruction against the identical
+    page went from a reliable 180s+ timeout to a normal response).
+    Every named index is still validated (in range, same `type` as the
+    original — a hallucinated restructure at one index is silently
+    dropped, not applied) before `_coerce_sections` (the same validator
+    `generate_landing_page` already relies on) runs over the result.
+  - **Verified live against the real running stack and the real,
+    currently-configured local 27B model, including its own real
+    non-determinism** — the identical instruction ("change the hero
+    headline to...") against the identical 9-section real page
+    succeeded cleanly twice (correct `changed_indices: [0]`, every
+    other section byte-identical to before) and failed cleanly once
+    (a clean 502 — `{"changes": []}` — no version written, nothing
+    corrupted) across repeated runs, the same class of local-model
+    output variance already documented elsewhere in this file (the
+    em-dash finding in "Document-to-structured-data" above) — not a
+    code bug, and a failure is always safe (never a silent wrong edit,
+    never a corrupted save), matching `agent_loop.py`'s own
+    "retry on a failed tool call" behavior. The test page was restored
+    to its pre-test version afterward via the dashboard's own restore
+    mechanism.
+- **`suggest_business_profile`** (registered as an owner-agent tool onto
+  the already-existing `POST /agent/business-profile/suggest`, no
+  backend change needed) — same propose-then-owner-applies posture as
+  `propose_intent_schema`/`propose_products`, since a wrong phone number
+  published as structured data has real consequences. `OwnerAgentPanel`
+  gained a matching editable review card (name/type/description/email/
+  phone/address fields, Apply/Discard) — the same pattern the schema/
+  product/stock review cards already established, detecting a
+  successful `suggest_business_profile` step and rendering the draft
+  for review. Fixed a small, real, adjacent bug while touching this
+  code: `handleRun` reset `pendingProposal`/`pendingProducts` at the
+  start of a new run but never `pendingStock`, so a stale stock-restock
+  card from a PREVIOUS run could still be showing (and applicable)
+  during/after a new, unrelated run — now reset alongside the rest.
+- **Turn/time budget raised** (`owner-agent/agent_loop.py`,
+  `MAX_ITERATIONS` 6→12, `RUN_TIMEOUT_SECONDS` 300→1200) — once tool
+  coverage grew enough that a single real command ("I want to sell
+  watches") can legitimately chain several calls
+  (`list_intent_schemas` → `propose_intent_schema` →
+  `suggest_business_profile` → optionally `generate_landing_page`/
+  `propose_products_from_document`), the old 300s ceiling was already
+  tight enough that ONE slow `generate_landing_page` call alone (which
+  separately budgets up to 620s) could exceed the whole run's total
+  budget and get the run cut off on the very next turn-boundary check,
+  before the model got a chance to continue chaining the rest.
+- **Orchestration guidance added to `SYSTEM_PROMPT_TEMPLATE`** — tells
+  the model to chain the relevant tools itself in one run when the owner
+  describes a new business or asks for their whole site to be set up,
+  rather than doing one step and stopping and making the owner ask for
+  each piece separately: check `list_intent_schemas` first, propose an
+  intent schema fitting the stated business, suggest a business profile,
+  and (if a design image or reference documents were given) generate a
+  landing page / propose products or stock from them — then explain
+  plainly what's ready to review-and-Apply versus what already took
+  effect immediately. Explicitly told never to fabricate business-
+  specific facts (a real address, a real price) that weren't given or
+  found via `search_knowledge`/ingested documents.
+  - **Verified live, end-to-end, against the real running stack and the
+    real local model** — command: "I want to build a website selling
+    watches. Please set up the right structured data collection for
+    customer inquiries and a business profile draft for this." The
+    model correctly called `list_intent_schemas` FIRST (found only an
+    unrelated `table_reservation` schema from earlier testing), then
+    `propose_intent_schema` with a genuinely sensible `watch_inquiry`
+    schema (watch of interest, contact name, email, budget range,
+    notes) it wasn't hand-fed — no template existed for this, the model
+    inferred appropriate fields for a watch retailer on its own — then
+    automatically chained straight into `suggest_business_profile`
+    without being asked again, and correctly reported the profile came
+    back nearly empty because 0 documents were ingested rather than
+    inventing a plausible-sounding business name/address/phone. Finished
+    in 4 turns with a final answer that clearly separated "ready to
+    review and Apply" from "already took effect" and suggested the
+    logical next step (upload real business documents, then re-run).
+    The proposed schema's Apply path was separately verified by
+    actually creating it via `POST /agent/intent-schemas` and confirming
+    it round-tripped correctly, then deleting the test row.
+  - **owner-agent tool count is now 29** — the four new tools this round
+    are `search_knowledge`, `edit_page_field`, `create_document`, and
+    `suggest_business_profile`.
+- **Inline chart rendering for `generate_report`, not just a JSON dump**
+  — the other half of a separate design discussion (should a report show
+  up as a chart in the chat, or only in a separate dashboard section):
+  the answer settled on BOTH, with the conversational path as the
+  primary one and the dashboard's own `ReportPanel` staying as a
+  secondary, optional browsing entry point (an owner who just wants to
+  glance at numbers without asking shouldn't have to). The recharts
+  rendering (`ReportPanel`'s own line chart — sessions/messages or
+  revenue/orders per day) was extracted into a new shared
+  `frontend/src/components/common/report-chart.tsx`, used by BOTH
+  `ReportPanel` and `OwnerAgentPanel`'s step trace — a successful
+  `generate_report` step now renders the actual chart inline in the
+  conversation instead of a raw JSON blob, reusing recharts (already a
+  dependency via `ReportPanel`) rather than introducing Chart.js or any
+  other new charting library for a second, inconsistent look.
 
 ## Known gotchas worth remembering
 

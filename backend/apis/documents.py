@@ -410,48 +410,41 @@ def resync_document(
     return _to_summary(document, _current_embedding_config(db))
 
 
-@router.post("/agent/documents/ingest", response_model=DocumentSummary)
-async def ingest_document(
-    req: IngestDocumentRequest,
-    db: Session = Depends(get_db),
-    current: CurrentUser = Depends(get_current_user),
-) -> DocumentSummary:
-    """Parse -> chunk -> embed -> store. Synchronous (blocks until done,
-    same tradeoff generate_landing_page makes) — fine for MVP-sized
-    documents; a real background job queue would be the next step for
-    anything large enough to time out a request."""
-    content_b64 = req.content_base64
-    # Tolerate a data-URI prefix (e.g. from the browser's FileReader
-    # .readAsDataURL, "data:application/pdf;base64,...") — same pattern
-    # apis/api.py and agent.py's vision endpoint already use.
-    if content_b64.strip().lower().startswith("data:") and "," in content_b64:
-        content_b64 = content_b64.split(",", 1)[1]
-
-    try:
-        raw_bytes = base64.b64decode(content_b64, validate=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
-
+async def _ingest_content(
+    db: Session,
+    uploaded_by: str | None,
+    filename: str,
+    content_type: str,
+    raw_bytes: bytes,
+    *,
+    is_company_material: bool = True,
+    status_note: str | None = None,
+    suggest_status_note: bool = False,
+) -> Document:
+    """Shared parse -> chunk -> embed -> store core (2026-09-10, factored
+    out of ingest_document below once create_document_from_text needed
+    the identical pipeline) — synchronous (blocks until done, same
+    tradeoff generate_landing_page makes), fine for MVP-sized documents."""
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    stored_name = f"{uuid.uuid4().hex}_{req.filename}"
+    stored_name = f"{uuid.uuid4().hex}_{filename}"
     (STORAGE_DIR / stored_name).write_bytes(raw_bytes)
 
     document = Document(
-        filename=req.filename,
-        content_type=req.content_type,
+        filename=filename,
+        content_type=content_type,
         size_bytes=len(raw_bytes),
         storage_path=stored_name,
         status="processing",
-        is_company_material=req.is_company_material,
-        status_note=req.status_note,
-        uploaded_by=current.email,
+        is_company_material=is_company_material,
+        status_note=status_note,
+        uploaded_by=uploaded_by,
     )
     db.add(document)
     db.commit()
     db.refresh(document)
 
     try:
-        text = parse_document(raw_bytes, req.content_type, req.filename)
+        text = parse_document(raw_bytes, content_type, filename)
         chunks = chunk_text(text)
         if not chunks:
             raise ValueError("No extractable text found in this document.")
@@ -473,7 +466,7 @@ async def ingest_document(
         document.embedding_provider = embedder.name
         document.embedding_model = getattr(embedder, "model", None)
         _record_embedding_dimensions(db, vectors)
-        if req.suggest_status_note and not document.status_note:
+        if suggest_status_note and not document.status_note:
             document.status_note = await _suggest_status_note(db, text)
         db.commit()
     except ProviderNotConfigured as e:
@@ -486,6 +479,76 @@ async def ingest_document(
         db.commit()
 
     db.refresh(document)
+    return document
+
+
+@router.post("/agent/documents/ingest", response_model=DocumentSummary)
+async def ingest_document(
+    req: IngestDocumentRequest,
+    db: Session = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+) -> DocumentSummary:
+    """A base64-encoded file upload — see _ingest_content above for the
+    actual parse/chunk/embed/store pipeline."""
+    content_b64 = req.content_base64
+    # Tolerate a data-URI prefix (e.g. from the browser's FileReader
+    # .readAsDataURL, "data:application/pdf;base64,...") — same pattern
+    # apis/api.py and agent.py's vision endpoint already use.
+    if content_b64.strip().lower().startswith("data:") and "," in content_b64:
+        content_b64 = content_b64.split(",", 1)[1]
+
+    try:
+        raw_bytes = base64.b64decode(content_b64, validate=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
+
+    document = await _ingest_content(
+        db,
+        current.email,
+        req.filename,
+        req.content_type,
+        raw_bytes,
+        is_company_material=req.is_company_material,
+        status_note=req.status_note,
+        suggest_status_note=req.suggest_status_note,
+    )
+    return _to_summary(document, _current_embedding_config(db))
+
+
+class CreateDocumentFromTextRequest(BaseModel):
+    title: str
+    content: str
+    is_company_material: bool = True
+
+
+@router.post("/agent/documents/create-from-text", response_model=DocumentSummary)
+async def create_document_from_text(
+    req: CreateDocumentFromTextRequest,
+    db: Session = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+) -> DocumentSummary:
+    """Owner-agent's create_document tool (owner-agent/tools.py) — the
+    plain-text counterpart to ingest_document above, built specifically
+    so the model never has to produce base64 inside its own tool-call
+    JSON (same "a text-generation model shouldn't be asked to emit a
+    binary encoding" reasoning as generate_landing_page_from_url uses
+    for images). Shares ingest_document's exact pipeline via
+    _ingest_content — the only difference is the input is already plain
+    text, never a file the owner uploaded first."""
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title must not be empty")
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="content must not be empty")
+    filename = title if title.lower().endswith((".txt", ".md")) else f"{title}.txt"
+    document = await _ingest_content(
+        db,
+        current.email,
+        filename,
+        "text/plain",
+        req.content.encode("utf-8"),
+        is_company_material=req.is_company_material,
+    )
     return _to_summary(document, _current_embedding_config(db))
 
 

@@ -13,7 +13,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { Pagination } from "@/components/common/pagination";
+import { ReportChart } from "@/components/common/report-chart";
 import { ApiError } from "@/lib/api";
+import { updateBusinessProfile, type BusinessProfile, type SuggestBusinessProfileResult } from "@/lib/business-profile";
 import {
   createIntentSchema,
   FIELD_TYPE_OPTIONS,
@@ -36,6 +38,7 @@ import {
   type ProductInput,
   type ProposedStockAdjustment,
 } from "@/lib/products";
+import type { Report } from "@/lib/reports";
 
 const HISTORY_PAGE_SIZE = 20;
 
@@ -63,12 +66,15 @@ type ProposedProduct = {
 /** Owner only (see owner-agent/deps.py — stricter than every other panel
  * in this section, which are admin OR owner). Sends a natural-language
  * command to the owner-agent container's `POST /run`, a real LLM
- * tool-calling loop over a fixed 25-tool allowlist (poster/landing-page
+ * tool-calling loop over a fixed 29-tool allowlist (poster/landing-page
  * generation, CRM capture/list/delete, reporting, GEO page regeneration,
- * attachment scanning, upload cleanup, intake-schema/product/stock
- * proposals — including drafting products/restocks straight from an
- * already-uploaded PDF — and more, see owner-agent/tools.py for the
- * current, authoritative list) — the first capability in this app where
+ * attachment scanning, upload cleanup, intake-schema/product/stock/
+ * business-profile proposals — including drafting products/restocks
+ * straight from an already-uploaded PDF, knowledge-base search, a
+ * targeted single-instruction page edit, and creating a knowledge-base
+ * document directly from composed text — and more, see owner-agent/
+ * tools.py for the current, authoritative list) — the first capability
+ * in this app where
  * the model itself decides which action(s) to take, not a single
  * deterministic pipeline call. Renders the full step trace so a run's
  * reasoning is visible, not just its final answer. Also lists past runs
@@ -115,6 +121,17 @@ export function OwnerAgentPanel() {
   const [stockApplyStatus, setStockApplyStatus] = React.useState<"idle" | "saving" | "error">("idle");
   const [stockApplyError, setStockApplyError] = React.useState<string | null>(null);
 
+  // Business-profile-proposal review (2026-09-10) — same propose-then-
+  // owner-applies posture, see suggest_business_profile's description in
+  // owner-agent/tools.py: a wrong phone/address published as structured
+  // data has real consequences, so owner-agent never saves a profile
+  // itself.
+  const [pendingBusinessProfile, setPendingBusinessProfile] = React.useState<BusinessProfile | null>(null);
+  const [businessProfileApplyStatus, setBusinessProfileApplyStatus] = React.useState<"idle" | "saving" | "error">(
+    "idle",
+  );
+  const [businessProfileApplyError, setBusinessProfileApplyError] = React.useState<string | null>(null);
+
   const refreshHistory = React.useCallback(() => {
     listOwnerAgentRuns(HISTORY_PAGE_SIZE, (historyPage - 1) * HISTORY_PAGE_SIZE)
       .then((result) => {
@@ -136,6 +153,8 @@ export function OwnerAgentPanel() {
     setPendingProposal(null);
     setProposalDraft(null);
     setPendingProducts(null);
+    setPendingStock(null);
+    setPendingBusinessProfile(null);
     try {
       const runResult = await runOwnerAgentCommand(command.trim());
       setResult(runResult);
@@ -171,6 +190,14 @@ export function OwnerAgentPanel() {
       if (stockStep?.result) {
         const { proposals } = stockStep.result as unknown as { proposals: ProposedStockAdjustment[] };
         setPendingStock(proposals);
+      }
+
+      const businessProfileStep = runResult.steps.find(
+        (step) => step.tool === "suggest_business_profile" && step.ok,
+      );
+      if (businessProfileStep?.result) {
+        const { suggestion } = businessProfileStep.result as unknown as SuggestBusinessProfileResult;
+        setPendingBusinessProfile(suggestion);
       }
     } catch (err) {
       setError(
@@ -312,6 +339,30 @@ export function OwnerAgentPanel() {
     } catch (err) {
       setStockApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
       setStockApplyStatus("error");
+    }
+  }
+
+  function updateBusinessProfileDraft(patch: Partial<BusinessProfile>) {
+    setPendingBusinessProfile((p) => (p ? { ...p, ...patch } : p));
+  }
+
+  function discardBusinessProfile() {
+    setPendingBusinessProfile(null);
+    setBusinessProfileApplyStatus("idle");
+    setBusinessProfileApplyError(null);
+  }
+
+  async function applyBusinessProfile() {
+    if (!pendingBusinessProfile) return;
+    setBusinessProfileApplyStatus("saving");
+    setBusinessProfileApplyError(null);
+    try {
+      await updateBusinessProfile(pendingBusinessProfile);
+      setPendingBusinessProfile(null);
+      setBusinessProfileApplyStatus("idle");
+    } catch (err) {
+      setBusinessProfileApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
+      setBusinessProfileApplyStatus("error");
     }
   }
 
@@ -602,6 +653,95 @@ export function OwnerAgentPanel() {
             </div>
           ) : null}
 
+          {pendingBusinessProfile ? (
+            <div className="space-y-3 rounded-lg border border-dashed p-3">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">Business profile draft — review before applying</p>
+                <p className="text-xs text-muted-foreground">
+                  The agent never saves this itself — only facts explicitly stated in ingested documents
+                  are filled in; anything left blank means nothing was found for it. Review, fill in
+                  anything missing, then Apply to publish it.
+                </p>
+              </div>
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">Business name</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_name ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_name: e.target.value || null })}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">Type (e.g. Plumber, Restaurant)</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_type ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_type: e.target.value || null })}
+                  />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Description</Label>
+                <Textarea
+                  value={pendingBusinessProfile.business_description ?? ""}
+                  onChange={(e) => updateBusinessProfileDraft({ business_description: e.target.value || null })}
+                  rows={2}
+                />
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">Email</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_email ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_email: e.target.value || null })}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">Phone</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_phone ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_phone: e.target.value || null })}
+                  />
+                </div>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">Street address</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_street_address ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_street_address: e.target.value || null })}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">City</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_locality ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_locality: e.target.value || null })}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">State/region</Label>
+                  <Input
+                    value={pendingBusinessProfile.business_region ?? ""}
+                    onChange={(e) => updateBusinessProfileDraft({ business_region: e.target.value || null })}
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button onClick={applyBusinessProfile} disabled={businessProfileApplyStatus === "saving"}>
+                  {businessProfileApplyStatus === "saving" ? "Applying…" : "Apply"}
+                </Button>
+                <Button variant="ghost" onClick={discardBusinessProfile}>
+                  Discard
+                </Button>
+              </div>
+              {businessProfileApplyStatus === "error" && businessProfileApplyError ? (
+                <ErrorMessage description={businessProfileApplyError} onRetry={() => setBusinessProfileApplyStatus("idle")} />
+              ) : null}
+            </div>
+          ) : null}
+
           <div className="space-y-2">
             <p className="text-sm font-medium">Step trace</p>
             {result.steps.map((step) => (
@@ -625,7 +765,14 @@ export function OwnerAgentPanel() {
                     {JSON.stringify(step.args, null, 2)}
                   </pre>
                 ) : null}
-                {step.result ? (
+                {step.tool === "generate_report" && step.ok && step.result ? (
+                  // Inline chart (2026-09-10), not just the raw JSON dump
+                  // below — reuses the exact same rendering ReportPanel's
+                  // own dashboard section uses, so a report looks the
+                  // same whether the owner asked for it via the form or
+                  // via a chat command.
+                  <ReportChart report={step.result as unknown as Report} />
+                ) : step.result ? (
                   <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
                     {JSON.stringify(step.result, null, 2)}
                   </pre>

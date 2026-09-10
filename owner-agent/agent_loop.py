@@ -22,14 +22,25 @@ from json_repair import repair_json
 
 from tools import BACKEND_URL, TOOL_REGISTRY, execute_tool, render_tools_for_prompt
 
-MAX_ITERATIONS = 6
+MAX_ITERATIONS = 12
+# Raised from 6 (2026-09-10) once tool coverage grew enough that a single
+# real command can legitimately need to chain many calls — e.g. "I want
+# to sell watches" plausibly means propose_intent_schema +
+# suggest_business_profile + generate_landing_page + (if a catalog file
+# was given) propose_products_from_document, several turns on its own
+# even before counting list_* lookups or a retry.
+#
 # Checked only *between* turns (the loop below), not while a _backend_chat
 # call is in flight — that call has its own 600s httpx timeout to give a
 # slow local model room to finish (see _backend_chat), which can itself
-# exceed this "budget." Not new: even the old fixed-120s-per-call version
-# could already blow past 300s total across up to 6 turns; this just
-# makes an already-loose budget more visibly loose, not categorically so.
-RUN_TIMEOUT_SECONDS = 300.0
+# exceed this "budget." RUN_TIMEOUT_SECONDS raised to 1200s alongside
+# MAX_ITERATIONS for the same reason: generate_landing_page alone budgets
+# up to 620s for one call (see its own ToolSpec.timeout) — at the old
+# 300s ceiling, a run that included even one slow landing-page generation
+# would already exceed the total budget and get cut off on the very next
+# turn-boundary check, before the model got a chance to continue chaining
+# the rest of a multi-step setup.
+RUN_TIMEOUT_SECONDS = 1200.0
 
 SYSTEM_PROMPT_TEMPLATE = """You are the owner's operations agent for this company's internal admin \
 dashboard. The owner has typed a command; your job is to decide which of the following tools (if any) \
@@ -53,7 +64,21 @@ corrected arguments, try a different tool, or give up and explain the failure in
 Do not repeat the exact same failing call twice.
 - You have at most {max_iterations} turns total. If you're near that limit, stop and give a \
 final_answer summarizing what you accomplished, even if incomplete.
-- Output ONLY the JSON object described above."""
+- Output ONLY the JSON object described above.
+
+Setting up a new business/site: when the owner describes what kind of business they're running (e.g. \
+"I want to sell watches", "this is a dental clinic", "I do plumbing/electrical work"), or asks you to get \
+their whole site set up, chain the relevant tools yourself in one run rather than doing just one step and \
+stopping — don't make the owner ask for each piece separately. A reasonable sequence: (1) \
+list_intent_schemas to check nothing already fits, then propose_intent_schema for the kind of \
+request/booking this business needs to collect (a quote, an appointment, a service call — pick fields that \
+actually fit the stated business, not a generic template); (2) suggest_business_profile; (3) if the owner \
+gave you a design image or reference documents, generate_landing_page / propose_products_from_document / \
+propose_stock_from_document as appropriate; (4) explain plainly in your final_answer what's ready to review \
+and Apply in the dashboard (schema/product/profile drafts never apply themselves) versus what already took \
+effect immediately (a page edit, a shipping/order-status setting). Never fabricate business-specific facts \
+(a real address, a real price) that weren't given to you or found via search_knowledge/ingested documents — \
+leave those fields for the owner to fill in rather than inventing plausible-sounding ones."""
 
 
 @dataclass

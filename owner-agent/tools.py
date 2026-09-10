@@ -419,6 +419,67 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="POST",
         path="/api/agent/scheduled-tasks",
     ),
+    "search_knowledge": ToolSpec(
+        name="search_knowledge",
+        description=(
+            'Searches the ingested knowledge base (the same documents the public chatbot draws on) and '
+            'returns the most relevant excerpts. Args: {"query": "<what you\'re looking for>", "limit": '
+            '<optional, default 5>}. Use this to answer "what does our documentation/policy say about X" '
+            "or to ground a page edit/summary in real business facts instead of guessing — the public "
+            "chatbot already has this; you didn't, until now."
+        ),
+        method="POST",
+        path="/api/agent/knowledge/search",
+    ),
+    "edit_page_field": ToolSpec(
+        name="edit_page_field",
+        description=(
+            "Makes ONE small, targeted edit to an already-saved page (e.g. change a headline, update a "
+            "button's text, swap a caption) — never a full regenerate. Args: {\"slug\": \"<page slug, e.g. "
+            '\'home\'>", "instructions": "<the one change to make, in plain language>"}. Fails with a 404 '
+            "if that slug has nothing saved yet (use generate_landing_page for a brand-new page instead). "
+            "Applies immediately as a new page version — the owner can always restore an earlier version "
+            "from the dashboard's Page manager if the edit isn't right, so there's no need to ask for "
+            "confirmation first. Can only change existing text/image/color/link values, never restructure "
+            "the page — if you need to add or remove whole sections, tell the owner to use the dashboard's "
+            "editor instead."
+        ),
+        method="POST",
+        path="/api/agent/pages/{slug}/ai-edit",
+        # A real page's current content (every section, tagged with its
+        # own index) is sent as context on every call regardless of how
+        # small the requested edit is — a large local model can take a
+        # while to process a several-KB prompt, found via live testing
+        # against a real 9-section page. Matches generate_landing_page's
+        # own reasoning for a per-tool override.
+        timeout=400.0,
+    ),
+    "create_document": ToolSpec(
+        name="create_document",
+        description=(
+            'Creates a new knowledge-base document directly from text you compose yourself (no file '
+            'upload needed) — use this to save a summary, a policy, or any other reference text the owner '
+            'asks you to "write down"/"remember" so it\'s searchable later via search_knowledge and usable '
+            'by the public chatbot. Args: {"title": "<short name for this document>", "content": "<the '
+            'full text>", "is_company_material": <true (default) if this states facts about the business '
+            "itself, false if it's background reference material the business doesn't own>}."
+        ),
+        method="POST",
+        path="/api/agent/documents/create-from-text",
+    ),
+    "suggest_business_profile": ToolSpec(
+        name="suggest_business_profile",
+        description=(
+            "Drafts the business's structured profile (name, type, description, contact info, hours) from "
+            "currently-ingested documents — this NEVER saves anything itself, only returns a draft for the "
+            "owner to review and save in the dashboard's Business profile panel. No arguments. After "
+            "calling this, tell the owner a draft is ready to review — never claim the profile has already "
+            "been saved. Part of setting up a brand-new business/site: call this alongside "
+            "propose_intent_schema when the owner describes what kind of business they're running."
+        ),
+        method="POST",
+        path="/api/agent/business-profile/suggest",
+    ),
     "check_seo_schema": ToolSpec(
         name="check_seo_schema",
         description=(
