@@ -31,6 +31,7 @@ import {
 import { getPublicPage, listPages, savePageVersion, type PageSummary } from "@/lib/pages";
 import type { FillableField } from "@/lib/page-ai-fill";
 import { slugify } from "@/lib/slug";
+import { useDebouncedSearch } from "@/lib/use-debounced-search";
 import { cn } from "@/lib/utils";
 import type { GeneratedPage, PageSection, ThemeImage } from "@/lib/theme";
 
@@ -79,16 +80,8 @@ export function CteEditorPanel() {
   const [pageListTotal, setPageListTotal] = React.useState(0);
   const [pageListPage, setPageListPage] = React.useState(1);
   const [pageSearchInput, setPageSearchInput] = React.useState("");
-  const [pageSearchText, setPageSearchText] = React.useState("");
+  const pageSearchText = useDebouncedSearch(pageSearchInput, setPageListPage);
   const [pageListError, setPageListError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    const id = window.setTimeout(() => {
-      setPageSearchText(pageSearchInput);
-      setPageListPage(1);
-    }, 300);
-    return () => window.clearTimeout(id);
-  }, [pageSearchInput]);
 
   const loadPageList = React.useCallback(() => {
     if (!canEdit) return;

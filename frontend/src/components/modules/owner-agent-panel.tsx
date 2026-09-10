@@ -39,6 +39,7 @@ import {
   type ProposedStockAdjustment,
 } from "@/lib/products";
 import type { Report } from "@/lib/reports";
+import { useAsyncApply } from "@/lib/use-async-apply";
 
 const HISTORY_PAGE_SIZE = 20;
 
@@ -98,8 +99,7 @@ export function OwnerAgentPanel() {
   // is the editable working copy the form actually binds to.
   const [pendingProposal, setPendingProposal] = React.useState<ProposedSchema | null>(null);
   const [proposalDraft, setProposalDraft] = React.useState<IntentSchemaInput | null>(null);
-  const [applyStatus, setApplyStatus] = React.useState<"idle" | "saving" | "error">("idle");
-  const [applyError, setApplyError] = React.useState<string | null>(null);
+  const schemaApply = useAsyncApply();
 
   // Product-proposal review (2026-08-19) — same propose-then-owner-
   // applies posture as the schema proposal above, see
@@ -109,8 +109,7 @@ export function OwnerAgentPanel() {
   // draft, since one command ("set up my whole menu") proposes several
   // at once.
   const [pendingProducts, setPendingProducts] = React.useState<ProposedProduct[] | null>(null);
-  const [productApplyStatus, setProductApplyStatus] = React.useState<"idle" | "saving" | "error">("idle");
-  const [productApplyError, setProductApplyError] = React.useState<string | null>(null);
+  const productApply = useAsyncApply();
 
   // Stock-adjustment-proposal review (2026-09-10) — same propose-then-
   // owner-applies posture, see propose_stock_from_document's description
@@ -118,8 +117,7 @@ export function OwnerAgentPanel() {
   // would silently corrupt a real stock count, so owner-agent never
   // writes to StockItem itself.
   const [pendingStock, setPendingStock] = React.useState<ProposedStockAdjustment[] | null>(null);
-  const [stockApplyStatus, setStockApplyStatus] = React.useState<"idle" | "saving" | "error">("idle");
-  const [stockApplyError, setStockApplyError] = React.useState<string | null>(null);
+  const stockApply = useAsyncApply();
 
   // Business-profile-proposal review (2026-09-10) — same propose-then-
   // owner-applies posture, see suggest_business_profile's description in
@@ -127,10 +125,7 @@ export function OwnerAgentPanel() {
   // data has real consequences, so owner-agent never saves a profile
   // itself.
   const [pendingBusinessProfile, setPendingBusinessProfile] = React.useState<BusinessProfile | null>(null);
-  const [businessProfileApplyStatus, setBusinessProfileApplyStatus] = React.useState<"idle" | "saving" | "error">(
-    "idle",
-  );
-  const [businessProfileApplyError, setBusinessProfileApplyError] = React.useState<string | null>(null);
+  const businessProfileApply = useAsyncApply();
 
   const refreshHistory = React.useCallback(() => {
     listOwnerAgentRuns(HISTORY_PAGE_SIZE, (historyPage - 1) * HISTORY_PAGE_SIZE)
@@ -226,15 +221,12 @@ export function OwnerAgentPanel() {
   function discardProposal() {
     setPendingProposal(null);
     setProposalDraft(null);
-    setApplyStatus("idle");
-    setApplyError(null);
+    schemaApply.reset();
   }
 
   async function applyProposal() {
     if (!pendingProposal || !proposalDraft) return;
     if (!proposalDraft.key.trim() || !proposalDraft.label.trim()) return;
-    setApplyStatus("saving");
-    setApplyError(null);
     const payload: IntentSchemaInput = {
       key: proposalDraft.key.trim(),
       label: proposalDraft.label.trim(),
@@ -243,7 +235,7 @@ export function OwnerAgentPanel() {
         .filter((f) => f.field_key.trim() && f.label.trim())
         .map((f) => ({ ...f, field_key: f.field_key.trim(), label: f.label.trim(), prompt_hint: f.prompt_hint?.trim() || null })),
     };
-    try {
+    await schemaApply.run(async () => {
       if (pendingProposal.already_exists && pendingProposal.existing_id !== null) {
         await updateIntentSchema(pendingProposal.existing_id, payload);
       } else {
@@ -251,11 +243,7 @@ export function OwnerAgentPanel() {
       }
       setPendingProposal(null);
       setProposalDraft(null);
-      setApplyStatus("idle");
-    } catch (err) {
-      setApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
-      setApplyStatus("error");
-    }
+    });
   }
 
   function updateProductDraftAt(index: number, patch: Partial<ProductInput>) {
@@ -270,15 +258,12 @@ export function OwnerAgentPanel() {
 
   function discardProducts() {
     setPendingProducts(null);
-    setProductApplyStatus("idle");
-    setProductApplyError(null);
+    productApply.reset();
   }
 
   async function applyProducts() {
     if (!pendingProducts || pendingProducts.length === 0) return;
-    setProductApplyStatus("saving");
-    setProductApplyError(null);
-    try {
+    await productApply.run(async () => {
       for (const proposal of pendingProducts) {
         const payload: ProductInput = {
           name: proposal.product.name.trim(),
@@ -294,11 +279,7 @@ export function OwnerAgentPanel() {
         }
       }
       setPendingProducts(null);
-      setProductApplyStatus("idle");
-    } catch (err) {
-      setProductApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
-      setProductApplyStatus("error");
-    }
+    });
   }
 
   function updateStockDraftAt(index: number, patch: Partial<ProposedStockAdjustment>) {
@@ -311,15 +292,12 @@ export function OwnerAgentPanel() {
 
   function discardStock() {
     setPendingStock(null);
-    setStockApplyStatus("idle");
-    setStockApplyError(null);
+    stockApply.reset();
   }
 
   async function applyStock() {
     if (!pendingStock || pendingStock.length === 0) return;
-    setStockApplyStatus("saving");
-    setStockApplyError(null);
-    try {
+    await stockApply.run(async () => {
       for (const proposal of pendingStock) {
         if (proposal.existing_id !== null && proposal.existing_quantity !== null) {
           // Restock adds the parsed quantity ON TOP OF whatever's
@@ -335,11 +313,7 @@ export function OwnerAgentPanel() {
         }
       }
       setPendingStock(null);
-      setStockApplyStatus("idle");
-    } catch (err) {
-      setStockApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
-      setStockApplyStatus("error");
-    }
+    });
   }
 
   function updateBusinessProfileDraft(patch: Partial<BusinessProfile>) {
@@ -348,22 +322,15 @@ export function OwnerAgentPanel() {
 
   function discardBusinessProfile() {
     setPendingBusinessProfile(null);
-    setBusinessProfileApplyStatus("idle");
-    setBusinessProfileApplyError(null);
+    businessProfileApply.reset();
   }
 
   async function applyBusinessProfile() {
     if (!pendingBusinessProfile) return;
-    setBusinessProfileApplyStatus("saving");
-    setBusinessProfileApplyError(null);
-    try {
+    await businessProfileApply.run(async () => {
       await updateBusinessProfile(pendingBusinessProfile);
       setPendingBusinessProfile(null);
-      setBusinessProfileApplyStatus("idle");
-    } catch (err) {
-      setBusinessProfileApplyError(err instanceof ApiError ? err.message : "Apply failed — is the backend reachable?");
-      setBusinessProfileApplyStatus("error");
-    }
+    });
   }
 
   return (
@@ -499,16 +466,16 @@ export function OwnerAgentPanel() {
               <div className="flex items-center gap-2">
                 <Button
                   onClick={applyProposal}
-                  disabled={!proposalDraft.key.trim() || !proposalDraft.label.trim() || applyStatus === "saving"}
+                  disabled={!proposalDraft.key.trim() || !proposalDraft.label.trim() || schemaApply.status === "saving"}
                 >
-                  {applyStatus === "saving" ? "Applying…" : pendingProposal.already_exists ? "Apply update" : "Apply"}
+                  {schemaApply.status === "saving" ? "Applying…" : pendingProposal.already_exists ? "Apply update" : "Apply"}
                 </Button>
                 <Button variant="ghost" onClick={discardProposal}>
                   Discard
                 </Button>
               </div>
-              {applyStatus === "error" && applyError ? (
-                <ErrorMessage description={applyError} onRetry={() => setApplyStatus("idle")} />
+              {schemaApply.status === "error" && schemaApply.error ? (
+                <ErrorMessage description={schemaApply.error} onRetry={schemaApply.reset} />
               ) : null}
             </div>
           ) : null}
@@ -573,15 +540,15 @@ export function OwnerAgentPanel() {
               </div>
 
               <div className="flex items-center gap-2">
-                <Button onClick={applyProducts} disabled={productApplyStatus === "saving"}>
-                  {productApplyStatus === "saving" ? "Applying…" : "Apply"}
+                <Button onClick={applyProducts} disabled={productApply.status === "saving"}>
+                  {productApply.status === "saving" ? "Applying…" : "Apply"}
                 </Button>
                 <Button variant="ghost" onClick={discardProducts}>
                   Discard
                 </Button>
               </div>
-              {productApplyStatus === "error" && productApplyError ? (
-                <ErrorMessage description={productApplyError} onRetry={() => setProductApplyStatus("idle")} />
+              {productApply.status === "error" && productApply.error ? (
+                <ErrorMessage description={productApply.error} onRetry={productApply.reset} />
               ) : null}
             </div>
           ) : null}
@@ -640,15 +607,15 @@ export function OwnerAgentPanel() {
               </div>
 
               <div className="flex items-center gap-2">
-                <Button onClick={applyStock} disabled={stockApplyStatus === "saving"}>
-                  {stockApplyStatus === "saving" ? "Applying…" : "Apply"}
+                <Button onClick={applyStock} disabled={stockApply.status === "saving"}>
+                  {stockApply.status === "saving" ? "Applying…" : "Apply"}
                 </Button>
                 <Button variant="ghost" onClick={discardStock}>
                   Discard
                 </Button>
               </div>
-              {stockApplyStatus === "error" && stockApplyError ? (
-                <ErrorMessage description={stockApplyError} onRetry={() => setStockApplyStatus("idle")} />
+              {stockApply.status === "error" && stockApply.error ? (
+                <ErrorMessage description={stockApply.error} onRetry={stockApply.reset} />
               ) : null}
             </div>
           ) : null}
@@ -729,15 +696,15 @@ export function OwnerAgentPanel() {
               </div>
 
               <div className="flex items-center gap-2">
-                <Button onClick={applyBusinessProfile} disabled={businessProfileApplyStatus === "saving"}>
-                  {businessProfileApplyStatus === "saving" ? "Applying…" : "Apply"}
+                <Button onClick={applyBusinessProfile} disabled={businessProfileApply.status === "saving"}>
+                  {businessProfileApply.status === "saving" ? "Applying…" : "Apply"}
                 </Button>
                 <Button variant="ghost" onClick={discardBusinessProfile}>
                   Discard
                 </Button>
               </div>
-              {businessProfileApplyStatus === "error" && businessProfileApplyError ? (
-                <ErrorMessage description={businessProfileApplyError} onRetry={() => setBusinessProfileApplyStatus("idle")} />
+              {businessProfileApply.status === "error" && businessProfileApply.error ? (
+                <ErrorMessage description={businessProfileApply.error} onRetry={businessProfileApply.reset} />
               ) : null}
             </div>
           ) : null}

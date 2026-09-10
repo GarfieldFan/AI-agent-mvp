@@ -20,6 +20,7 @@ import {
   type ChatSessionMessagesResult,
   type ChatSessionSummary,
 } from "@/lib/chat-sessions";
+import { useDebouncedSearch } from "@/lib/use-debounced-search";
 
 const SESSION_PAGE_SIZE = 20;
 const MESSAGE_PAGE_SIZE = 50;
@@ -106,24 +107,9 @@ export function ChatSessionViewerPanel() {
   const [total, setTotal] = React.useState(0);
   const [page, setPage] = React.useState(1);
   const [searchInput, setSearchInput] = React.useState("");
-  const [searchText, setSearchText] = React.useState("");
+  const searchText = useDebouncedSearch(searchInput, setPage);
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [openSessionId, setOpenSessionId] = React.useState<number | null>(null);
-
-  // Resets `page` in the SAME debounced callback that updates
-  // `searchText`, rather than a separate effect watching `searchText` —
-  // an effect that only exists to reset one piece of state whenever
-  // another derived value changes trips react-hooks/set-state-in-effect
-  // (see the root AGENTS.md's "Known gotchas" for this project's other
-  // hits of the same rule); folding both updates into one place avoids
-  // the pattern entirely instead of working around the lint rule.
-  React.useEffect(() => {
-    const id = window.setTimeout(() => {
-      setSearchText(searchInput);
-      setPage(1);
-    }, 300);
-    return () => window.clearTimeout(id);
-  }, [searchInput]);
 
   const refresh = React.useCallback(() => {
     listChatSessions({ limit: SESSION_PAGE_SIZE, offset: (page - 1) * SESSION_PAGE_SIZE, q: searchText || undefined })

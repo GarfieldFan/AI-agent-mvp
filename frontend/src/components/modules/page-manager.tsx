@@ -21,6 +21,7 @@ import {
   type PageVersionSummary,
 } from "@/lib/pages";
 import { slugify } from "@/lib/slug";
+import { useDebouncedSearch } from "@/lib/use-debounced-search";
 
 function viewHrefFor(slug: string) {
   return slug === "home" ? "/" : `/p/${encodeURIComponent(slug)}`;
@@ -130,7 +131,7 @@ export function PageManager({ refreshToken }: { refreshToken?: number } = {}) {
   const [total, setTotal] = React.useState(0);
   const [page, setPage] = React.useState(1);
   const [searchInput, setSearchInput] = React.useState("");
-  const [searchText, setSearchText] = React.useState("");
+  const searchText = useDebouncedSearch(searchInput, setPage);
   const [error, setError] = React.useState<string | null>(null);
   const [expandedSlug, setExpandedSlug] = React.useState<string | null>(null);
   const [deletingSlug, setDeletingSlug] = React.useState<string | null>(null);
@@ -147,14 +148,6 @@ export function PageManager({ refreshToken }: { refreshToken?: number } = {}) {
   const [newSlugInput, setNewSlugInput] = React.useState("");
   const [creating, setCreating] = React.useState(false);
   const [createError, setCreateError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    const id = window.setTimeout(() => {
-      setSearchText(searchInput);
-      setPage(1);
-    }, 300);
-    return () => window.clearTimeout(id);
-  }, [searchInput]);
 
   const load = React.useCallback(() => {
     listPages({ q: searchText || undefined, limit: PAGE_LIST_SIZE, offset: (page - 1) * PAGE_LIST_SIZE })
@@ -186,8 +179,11 @@ export function PageManager({ refreshToken }: { refreshToken?: number } = {}) {
       // ProductPanel's identical "new row sorts first" fix.
       if (page === 1 && !searchText) load();
       else {
+        // Clearing searchInput alone still clears the actual filter
+        // (searchText, debounced via useDebouncedSearch) within one
+        // debounce cycle — a brief, acceptable flicker for this
+        // low-frequency admin action, not worth a manual bypass.
         setSearchInput("");
-        setSearchText("");
         setPage(1);
       }
     } catch (err) {

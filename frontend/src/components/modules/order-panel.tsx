@@ -14,6 +14,7 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { Pagination } from "@/components/common/pagination";
 import { ApiError } from "@/lib/api";
 import { listOrders, listOrderStatusOptions, updateOrder, updateOrderItemServed, type Order } from "@/lib/orders";
+import { useDebouncedSearch } from "@/lib/use-debounced-search";
 
 const FALLBACK_STATUS_OPTIONS = ["received", "preparing", "ready", "delivered", "paid", "refunded"];
 const PAGE_SIZE = 20;
@@ -43,17 +44,15 @@ export function OrderPanel() {
   const [fieldErrorByOrder, setFieldErrorByOrder] = React.useState<Record<number, string>>({});
 
   const [searchInput, setSearchInput] = React.useState("");
-  const [searchText, setSearchText] = React.useState(""); // debounced
+  // Debounced (2026-08-20) — fires a server request per keystroke
+  // otherwise, wasteful for something that's just going to be
+  // superseded by the next keystroke a moment later. Page reset is
+  // handled by the separate effect below (not passed to
+  // useDebouncedSearch), since it also needs to fire for the status/open
+  // filters below, not just this search box.
+  const searchText = useDebouncedSearch(searchInput);
   const [statusFilter, setStatusFilter] = React.useState<string>("all");
   const [openFilter, setOpenFilter] = React.useState<"all" | "open" | "closed">("all");
-
-  // Debounce the search box (2026-08-20) — fires a server request per
-  // keystroke otherwise, wasteful for something that's just going to be
-  // superseded by the next keystroke a moment later.
-  React.useEffect(() => {
-    const id = window.setTimeout(() => setSearchText(searchInput), 300);
-    return () => window.clearTimeout(id);
-  }, [searchInput]);
 
   // Any filter change invalidates the current page — jump back to 1
   // rather than risk landing on a now-out-of-range offset.
