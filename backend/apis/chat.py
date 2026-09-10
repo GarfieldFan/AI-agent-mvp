@@ -839,10 +839,17 @@ def _order_extraction_system_prompt(active_order: Order | None) -> str:
         f"{progress_clause}"
         "Respond with ONLY a single JSON object, no markdown fences, no commentary before or after it:\n"
         '{"items": [{"item_phrase": "<plain product name/description the visitor mentioned, e.g. '
-        '\'latte\'>", "quantity_delta": <positive to add, negative to remove/reduce>}], "search_phrase": '
+        '\'latte\'>", "quantity_delta": <positive to add, negative to remove/reduce>, "comment": "<any '
+        'per-item customization the visitor mentioned for THIS item specifically, e.g. \'no sugar\', '
+        '\'extra spicy\', or null>"}], "search_phrase": '
         '"<plain text describing what the visitor is asking about, or null>", "pickup_time": "<what the '
         'visitor said about timing, e.g. "9am" or "in 5 minutes", or null>", "note": "<any special '
-        'instructions, or null>"}\n\n'
+        'instructions that apply to the WHOLE order rather than one item, or null>"}\n\n'
+        "If the SAME item is ordered multiple times with DIFFERENT per-item customizations (e.g. "
+        '"2 coffees, one of them with no sugar" — one plain, one customized), list them as SEPARATE '
+        "entries — one with quantity_delta 1 and the customization's own comment, another with "
+        "quantity_delta 1 and comment null — never merge them into a single entry with a combined "
+        "quantity, which would lose which unit gets the customization.\n\n"
         "Set search_phrase whenever the visitor asks what you have, asks about a category (e.g. "
         '"what coffee do you have"), or asks about specific products by name — even if you can already '
         "answer from context — a short phrase describing what they're asking about (e.g. \"coffee\", "
@@ -856,6 +863,14 @@ def _order_extraction_system_prompt(active_order: Order | None) -> str:
 class _ResolvedOrderItem:
     product: Product
     quantity_delta: int
+    # Per-item customization ("no sugar", "extra spicy", ...) — 2026-09-10,
+    # a real gap found simulating a dine-in order ("2 long blacks, one with
+    # no sugar"): apply_order_delta (cart.py) already merges by
+    # (product_id, comment), so two differently-customized units of the
+    # same product were ALWAYS meant to land as two distinct lines — the
+    # extraction call just never had a field to put the customization in,
+    # so it was silently dropped before ever reaching that logic.
+    comment: str | None = None
 
 
 @dataclass
@@ -939,9 +954,11 @@ def _resolve_order_turn(db: Session, parsed: dict | None, active_order: Order | 
                 continue
             if delta == 0:
                 continue
+            item_comment = raw_item.get("comment")
+            item_comment = item_comment.strip() if isinstance(item_comment, str) and item_comment.strip() else None
             matches = search_products(db, phrase, limit=_SEARCH_DISPLAY_CAP + 1)
             if len(matches) == 1:
-                resolved.append(_ResolvedOrderItem(product=matches[0], quantity_delta=delta))
+                resolved.append(_ResolvedOrderItem(product=matches[0], quantity_delta=delta, comment=item_comment))
             elif len(matches) > 1:
                 ambiguous.extend(matches[:_SEARCH_DISPLAY_CAP])
             # 0 matches: nothing resolved, nothing to show — the main
@@ -978,6 +995,7 @@ def _order_turn_context_block(active_order: Order | None, turn: OrderTurnResult)
         delta_total = sum(float(item.product.price) * item.quantity_delta for item in turn.resolved)
         lines = "; ".join(
             f"{item.quantity_delta:+d} {item.product.name} (${float(item.product.price):.2f} each)"
+            + (f" [{item.comment}]" if item.comment else "")
             for item in turn.resolved
         )
         parts.append(
@@ -1026,7 +1044,7 @@ def apply_resolved_order_turn(
             db.flush()  # populates order.id before apply_order_delta's OrderItem rows reference it
 
         for item in turn.resolved:
-            apply_order_delta(db, order, item.product, item.quantity_delta)
+            apply_order_delta(db, order, item.product, item.quantity_delta, comment=item.comment)
 
         if turn.pickup_time:
             order.pickup_time = turn.pickup_time

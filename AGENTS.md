@@ -1326,6 +1326,25 @@ not e-commerce checkout.
     that never passes a comment. Verified: adding the same product
     twice with the same comment merges to `quantity=2`; the same
     product with two different comments stays two separate rows.
+  - **Chat-driven ordering couldn't actually reach this comment-merge
+    capability until 2026-09-10** — `apply_order_delta`'s comment-aware
+    merge above was already live for `/cart`'s own manual per-line
+    comment editor, but `apis/chat.py`'s order-extraction call had no
+    per-item `comment` field in its own JSON schema at all, so a visitor
+    saying "2 long blacks, one with no sugar" in chat had the
+    customization silently dropped entirely — not merged incorrectly,
+    just never captured in the first place, found running a restaurant
+    simulation. Fixed by adding `comment` to the per-item extraction
+    schema (with an explicit instruction to emit differently-customized
+    units of the same product as SEPARATE entries, never one merged
+    quantity) and threading it through `_ResolvedOrderItem` into the
+    existing `apply_order_delta(..., comment=...)` call — no change
+    needed to `apply_order_delta`/`OrderPanel` themselves, both already
+    supported this correctly once the extraction layer actually supplied
+    it. Verified live: the identical "2 long blacks, one with no sugar"
+    message now correctly produces two distinct `OrderItem` rows (one
+    `comment: "no sugar"`, one `comment: None`), same $6.00 total either
+    way. `pytest` clean.
   - **`POST /api/cart/update` now targets `item_id`, not `product_id`**
     (a real, deliberate breaking change to that route) — once a product
     can have more than one cart line (different comments), `product_id`
