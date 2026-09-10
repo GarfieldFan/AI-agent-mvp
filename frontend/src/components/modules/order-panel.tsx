@@ -4,6 +4,7 @@ import * as React from "react";
 import { ShoppingCart } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -125,6 +126,35 @@ export function OrderPanel() {
     } catch (err) {
       setOrders((prev) => (prev ? prev.map((o) => (o.id === order.id ? { ...o, status: previous } : o)) : prev));
       setFieldErrorByOrder((prev) => ({ ...prev, [order.id]: err instanceof ApiError ? err.message : "Update failed." }));
+    }
+  }
+
+  // Refund (2026-09-10) — records a refund the owner already processed
+  // through their real payment provider's own dashboard; no refund API
+  // call happens here (see backend/apis/products.py's own docstring).
+  // A native confirm() is enough friction for this internal admin
+  // action, same posture as this app's other one-way state changes
+  // (CrmPanel's delete, PageManager's delete).
+  async function handleMarkRefunded(order: Order) {
+    if (!window.confirm(`Mark order #${order.id} ($${order.total_amount.toFixed(2)}) as refunded? Only do this after actually refunding the customer through your real payment provider.`)) {
+      return;
+    }
+    const previous = order.payment_status;
+    setOrders((prev) =>
+      prev ? prev.map((o) => (o.id === order.id ? { ...o, payment_status: "refunded" } : o)) : prev,
+    );
+    try {
+      await updateOrder(order.id, { mark_refunded: true });
+      setFieldErrorByOrder((prev) => {
+        const next = { ...prev };
+        delete next[order.id];
+        return next;
+      });
+    } catch (err) {
+      setOrders((prev) =>
+        prev ? prev.map((o) => (o.id === order.id ? { ...o, payment_status: previous } : o)) : prev,
+      );
+      setFieldErrorByOrder((prev) => ({ ...prev, [order.id]: err instanceof ApiError ? err.message : "Refund failed." }));
     }
   }
 
@@ -321,7 +351,14 @@ export function OrderPanel() {
                   </tbody>
                 </table>
               </div>
-              <p className="font-medium">Total: ${order.total_amount.toFixed(2)}</p>
+              <p className="flex items-center gap-2 font-medium">
+                Total: ${order.total_amount.toFixed(2)}
+                {order.payment_status === "paid" ? (
+                  <Button size="xs" variant="outline" onClick={() => handleMarkRefunded(order)}>
+                    Mark refunded
+                  </Button>
+                ) : null}
+              </p>
               {order.note ? <p className="text-muted-foreground">Note: {order.note}</p> : null}
               {order.contact_email ? <p className="text-muted-foreground">Contact: {order.contact_email}</p> : null}
               {order.shipping_address ? (

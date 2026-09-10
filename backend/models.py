@@ -927,11 +927,13 @@ class Order(Base):
     # set_order_status_options, so it can never be a trustworthy signal
     # for "did a real payment actually succeed." `payment_status` is
     # never owner-agent-writable — only POST /cart/checkout (for the
-    # "test" provider's synchronous skip) and POST /webhooks/stripe (for
-    # a real Stripe confirmation) ever set it. "unpaid" (default) ->
-    # "paid" | "failed"; "refunded" exists as a value this column can
-    # hold but nothing currently sets it — a real refund flow isn't
-    # built yet, see the root AGENTS.md.
+    # "test" provider's synchronous skip), POST /webhooks/stripe (for a
+    # real Stripe confirmation), and admin/owner's own PATCH
+    # /agent/orders/{id} `mark_refunded` (2026-09-10, only a "paid" order
+    # can transition to "refunded" — records a refund the owner already
+    # processed through their real payment provider, no refund API call
+    # happens here) ever set it. "unpaid" (default) -> "paid" | "failed"
+    # | "refunded".
     payment_status: Mapped[str] = mapped_column(String(16), default="unpaid", server_default="unpaid")
     payment_provider: Mapped[str | None] = mapped_column(String(32), default=None)
     # Stripe's own Checkout Session id — what POST /webhooks/stripe

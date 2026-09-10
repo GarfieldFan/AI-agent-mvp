@@ -2090,6 +2090,31 @@ that package is specifically AI providers, and payment isn't one.
   `is_open: False`, and `payment_reference` correctly captured from the
   event. `pytest` (21 tests) still clean after the fix.
 
+- **Manual refund recording, 2026-09-10 — closes a real silent-failure
+  trap the same e-commerce simulation caught.** `PATCH
+  /agent/orders/{id}` (`UpdateOrderRequest`) previously had no
+  `payment_status` field at all — so a caller that sent one got a
+  misleading `200` with zero effect (Pydantic silently drops an unknown
+  field), confirmed live before the fix. Now takes `mark_refunded: bool`
+  — deliberately not a general `payment_status` setter (which would let
+  an admin claim "paid" for an order that was never actually charged,
+  undermining `payment_status`'s own "trustworthy signal" design, see
+  `models.Order`'s docstring): the ONLY transition this allows is a
+  currently-`"paid"` order becoming `"refunded"`, and anything else
+  (already refunded, never paid) now 400s with a clear message instead
+  of silently no-op'ing. **This app still has no real refund
+  PROCESSING** — no API call to Stripe or any payment provider happens
+  here; it only records that the owner already refunded the customer
+  through their real payment provider's own dashboard. Fires the same
+  `notify_owner` notification the rest of this section already uses.
+  `OrderPanel` gained a "Mark refunded" button (shown only when
+  `payment_status === "paid"`, behind a native `confirm()`, optimistic
+  with rollback like every other control in that panel). Verified live:
+  refunding a real paid order correctly flips it to `"refunded"`;
+  refunding it again, and attempting to refund a `"failed"` order, both
+  correctly 400 with the exact rejection reason rather than silently
+  succeeding. `pytest`/`tsc`/`eslint`/a real production build all clean.
+
 ### Email + SMS gate (`backend/notifications.py`, `backend/apis/notifications.py`)
 
 Added 2026-08-20, same session as the payment gate above, on the user's

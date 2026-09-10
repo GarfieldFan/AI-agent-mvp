@@ -46,6 +46,10 @@ export type Order = {
 export type OrderUpdateInput = {
   status?: string;
   is_open?: boolean;
+  /** Refund (2026-09-10) — only valid on a currently `payment_status:
+   * "paid"` order; records a refund the owner already processed through
+   * their real payment provider, no refund API call happens here. */
+  mark_refunded?: boolean;
 };
 
 export type OrderListResult = {

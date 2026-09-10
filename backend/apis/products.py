@@ -584,13 +584,34 @@ def list_orders(
 class UpdateOrderRequest(BaseModel):
     status: str | None = None
     is_open: bool | None = None
+    # Refund (2026-09-10) — deliberately NOT a general payment_status
+    # setter (which would let an admin claim "paid" for an order that was
+    # never actually charged, undermining the whole "payment_status is a
+    # trustworthy signal" design — see models.Order's own docstring). The
+    # only manual transition this allows is a currently-"paid" order
+    # becoming "refunded", recording that a refund already happened
+    # through the owner's real payment processor (this app has no refund
+    # PROCESSING of its own — see the class docstring below). A real,
+    # previously-silent gap: this field used to not exist on this model
+    # at all, so PATCHing `payment_status` here was silently dropped by
+    # Pydantic (a misleading 200, no actual effect) — found and fixed
+    # after a real e-commerce simulation caught it.
+    mark_refunded: bool | None = None
 
 
 @admin_router.patch("/agent/orders/{order_id}", response_model=OrderSummary)
-def update_order(order_id: int, req: UpdateOrderRequest, db: Session = Depends(get_db)) -> OrderSummary:
+async def update_order(order_id: int, req: UpdateOrderRequest, db: Session = Depends(get_db)) -> OrderSummary:
     """Partial update — only the fields the caller actually sent change.
-    One endpoint for both controls (status label + is_open) since
-    OrderPanel adjusts them from the same row."""
+    One endpoint for status/is_open/refund controls since OrderPanel
+    adjusts them from the same row.
+
+    `mark_refunded=True` records that the owner already refunded this
+    order through their real payment processor's own dashboard (Stripe,
+    ...) — this app has no refund-processing capability of its own, no
+    API call to any payment provider happens here. Only valid on a
+    currently-`"paid"` order; anything else 400s with a clear message
+    rather than silently no-op'ing, which is exactly the trap the
+    previous (nonexistent) version of this field fell into."""
     row = db.get(Order, order_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Order not found.")
@@ -598,8 +619,21 @@ def update_order(order_id: int, req: UpdateOrderRequest, db: Session = Depends(g
         row.status = req.status
     if req.is_open is not None:
         row.is_open = req.is_open
+    if req.mark_refunded:
+        if row.payment_status != "paid":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Can't refund an order whose payment_status is '{row.payment_status}' — only a paid order can be marked refunded.",
+            )
+        row.payment_status = "refunded"
     db.commit()
     db.refresh(row)
+    if req.mark_refunded:
+        await notify_owner(
+            db,
+            f"[AI MVP] Order #{row.id} marked refunded",
+            f"Order #{row.id} (${float(row.total_amount):.2f}) was marked refunded in the dashboard.",
+        )
     return _to_order_summary(row)
 
 
