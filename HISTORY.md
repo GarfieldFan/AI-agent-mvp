@@ -3673,3 +3673,360 @@ entire `HISTORY.md` section is that narrative, moved here in full;
 facts (what each feature does, its confirmed scope, and a one-line
 pointer to this entry for any of the bug stories) as part of the same
 pass.
+
+## 2026-09-10 — Inventory, revenue report, document-to-structured-data, variable-price products
+
+This entry preserves the full narrative behind the condensed
+"Inventory, revenue report, document-to-structured-data, variable-price
+products" section of the current `AGENTS.md` — read that file first;
+come here only for the blow-by-blow behind the design decisions or the
+two real bugs found while verifying it live.
+
+### The ask
+
+Built all four together on the user's own explicit authorization
+("没有优先级，也不是特别难，就一起做了吧" — no priority, not that hard, build it
+all together) — the tail end of a conversational request the user framed
+as four things an owner should be able to say to the chatbot/owner-agent:
+"how's stock today," "what was yesterday's revenue," "here's a PDF of
+new products, add them," "here's a purchase order, adjust inventory."
+Each maps to one real tool/endpoint — per the user's own explicit
+instruction, "所以我需要每一个功能都配一个相应的工具" (every function needs its
+own tool).
+
+### Inventory design: one boolean-adjacent split, not two systems
+
+Per the user's own explicit constraint ("库存有一个内部一个是外部的，我们尽量看看是否用
+一个column区分他们，这样就不用多做或多建" — internal vs external inventory, try to
+use ONE column to distinguish them so nothing extra gets built), the
+actual design that shipped uses two existing/new columns on `Product`
+for external/sellable stock (already the natural home for "can a
+customer buy this") and one small new table, `StockItem`, for internal/
+raw-material stock — a genuinely different shape (ingredients have a
+name/quantity/unit, not a price/description/tags/availability), so
+forcing them into the same table would have meant a pile of nullable,
+sometimes-meaningless columns on `Product` instead of one clean split.
+This is the "minimum extra structure" reading of the user's own
+constraint: not literally one column across two concepts, but no
+*third* table, no duplicate CRUD framework, no duplicate propose-from-
+document pipeline — both stock types share the identical document-
+extraction primitive (`_extract_document_text`) and the identical
+propose-then-owner-applies posture `propose_products`/
+`propose_intent_schema` already established.
+
+`StockItem` is deliberately never automatically linked to
+`Product.stock_quantity` — no recipe/bill-of-materials system exists, a
+real, explicit scope cut confirmed by the user's own framing (asked to
+help "扩展一下" — round out the idea for edge cases — not to build a BOM
+engine): decrementing raw ingredients per sold finished product would
+need a recipe definition per product (how much milk in one latte) this
+app has no representation for and wasn't asked to build.
+
+Variable-price ("pay what you want") products round out the "internal
+vs external" inventory picture with a third real-world case the user
+raised directly: "客人输入金额的商品，比如小费、捐款等" (a customer-entered-amount
+item, like a tip or donation) — not inventory at all, but the same
+conversation, and genuinely the smallest possible addition:
+`Product.variable_price: bool` + reusing the already-existing
+`OrderItem.unit_price_snapshot` field to hold whatever amount the
+customer actually states, instead of inventing a new column.
+
+### A real gap found and closed during live verification
+
+The storefront's own `ProductCard`/`ProductDetail` "Add to cart" buttons
+never sent `unit_price` at all, and the public product read model
+(`PublicProductSummary`) never even exposed `variable_price` — so a
+visitor browsing directly (not through chat) could add a variable-price
+product to their cart, but it silently used the fixed default `price`,
+with no on-page indication they could have named their own amount. This
+closed a scope question flagged as explicitly unresolved earlier in the
+session ("does `/checkout`/product-detail need direct variable-price
+input, or is chat-only + admin-dashboard coverage enough for v1"). Fixed
+by adding `variable_price` to `PublicProductSummary` (not
+`stock_quantity`/`low_stock_threshold`, which stay admin-only — raw
+inventory counts aren't customer-facing data anywhere else in this app
+either) and adding a "Your amount ($)" input to both components,
+threaded through `lib/cart.ts`'s `addToCart`'s new optional `unitPrice`
+parameter.
+
+### Two real, load-bearing bugs found and fixed during live testing, not assumed correct from a static read of the code
+
+1. **`_extract_document_text` hardcoded `content_type="application/
+   pdf"` when calling `parse_document`** — `parse_document`'s own
+   dispatch checks `content_type == "application/pdf" OR filename ends
+   with .pdf` for its FIRST branch, so a hardcoded `"application/pdf"`
+   always won that branch regardless of the real uploaded file's actual
+   type. A genuine `.docx` purchase order was fed straight into
+   `PdfReader` and crashed with an unhandled `PdfStreamError` 500
+   instead of either parsing correctly or failing with a clean 400 —
+   found by uploading a real `.docx` test catalog and hitting the real
+   endpoint, not by code review alone. Fixed by passing an empty
+   `content_type`, so `parse_document`'s own filename-extension fallback
+   actually runs for every supported type (PDF/DOCX/text/Markdown), the
+   same way every other real caller of `parse_document` in this app
+   already relies on.
+2. **Both new endpoints reused `llm_json.parse_lenient_json`, which is
+   object-shaped (`{...}`) only** — but both prompts explicitly ask the
+   model for a top-level JSON ARRAY (`[{"name":...}, ...]`).
+   `parse_lenient_json`'s own `extract_json_object` slices between the
+   first `{` and the last `}`, which for an array response strips the
+   enclosing `[`/`]` entirely, leaving several comma-joined objects with
+   no wrapping brackets — invalid JSON, correctly rejected by strict
+   `json.loads`, and `json_repair`'s own fallback couldn't produce a
+   `dict` from it either (the function's own success check is
+   `isinstance(parsed, dict)`, a second, independent reason an array
+   response could never survive this parser even if repair "fixed" the
+   brackets). The result: a perfectly well-formed, correct array
+   response from the real configured LLM was silently discarded every
+   time, always producing "couldn't find anything that looked like a
+   product catalog" even when the model got it completely right —
+   caught only by capturing the raw LLM output via a live debug trace
+   and comparing it against what `parse_lenient_json` actually did with
+   it, since a direct in-process call to the same provider succeeded
+   while the identical code path through the running server didn't (the
+   real, live 27B model's own output was reproducibly correct across
+   repeated runs — the parser was the actual bug, not model flakiness).
+   Fixed by adding `extract_json_array`/`parse_lenient_json_array`
+   (`llm_json.py`) — the identical strict-then-repair tolerance, but
+   slicing between `[`/`]` and checking `isinstance(parsed, list)` —
+   and switching both `apis/products.py` call sites to it.
+   `parse_lenient_json` (object-shaped) is untouched and still used
+   exactly as before by every existing dict-shaped caller
+   (`apis/agent.py`'s page generation, `apis/chat.py`'s lead/order
+   extraction) — this was a genuinely new, array-shaped need this
+   feature introduced, not a latent bug in the pre-existing function
+   itself.
+
+### Verification
+
+Verified end-to-end against the real running stack, including the real,
+currently-configured local 27B `custom` chat model (not mocked):
+`StockItem` CRUD (create/list/update/delete) via direct HTTP calls; a
+real paid checkout (test provider) against a `stock_quantity`-tracked
+product correctly decremented stock and left it at/below its configured
+`low_stock_threshold` (notification path exercised, best-effort/
+swallowed as designed); a real revenue report (`POST
+/agent/reports/generate` with `report_type: "revenue"`) correctly
+reflected the real paid test order's total among the day's other real
+paid orders; variable-price ordering verified on BOTH surfaces — `POST
+/api/cart/add` with a real `unit_price` override (confirmed via `GET
+/api/cart` showing the exact stated amount, not the product's default
+price) and a real multi-turn `/api/chat` conversation ("I want to put 12
+dollars in the Zenith Donation Jar" — a deliberately unambiguous product
+name, after an earlier same-session attempt with collision-prone "Test"/
+"Donation"-named products correctly demonstrated the existing 2+-match
+disambiguation behavior instead of a bug) that produced a real
+`Order`/`OrderItem` row with `unit_price_snapshot == 12.00`, confirmed
+by a direct DB read, not just trusting the reply text. Both document-to-
+structured-data endpoints verified against real `.docx` files (a product
+catalog, a delivery receipt) processed by the real configured LLM end to
+end, both before AND after the two fixes above (the failure was
+reproduced first, then the fix confirmed against the identical file).
+`pytest` (21 fast tests), `tsc`, full-source `eslint`, and a real
+`docker compose run --rm frontend npm run build` all clean throughout.
+All test products, stock items, orders, chat sessions, and uploaded test
+files were removed afterward; nothing test-related was left in the dev
+DB or `storage/media/`.
+
+owner-agent tool count went from 22 (the last time this file's own count
+was updated, for the shipping-region tool) to 25 — the three new tools
+this round were `propose_products_from_document`, `list_stock_items`,
+`propose_stock_from_document`.
+
+## 2026-09-10 — "Owner talks, AI operates": closing owner-agent tool-coverage gaps + orchestration
+
+This entry preserves the full narrative behind the condensed "'Owner
+talks, AI operates'" section of the current `AGENTS.md` — read that file
+first; come here only for the blow-by-blow behind the timeout bug or the
+full live orchestration test transcript.
+
+### The design pivot: dropping the tooltip/navigation idea
+
+An earlier-floated idea (an owner-agent onboarding wizard with a
+tooltip/spotlight UI pointing at dashboard locations, plus conversational
+navigation that auto-jumps to the right dashboard tab) was explicitly
+dropped, not deferred, once discussed directly with the user. The user's
+own reasoning: in an AI-native platform, the AI should be the one
+performing the operation, not just pointing at where a human should click
+— if the AI actually does the edit, there's nothing left for a tooltip to
+point at; a plain chat reply ("I've changed the headline to X") already
+tells the owner what happened, more directly than an arrow ever could.
+
+This reframed the whole direction into one concrete question: does
+owner-agent's existing tool-calling loop actually cover what an owner
+would plausibly ask for in a real conversation — edit a page, search the
+knowledge base, write a document, and, the big one, "I want to sell
+watches, set up everything"? A related, separate discussion about how to
+keep the agent "smart" without token/time cost exploding as the platform
+grows settled on: don't preload everything into every prompt, let the
+agent look things up on demand (already the pattern `list_*` tools use
+for structured data) and reuse the existing RAG pipeline for the
+agent's own "how does this platform work" self-knowledge rather than
+inventing a new mechanism — informing the `search_knowledge` tool below.
+
+### Four gaps closed
+
+`search_knowledge` (`POST /agent/knowledge/search`) — owner-agent could
+read structured data (products, schemas, CRM) via its existing `list_*`
+tools, but had NO way to query the ingested RAG knowledge base at all —
+that was only ever wired into the public chatbot (`retrieval.py`'s
+`retrieve()`). Built as a thin wrapper calling the exact same
+`retrieve()` function with the exact same embedding-provider resolution
+`/api/chat` already uses — zero new retrieval mechanism, just a new
+authenticated entry point onto it.
+
+`create_document` (`POST /agent/documents/create-from-text`) — lets
+owner-agent save a document directly from text it composes ("write this
+policy down so it's searchable"), without needing an already-uploaded
+file. Deliberately NOT built by asking the model to produce base64 in
+its own tool-call JSON — same "a text-generation model shouldn't be
+asked to emit a binary encoding" reasoning `generate_landing_page_
+from_url` already established for images. `apis/documents.py`'s
+`ingest_document` (the base64-upload route) was refactored to share a
+new `_ingest_content()` helper with this one, rather than duplicating
+the parse/chunk/embed/store pipeline — the only real difference between
+the two routes is where the raw bytes come from.
+
+`suggest_business_profile` — registered as an owner-agent tool onto the
+already-existing `POST /agent/business-profile/suggest`, no backend
+change needed. Same propose-then-owner-applies posture as
+`propose_intent_schema`/`propose_products`, since a wrong phone number
+published as structured data has real consequences. `OwnerAgentPanel`
+gained a matching editable review card (name/type/description/email/
+phone/address fields, Apply/Discard) — the same pattern the schema/
+product/stock review cards already established. Fixed a small, real,
+adjacent bug while touching this code: `handleRun` reset
+`pendingProposal`/`pendingProducts` at the start of a new run but never
+`pendingStock`, so a stale stock-restock card from a PREVIOUS run could
+still be showing (and applicable) during/after a new, unrelated run —
+now reset alongside the rest.
+
+### `edit_page_field` and a real timeout bug
+
+`edit_page_field` (`POST /agent/pages/{slug}/ai-edit`) is a targeted
+single-instruction edit to an already-saved page (e.g. "change the
+homepage headline to X"), applied directly as a new `PageVersion` (never
+a propose-then-review step — a page edit is already one click from being
+undone via the dashboard's Page manager, same "cheap to reverse, so
+apply immediately" reasoning `set_order_status_options`/
+`set_shipping_allowed_regions` already use). Deliberately not the same
+mechanism as `ai_fill_content` (which needs a live CTE browser session
+and a client-computed field manifest) — this endpoint is fully
+self-contained, since owner-agent has no browser session to hand it one.
+
+The first cut asked the model to echo the WHOLE sections array back on
+every edit, same shape as `generate_landing_page`'s own response —
+against a real, only moderately large page (9 sections, ~8KB of JSON),
+this reliably timed out past 180s: regenerating every untouched section
+verbatim, token by token, doesn't scale for what should be a
+constant-cost edit, and gets linearly worse as a real page grows —
+exactly the kind of "predict everything up front instead of fetching
+what's needed" anti-pattern the earlier scaling discussion with the user
+was specifically about avoiding.
+
+Redesigned as a targeted diff: the page is still sent as context (the
+model needs to see what's there to know what to change), but the model
+only ever echoes back the `index` + full object of whichever section(s)
+it actually changed — every other section is copied through unchanged
+server-side, never regenerated. This alone fixed the timeout (confirmed:
+the identical instruction against the identical page went from a
+reliable 180s+ timeout to a normal response). Every named index is still
+validated (in range, same `type` as the original — a hallucinated
+restructure at one index is silently dropped, not applied) before
+`_coerce_sections` (the same validator `generate_landing_page` already
+relies on) runs over the result.
+
+Verified live against the real running stack and the real, currently-
+configured local 27B model, including its own real non-determinism — the
+identical instruction ("change the hero headline to...") against the
+identical 9-section real page succeeded cleanly twice (correct
+`changed_indices: [0]`, every other section byte-identical to before)
+and failed cleanly once (a clean 502 — `{"changes": []}` — no version
+written, nothing corrupted) across repeated runs, the same class of
+local-model output variance already documented in the entry above (the
+em-dash finding) — not a code bug, and a failure is always safe (never a
+silent wrong edit, never a corrupted save), matching `agent_loop.py`'s
+own "retry on a failed tool call" behavior. The test page was restored
+to its pre-test version afterward via the dashboard's own restore
+mechanism.
+
+### Turn/time budget and orchestration guidance
+
+Turn/time budget raised (`owner-agent/agent_loop.py`, `MAX_ITERATIONS`
+6→12, `RUN_TIMEOUT_SECONDS` 300→1200) — once tool coverage grew enough
+that a single real command ("I want to sell watches") can legitimately
+chain several calls (`list_intent_schemas` → `propose_intent_schema` →
+`suggest_business_profile` → optionally `generate_landing_page`/
+`propose_products_from_document`), the old 300s ceiling was already
+tight enough that ONE slow `generate_landing_page` call alone (which
+separately budgets up to 620s) could exceed the whole run's total budget
+and get the run cut off on the very next turn-boundary check, before the
+model got a chance to continue chaining the rest.
+
+Orchestration guidance added to `SYSTEM_PROMPT_TEMPLATE` tells the model
+to chain the relevant tools itself in one run when the owner describes a
+new business or asks for their whole site to be set up, rather than
+doing one step and stopping and making the owner ask for each piece
+separately: check `list_intent_schemas` first, propose an intent schema
+fitting the stated business, suggest a business profile, and (if a
+design image or reference documents were given) generate a landing page
+/ propose products or stock from them — then explain plainly what's
+ready to review-and-Apply versus what already took effect immediately.
+Explicitly told never to fabricate business-specific facts (a real
+address, a real price) that weren't given or found via
+`search_knowledge`/ingested documents.
+
+**Verified live, end-to-end, against the real running stack and the real
+local model** — command: "I want to build a website selling watches.
+Please set up the right structured data collection for customer
+inquiries and a business profile draft for this." The model correctly
+called `list_intent_schemas` FIRST (found only an unrelated
+`table_reservation` schema from earlier testing), then
+`propose_intent_schema` with a genuinely sensible `watch_inquiry` schema
+(watch of interest, contact name, email, budget range, notes) it wasn't
+hand-fed — no template existed for this, the model inferred appropriate
+fields for a watch retailer on its own — then automatically chained
+straight into `suggest_business_profile` without being asked again, and
+correctly reported the profile came back nearly empty because 0
+documents were ingested rather than inventing a plausible-sounding
+business name/address/phone. Finished in 4 turns with a final answer
+that clearly separated "ready to review and Apply" from "already took
+effect" and suggested the logical next step (upload real business
+documents, then re-run). The proposed schema's Apply path was separately
+verified by actually creating it via `POST /agent/intent-schemas` and
+confirming it round-tripped correctly, then deleting the test row.
+
+owner-agent tool count is now 29 — the four new tools this round are
+`search_knowledge`, `edit_page_field`, `create_document`, and
+`suggest_business_profile`.
+
+### Inline chart rendering
+
+The other half of a separate design discussion (should a report show up
+as a chart in the chat, or only in a separate dashboard section): the
+answer settled on BOTH, with the conversational path as the primary one
+and the dashboard's own `ReportPanel` staying as a secondary, optional
+browsing entry point (an owner who just wants to glance at numbers
+without asking shouldn't have to). The recharts rendering (`ReportPanel`'s
+own line chart — sessions/messages or revenue/orders per day) was
+extracted into a new shared `frontend/src/components/common/
+report-chart.tsx`, used by BOTH `ReportPanel` and `OwnerAgentPanel`'s
+step trace — a successful `generate_report` step now renders the actual
+chart inline in the conversation instead of a raw JSON blob, reusing
+recharts (already a dependency via `ReportPanel`) rather than
+introducing Chart.js or any other new charting library for a second,
+inconsistent look.
+
+### Documentation pass
+
+Same "整理一下文档" request pattern as the 2026-09-08 entry above: by this
+point in the session, both this section and the "Inventory, revenue
+report, document-to-structured-data, variable-price products" section of
+`AGENTS.md` had grown into long, narrative-heavy blocks (real bugs found
+and debugged live, full verification transcripts) — appropriate while
+actively building and verifying in real time, but exactly the content
+`AGENTS.md`'s own stated policy says belongs in `HISTORY.md` instead.
+Both entries above are that narrative, moved here in full; `AGENTS.md`'s
+own two sections were condensed back down to current-state facts (what
+each feature does, its confirmed scope, and a one-line pointer to the
+corresponding entry here) as part of the same pass.
