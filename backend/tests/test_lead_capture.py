@@ -4,13 +4,19 @@ be tested without a real model call (see apis/chat.py's
 `_lead_extraction_call`/`_apply_lead_capture` split, 2026-08-20). Feeds
 it an already-parsed dict directly, the same shape `_lead_extraction_call`
 would hand it after a real classification call.
+
+`_apply_lead_capture` became `async def` 2026-09-10 (it now calls
+`notify_owner` on a genuinely new CrmEntry) — these tests are `async def`
+too (pytest.ini's `asyncio_mode = auto` runs them without a decorator).
+`notify_owner` itself no-ops cleanly here since the test DB's
+`AppSettings.alert_email` is unset, so no network call happens.
 """
 
 from apis.chat import _apply_lead_capture
 from models import CrmEntry
 
 
-def test_apply_lead_capture_persists_wants_human(db_session):
+async def test_apply_lead_capture_persists_wants_human(db_session):
     """The human-handoff stub (models.CrmEntry.wants_human, 2026-08-20) —
     a fresh CrmEntry should pick up wants_human=True from the parsed
     extraction result. Uses the no-schema fallback path (schemas=[]),
@@ -22,7 +28,7 @@ def test_apply_lead_capture_persists_wants_human(db_session):
         "summary": "Wants to talk to a person.",
         "wants_human": True,
     }
-    _apply_lead_capture(db_session, parsed, message="please connect me to a human", schemas=[])
+    await _apply_lead_capture(db_session, parsed, message="please connect me to a human", schemas=[])
     db_session.flush()
 
     entry = (
@@ -31,7 +37,7 @@ def test_apply_lead_capture_persists_wants_human(db_session):
     assert entry.wants_human is True
 
 
-def test_apply_lead_capture_defaults_wants_human_false(db_session):
+async def test_apply_lead_capture_defaults_wants_human_false(db_session):
     """The other direction — an ordinary lead with no wants_human in the
     parsed result (or explicitly false) should not get flagged."""
     parsed = {
@@ -40,14 +46,14 @@ def test_apply_lead_capture_defaults_wants_human_false(db_session):
         "contact_email": "ordinary-test@example.com",
         "summary": "Wants a quote.",
     }
-    _apply_lead_capture(db_session, parsed, message="can I get a quote", schemas=[])
+    await _apply_lead_capture(db_session, parsed, message="can I get a quote", schemas=[])
     db_session.flush()
 
     entry = db_session.query(CrmEntry).filter_by(contact_email="ordinary-test@example.com").one()
     assert entry.wants_human is False
 
 
-def test_apply_lead_capture_uses_message_fallback_for_summary(db_session):
+async def test_apply_lead_capture_uses_message_fallback_for_summary(db_session):
     """Regression test for a real bug found 2026-08-20: `_apply_lead_capture`
     used to reference a `message` variable that wasn't one of its own
     parameters (a leftover from before it was split out of the combined
@@ -61,7 +67,7 @@ def test_apply_lead_capture_uses_message_fallback_for_summary(db_session):
         "contact_email": "summary-fallback-test@example.com",
         # no "summary" key at all — must not raise, must fall back to `message`
     }
-    _apply_lead_capture(
+    await _apply_lead_capture(
         db_session, parsed, message="this exact text should become the summary", schemas=[]
     )
     db_session.flush()

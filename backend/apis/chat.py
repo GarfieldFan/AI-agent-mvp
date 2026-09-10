@@ -110,6 +110,7 @@ from sqlalchemy.orm import Session, selectinload
 import chat_attachments
 from apis.deps import CurrentUser, get_current_user
 from apis.model_settings import resolve_chat_provider, resolve_embedding_provider
+from apis.notifications import notify_owner
 from apis.turnstile_settings import is_turnstile_enabled
 from cart import apply_order_delta, find_active_order, search_products
 from db import get_db
@@ -616,7 +617,7 @@ async def _lead_extraction_call(
         return None
 
 
-def _apply_lead_capture(
+async def _apply_lead_capture(
     db: Session,
     parsed: dict | None,
     message: str = "",
@@ -640,7 +641,10 @@ def _apply_lead_capture(
     A hit against `active_entry` (the same-session record `chat()`
     already looked up) merges new field values into it — UPDATE, not
     another INSERT — everything else is treated exactly like today: a
-    brand new CrmEntry."""
+    brand new CrmEntry, which now also fires `notify_owner` (2026-09-10 —
+    the same real gap found and fixed for order/payment events applies
+    identically to a chat-captured lead/reservation/claim; an in-progress
+    merge doesn't re-notify, only a genuinely new record does)."""
     if parsed is None:
         return
     schemas = schemas or []
@@ -700,22 +704,29 @@ def _apply_lead_capture(
                     active_entry.wants_human = True
                 db.commit()
             else:
-                db.add(
-                    CrmEntry(
-                        contact_email=contact_email.strip(),
-                        contact_name=contact_name.strip() if contact_name else None,
-                        contact_phone=contact_phone.strip() if contact_phone else None,
-                        summary=summary.strip(),
-                        category=matched_schema.key,
-                        tags=["source:chat"],
-                        attachment_url=attachment_url,
-                        intent_schema_id=matched_schema.id,
-                        collected_fields=new_fields,
-                        chat_session_id=chat_session_id,
-                        wants_human=wants_human,
-                    )
+                entry = CrmEntry(
+                    contact_email=contact_email.strip(),
+                    contact_name=contact_name.strip() if contact_name else None,
+                    contact_phone=contact_phone.strip() if contact_phone else None,
+                    summary=summary.strip(),
+                    category=matched_schema.key,
+                    tags=["source:chat"],
+                    attachment_url=attachment_url,
+                    intent_schema_id=matched_schema.id,
+                    collected_fields=new_fields,
+                    chat_session_id=chat_session_id,
+                    wants_human=wants_human,
                 )
+                db.add(entry)
                 db.commit()
+                db.refresh(entry)
+                await notify_owner(
+                    db,
+                    f"[AI MVP] New {matched_schema.label.lower()} from {entry.contact_email}",
+                    f"{entry.summary}\n\nCategory: {matched_schema.label}\nContact: {entry.contact_email}"
+                    + (f" / {entry.contact_phone}" if entry.contact_phone else "")
+                    + (f"\n\n{entry.collected_fields}" if entry.collected_fields else ""),
+                )
             return
 
         # No schema matched — either the owner hasn't configured any
@@ -727,20 +738,26 @@ def _apply_lead_capture(
         if category not in _LEAD_CATEGORIES:
             category = "inquiry" if not schemas else None
 
-        db.add(
-            CrmEntry(
-                contact_email=contact_email.strip(),
-                contact_name=contact_name.strip() if contact_name else None,
-                contact_phone=contact_phone.strip() if contact_phone else None,
-                summary=summary.strip(),
-                category=category,
-                tags=["source:chat"],
-                attachment_url=attachment_url,
-                chat_session_id=chat_session_id,
-                wants_human=wants_human,
-            )
+        entry = CrmEntry(
+            contact_email=contact_email.strip(),
+            contact_name=contact_name.strip() if contact_name else None,
+            contact_phone=contact_phone.strip() if contact_phone else None,
+            summary=summary.strip(),
+            category=category,
+            tags=["source:chat"],
+            attachment_url=attachment_url,
+            chat_session_id=chat_session_id,
+            wants_human=wants_human,
         )
+        db.add(entry)
         db.commit()
+        db.refresh(entry)
+        await notify_owner(
+            db,
+            f"[AI MVP] New {entry.category or 'lead'} from {entry.contact_email}",
+            f"{entry.summary}\n\nContact: {entry.contact_email}"
+            + (f" / {entry.contact_phone}" if entry.contact_phone else ""),
+        )
     except (ValueError, sqlalchemy.exc.SQLAlchemyError):
         db.rollback()
 
@@ -1577,7 +1594,7 @@ async def chat(
             raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
 
         lead_parsed = await lead_extraction_task
-        _apply_lead_capture(
+        await _apply_lead_capture(
             db,
             lead_parsed,
             message=req.message,

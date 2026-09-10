@@ -1928,6 +1928,39 @@ codebase before writing anything, not assumed.
   grow a `resolve_sms_provider` branch the same way if a real need shows
   up), no notification on a merely-*created*-but-still-open cart (only a
   finalized/paid order, or a genuine failure/rejection).
+- **Extended the same day to chat-captured leads/reservations/claims**
+  (`apis/chat.py`'s `_apply_lead_capture`) — running a restaurant
+  simulation surfaced the identical gap for the CRM side: a table
+  reservation captured via chat notified no one either, same root cause
+  (this function had no `notify_owner` caller, confirmed by grepping
+  before assuming). `_apply_lead_capture` became `async def` (it now
+  awaits `notify_owner`) — fires on a genuinely NEW `CrmEntry` (both the
+  schema-matched and the fixed-category-fallback creation paths), never
+  on a merge into an already-open record (an in-progress multi-turn
+  intake isn't a new event each turn). The three existing unit tests
+  (`test_lead_capture.py`, `test_injection_defense.py`) became `async
+  def` too (`pytest.ini`'s `asyncio_mode = auto` runs them with no
+  decorator needed) — `notify_owner` itself no-ops cleanly against the
+  test DB's unset `alert_email`, so no network call happens in tests.
+  **Verified live**: a real chat message ("book a table for 4... need a
+  high chair") against a real `table_reservation` `IntentSchema`
+  correctly created a `CrmEntry` with structured `collected_fields`
+  (`party_size`/`reservation_date`/`reservation_time`/
+  `special_requests`) and the request completed in ~31s with no crash
+  from the new `await` in the request path. **A real, useful side-finding
+  from the same test**: this dev DB had two stale `insurance_*`
+  `IntentSchema`s left over from much earlier testing — with those
+  configured, "book a table" correctly did NOT match either (a
+  restaurant reservation genuinely isn't an insurance claim), so
+  `is_lead` came back `false` and nothing was captured at all, even
+  though the reply text still sounded reassuring. Not a bug — the
+  classification was doing exactly what it should for a business whose
+  only configured schemas are insurance-related — but a sharp reminder
+  that leftover demo schemas/documents from a different vertical
+  actively change what the *next* vertical's chatbot will and won't
+  capture. Cleaned up (stale schemas deleted, a real `table_reservation`
+  schema created, a stale unrelated RAG document removed) before
+  re-testing. `pytest` clean after the async conversion.
 
 ### Payment gate (`backend/payments.py`, `backend/apis/payments.py`)
 
