@@ -7,6 +7,8 @@ provider pickers (email/SMS), write-only secrets, a test-send action
 per capability so an owner can verify real credentials actually work
 without needing to wire this into any business trigger first."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -24,7 +26,41 @@ from notifications import (
     TwilioSMSProvider,
 )
 
+logger = logging.getLogger("backend.notifications")
+
 router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
+
+
+async def notify_owner(db: Session, subject: str, body: str) -> None:
+    """Best-effort business-event notification (2026-09-10) — reuses the
+    exact same `AppSettings.alert_email` + `resolve_email_provider`
+    pattern `error_alerts.py`'s crash-alert path already established
+    (2026-09-09), extended here from "the backend crashed" to real
+    order/payment events (a new paid order, a failed payment, a
+    region-blocked checkout — see the callers in apis/products.py and
+    apis/payments.py). No new settings field, no new provider, no new
+    component — an owner who already set `alert_email` for crash alerts
+    gets order notifications there too; one who hasn't configured email
+    at all gets a clean no-op via `TestEmailProvider`.
+
+    Unlike error_alerts.py's crash alerts, deliberately no cooldown here
+    — each of these is a genuinely distinct business event worth its own
+    notification, not a repeating failure to throttle. Never raises —
+    every failure mode (not configured, bad credentials, a real send
+    rejection) is caught and logged, exactly mirroring
+    error_alerts.py's own `_maybe_send_alert`, since a notification
+    failure must never be why an order/checkout call itself fails."""
+    row = db.get(AppSettings, 1)
+    alert_email = row.alert_email if row else None
+    if not alert_email or not is_email_configured(db):
+        return
+    try:
+        _name, provider = resolve_email_provider(db)
+        await provider.send_email(alert_email, subject, body)
+    except NotificationProviderNotConfigured as e:
+        logger.error("Order-event notification email was not sent: %s", e)
+    except Exception:
+        logger.exception("Failed to send an order-event notification email")
 
 
 def resolve_email_provider(db: Session) -> tuple[str, EmailProvider]:

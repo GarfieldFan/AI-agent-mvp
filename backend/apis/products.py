@@ -45,6 +45,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from apis.chat import _get_or_create_session
 from apis.deps import Role, require_role
+from apis.notifications import notify_owner
 from apis.payments import resolve_payment_provider
 from cart import apply_order_delta, count_search_products, find_active_order, search_products
 from db import get_db
@@ -973,6 +974,13 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
         settings_row = db.get(AppSettings, 1)
         allowed = settings_row.shipping_allowed_regions if settings_row else None
         if allowed and effective_region.strip().lower() not in [r.strip().lower() for r in allowed]:
+            await notify_owner(
+                db,
+                f"[AI MVP] Order #{order.id} blocked — unsupported shipping region",
+                f"A visitor tried to check out order #{order.id} (${float(order.total_amount):.2f}) "
+                f"to '{effective_region.strip()}', which isn't on the configured shipping-allowed-regions "
+                f"list. Checkout was blocked — the cart is still open if they want to try a different region.",
+            )
             raise HTTPException(
                 status_code=400,
                 detail=f"Sorry, we don't currently ship to '{effective_region.strip()}'.",
@@ -1015,4 +1023,21 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
         order.is_open = False
     db.commit()
     db.refresh(order)
+
+    if result.already_paid:
+        # A real Stripe order isn't "placed" yet at this point — payment
+        # hasn't happened, just a Checkout Session was created — so that
+        # notification belongs on the webhook's own paid branch instead
+        # (apis/payments.py's stripe_webhook), not here.
+        await notify_owner(
+            db,
+            f"[AI MVP] New order #{order.id} — ${float(order.total_amount):.2f}",
+            f"Order #{order.id} was placed and paid ({provider_name}).\n\n"
+            + "\n".join(f"{i.quantity}x {i.item_name_snapshot}" for i in order.items)
+            + f"\n\nTotal: ${float(order.total_amount):.2f}"
+            + (f"\nContact: {order.contact_email}" if order.contact_email else "")
+            + (f"\nPickup/delivery: {order.pickup_time}" if order.pickup_time else "")
+            + (f"\nShip to: {order.shipping_address}" if order.shipping_address else ""),
+        )
+
     return CheckoutResponse(order=_to_order_summary(order), client_secret=result.client_secret)

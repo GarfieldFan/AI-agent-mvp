@@ -1864,6 +1864,71 @@ not something that needs Google Maps/a real address-geocoding API.
   that prompted this (can an order be blocked from a region at
   checkout?) needed one.
 
+### Order-event notifications (`apis/notifications.py`'s `notify_owner`)
+
+Added the same day, off a real gap surfaced while planning an e-commerce
+simulation: this app's email/SMS send capability existed
+(`notifications.py`) but, before this, had exactly three callers — the
+CRM-resume-code email, the owner's own test-send buttons, and
+`error_alerts.py`'s crash-alert path (genuinely unhandled exceptions
+only). **No business event — a new order, a failed payment, a
+region-blocked checkout — ever notified anyone.** Confirmed by grepping
+every caller of `resolve_email_provider`/`resolve_sms_provider` in the
+codebase before writing anything, not assumed.
+
+- **`notify_owner(db, subject, body)`** (`apis/notifications.py`) — reuses
+  `AppSettings.alert_email` + `resolve_email_provider`, the exact same
+  pattern `error_alerts.py`'s `_maybe_send_alert` already established, so
+  an owner who already set `alert_email` for crash alerts gets order
+  notifications at the same address with zero extra configuration. No
+  new settings field, no new provider, no new component. Unlike crash
+  alerts, deliberately **no cooldown** — each order/payment event is a
+  distinct thing worth its own notification, not a repeating failure to
+  throttle. Never raises — every failure mode (not configured, bad
+  credentials, a real send rejection) is caught and logged, mirroring
+  `_maybe_send_alert` exactly, since a notification failure must never be
+  why a checkout call itself fails.
+- **Three call sites, all in already-existing code paths**: `checkout_cart`
+  (`apis/products.py`) fires on a synchronously-paid order (the "test"
+  payment provider) and on a region-blocked checkout rejection; the
+  Stripe webhook (`apis/payments.py`'s `stripe_webhook`) fires on
+  `checkout.session.completed` (a real paid order) and on
+  `checkout.session.async_payment_failed`/`expired` (a failed payment) —
+  the two payment-provider paths needed separate hooks since a Stripe
+  order isn't actually "placed" at `checkout_cart` return time, only once
+  the webhook confirms payment.
+- **Verified live against the real running stack, including a genuine
+  Mailgun rejection** (same verification pattern already established for
+  `error_alerts.py`): with no `alert_email` configured, a real checkout
+  correctly triggered no send attempt at all (silent no-op, confirmed via
+  a direct Python invocation of `notify_owner` showing `is_email_configured`
+  gates it). With a real `alert_email` + a fake-but-complete Mailgun
+  config set, a direct invocation of `notify_owner` reached Mailgun's
+  real production API and got a genuine "Forbidden" rejection, correctly
+  caught and logged rather than raised — and a real checkout through the
+  actual HTTP path (not just the direct invocation) still returned 200
+  successfully while this happened in the background, confirming a
+  notification failure can never break the underlying order. **A real,
+  pre-existing, unrelated gap found while verifying this**: neither this
+  nor `error_alerts.py`'s own already-shipped `logger.error`/
+  `logger.exception` calls reliably show up in `docker compose logs`
+  output in this dev environment — confirmed NOT a regression by
+  triggering `error_alerts.py`'s own pre-existing `POST
+  /agent/error-log/test` fresh and seeing the identical absence; the
+  actual persisted-record path (`GET /agent/error-log`, reading the
+  JSONL file directly) DID correctly show the fresh entry, confirming
+  this is a stdout/docker-logs visibility quirk specific to this
+  sandboxed environment, not a functional bug in either code path.
+  Settings restored to their original clean "test" state after
+  verification. `pytest` clean.
+- **Deliberately not built**: no per-event on/off toggles (a new order
+  always notifies if `alert_email` is set — an owner who wants finer
+  control has the existing test-mode/real-provider switch as the coarse
+  on/off), no SMS equivalent (email only, for now — `notify_owner` could
+  grow a `resolve_sms_provider` branch the same way if a real need shows
+  up), no notification on a merely-*created*-but-still-open cart (only a
+  finalized/paid order, or a genuine failure/rejection).
+
 ### Payment gate (`backend/payments.py`, `backend/apis/payments.py`)
 
 Added 2026-08-20, on the user's own explicit ask: "接一个pay gate接口，可以接

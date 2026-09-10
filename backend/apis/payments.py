@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 import stripe
 from apis.deps import Role, require_role
+from apis.notifications import notify_owner
 from db import get_db
 from models import AppSettings, Order
 from payments import (
@@ -143,6 +144,17 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)) -> Non
                 order.payment_reference = session.get("id")
                 order.is_open = False
                 db.commit()
+                db.refresh(order)
+                await notify_owner(
+                    db,
+                    f"[AI MVP] New order #{order.id} — ${float(order.total_amount):.2f}",
+                    f"Order #{order.id} was placed and paid (stripe).\n\n"
+                    + "\n".join(f"{i.quantity}x {i.item_name_snapshot}" for i in order.items)
+                    + f"\n\nTotal: ${float(order.total_amount):.2f}"
+                    + (f"\nContact: {order.contact_email}" if order.contact_email else "")
+                    + (f"\nPickup/delivery: {order.pickup_time}" if order.pickup_time else "")
+                    + (f"\nShip to: {order.shipping_address}" if order.shipping_address else ""),
+                )
     elif event["type"] in ("checkout.session.async_payment_failed", "checkout.session.expired"):
         session = event["data"]["object"]
         order_id = session.get("client_reference_id")
@@ -151,6 +163,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)) -> Non
             if order is not None and order.payment_status == "unpaid":
                 order.payment_status = "failed"
                 db.commit()
+                await notify_owner(
+                    db,
+                    f"[AI MVP] Payment failed — order #{order.id}",
+                    f"Order #{order.id} (${float(order.total_amount):.2f}) failed to pay via Stripe "
+                    f"({event['type']}). The order is still open in case the visitor wants to retry.",
+                )
     # Every other event type is silently ignored — this endpoint only
     # cares about a Checkout Session's own payment outcome.
 
