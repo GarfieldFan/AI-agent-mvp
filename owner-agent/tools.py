@@ -267,6 +267,19 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="PUT",
         path="/api/agent/order-status-options",
     ),
+    "set_shipping_allowed_regions": ToolSpec(
+        name="set_shipping_allowed_regions",
+        description=(
+            "Sets which regions (state/province/zip-prefix — whatever the owner actually says, plain "
+            'text) checkout is allowed for. Args: {"allowed_regions": ["<region>", ...]}. An empty list '
+            "means no restriction — any region can check out (the default, same as never configuring "
+            "this). This applies immediately (like set_order_status_options), since it's cheap for the "
+            "owner to adjust with a follow-up command. Only ever gates a checkout that actually states a "
+            "shipping region — a dine-in/pickup business should generally leave this unconfigured."
+        ),
+        method="PUT",
+        path="/api/agent/shipping-settings",
+    ),
     "generate_landing_page": ToolSpec(
         name="generate_landing_page",
         description=(

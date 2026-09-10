@@ -324,6 +324,12 @@ export function OrderPanel() {
               <p className="font-medium">Total: ${order.total_amount.toFixed(2)}</p>
               {order.note ? <p className="text-muted-foreground">Note: {order.note}</p> : null}
               {order.contact_email ? <p className="text-muted-foreground">Contact: {order.contact_email}</p> : null}
+              {order.shipping_address ? (
+                <p className="text-muted-foreground">Ship to: {order.shipping_address}</p>
+              ) : null}
+              {order.shipping_region ? (
+                <p className="text-muted-foreground">Shipping region: {order.shipping_region}</p>
+              ) : null}
               {!order.status ? <Badge variant="outline" className="text-xs">no status set</Badge> : null}
             </div>
           </details>

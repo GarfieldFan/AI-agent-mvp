@@ -38,6 +38,8 @@ export function CheckoutPage() {
   const [name, setName] = React.useState("");
   const [pickupTime, setPickupTime] = React.useState("");
   const [note, setNote] = React.useState("");
+  const [shippingAddress, setShippingAddress] = React.useState("");
+  const [shippingRegion, setShippingRegion] = React.useState("");
 
   const [placing, setPlacing] = React.useState(false);
   const [placeError, setPlaceError] = React.useState<string | null>(null);
@@ -64,6 +66,8 @@ export function CheckoutPage() {
         setName(result?.contact_name ?? "");
         setPickupTime(result?.pickup_time ?? "");
         setNote(result?.note ?? "");
+        setShippingAddress(result?.shipping_address ?? "");
+        setShippingRegion(result?.shipping_region ?? "");
         setLoadError(null);
       })
       .catch((err) => setLoadError(err instanceof ApiError ? err.message : "Couldn't load your cart."));
@@ -78,6 +82,8 @@ export function CheckoutPage() {
         contact_name: name.trim() || null,
         pickup_time: pickupTime.trim() || null,
         note: note.trim() || null,
+        shipping_address: shippingAddress.trim() || null,
+        shipping_region: shippingRegion.trim() || null,
       });
       if (result.client_secret) {
         setCheckoutClientSecret(result.client_secret);
@@ -183,6 +189,14 @@ export function CheckoutPage() {
           <div className="space-y-1">
             <Label className="text-xs text-muted-foreground">Note (optional)</Label>
             <Textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2} />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">Shipping address (optional)</Label>
+            <Input value={shippingAddress} onChange={(e) => setShippingAddress(e.target.value)} placeholder="Street, city, ..." />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">Shipping region (optional)</Label>
+            <Input value={shippingRegion} onChange={(e) => setShippingRegion(e.target.value)} placeholder="e.g. California, Ontario" />
           </div>
         </CardContent>
       </Card>

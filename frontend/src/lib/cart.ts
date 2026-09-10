@@ -50,6 +50,10 @@ export type Cart = {
   is_open: boolean;
   pickup_time: string | null;
   note: string | null;
+  /** Shipping (2026-09-10) — both null unless the checkout form actually
+   * collected them (every dine-in/pickup order leaves these unset). */
+  shipping_address: string | null;
+  shipping_region: string | null;
   total_amount: number;
   /** Payment gate (2026-08-20, backend/payments.py) — "unpaid" (default)
    * -> "paid" | "failed"; "refunded" is a valid value but nothing sets it
@@ -95,6 +99,11 @@ export type CheckoutInput = {
   contact_name?: string | null;
   pickup_time?: string | null;
   note?: string | null;
+  /** Shipping (2026-09-10) — optional; only meaningful when the owner has
+   * configured a shipping_allowed_regions restriction (backend/apis/
+   * products.py's checkout_cart) or simply wants it on record. */
+  shipping_address?: string | null;
+  shipping_region?: string | null;
 };
 
 export type CheckoutResult = {

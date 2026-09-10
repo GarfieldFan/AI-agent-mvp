@@ -425,6 +425,39 @@ def set_order_status_options(req: OrderStatusOptionsPayload, db: Session = Depen
     return OrderStatusOptionsResponse(status_options=row.order_status_options)
 
 
+# --- Shipping-allowed-regions (owner-agent-set, 2026-09-10) --------------
+# Mirrors order_status_options above exactly — same "null/empty means no
+# restriction" posture, same "no manual dashboard editor, owner-agent
+# only" v1 scope. See checkout_cart's own docstring for how this is used.
+
+
+class ShippingRegionsPayload(BaseModel):
+    allowed_regions: list[str]
+
+
+class ShippingRegionsResponse(BaseModel):
+    allowed_regions: list[str]
+
+
+@admin_router.get("/agent/shipping-settings", response_model=ShippingRegionsResponse)
+def get_shipping_settings(db: Session = Depends(get_db)) -> ShippingRegionsResponse:
+    row = db.get(AppSettings, 1)
+    return ShippingRegionsResponse(allowed_regions=(row.shipping_allowed_regions if row else None) or [])
+
+
+@admin_router.put("/agent/shipping-settings", response_model=ShippingRegionsResponse)
+def set_shipping_settings(req: ShippingRegionsPayload, db: Session = Depends(get_db)) -> ShippingRegionsResponse:
+    row = db.get(AppSettings, 1)
+    if row is None:
+        row = AppSettings(id=1)
+        db.add(row)
+    # An empty list means "no restriction" — same as never having
+    # configured it, not "block everything."
+    row.shipping_allowed_regions = req.allowed_regions or None
+    db.commit()
+    return ShippingRegionsResponse(allowed_regions=row.shipping_allowed_regions or [])
+
+
 # --- Order viewing/management (admin) ------------------------------------
 
 
@@ -447,6 +480,8 @@ class OrderSummary(BaseModel):
     is_open: bool
     pickup_time: str | None
     note: str | None
+    shipping_address: str | None
+    shipping_region: str | None
     total_amount: float
     # Payment gate (2026-08-20, backend/payments.py) — see models.Order's
     # own docstring for why this is separate from `status` above.
@@ -465,6 +500,8 @@ def _to_order_summary(row: Order) -> OrderSummary:
         is_open=row.is_open,
         pickup_time=row.pickup_time,
         note=row.note,
+        shipping_address=row.shipping_address,
+        shipping_region=row.shipping_region,
         total_amount=float(row.total_amount),
         payment_status=row.payment_status,
         payment_provider=row.payment_provider,
@@ -880,6 +917,12 @@ class CheckoutRequest(BaseModel):
     contact_name: str | None = None
     pickup_time: str | None = None
     note: str | None = None
+    # Shipping (2026-09-10) — both optional; a dine-in/pickup checkout
+    # simply never sends them, and shipping_region only ever gates
+    # checkout when the owner has actually configured
+    # AppSettings.shipping_allowed_regions (see checkout_cart below).
+    shipping_address: str | None = None
+    shipping_region: str | None = None
 
 
 class CheckoutResponse(BaseModel):
@@ -907,11 +950,33 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
     `POST /webhooks/stripe` for a real Stripe payment, since a visitor
     can close the tab right after paying and before the embedded
     checkout's own return trip completes. 400s on an empty/missing cart
-    rather than creating an empty Order — nothing to check out."""
+    rather than creating an empty Order — nothing to check out.
+
+    **Shipping-region gate (2026-09-10)** — deterministic Python, no
+    third-party geocoding: if the owner has configured
+    `AppSettings.shipping_allowed_regions` (a plain owner-typed list, see
+    `set_shipping_allowed_regions`) AND this checkout states a
+    `shipping_region`, the region is matched case-insensitively against
+    that list before any payment is even attempted. Checked BEFORE
+    mutating the order, so a rejected checkout never partially persists
+    contact/shipping fields. A checkout with no `shipping_region` at all
+    (every dine-in/pickup order, and any e-commerce order placed before
+    this field existed) is unaffected regardless of configuration —
+    this only ever gates an order that actually states a region."""
     session = _get_or_create_session(db, req.session_id, None)
     order = find_active_order(db, session.id)
     if order is None or not order.items:
         raise HTTPException(status_code=400, detail="Your cart is empty — nothing to check out.")
+
+    effective_region = req.shipping_region if req.shipping_region is not None else order.shipping_region
+    if effective_region and effective_region.strip():
+        settings_row = db.get(AppSettings, 1)
+        allowed = settings_row.shipping_allowed_regions if settings_row else None
+        if allowed and effective_region.strip().lower() not in [r.strip().lower() for r in allowed]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sorry, we don't currently ship to '{effective_region.strip()}'.",
+            )
 
     if req.contact_email is not None:
         order.contact_email = req.contact_email.strip() or None
@@ -921,6 +986,10 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
         order.pickup_time = req.pickup_time.strip() or None
     if req.note is not None:
         order.note = req.note.strip() or None
+    if req.shipping_address is not None:
+        order.shipping_address = req.shipping_address.strip() or None
+    if req.shipping_region is not None:
+        order.shipping_region = req.shipping_region.strip() or None
     db.commit()
     db.refresh(order)
 

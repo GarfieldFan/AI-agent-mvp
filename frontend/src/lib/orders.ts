@@ -27,6 +27,11 @@ export type Order = {
   is_open: boolean;
   pickup_time: string | null;
   note: string | null;
+  /** Shipping (2026-09-10) — both null for a dine-in/pickup order that
+   * never collects them. shipping_region is what checkout matches
+   * against the owner's configured shipping_allowed_regions, if any. */
+  shipping_address: string | null;
+  shipping_region: string | null;
   total_amount: number;
   /** Payment gate (2026-08-20, backend/payments.py) — "unpaid" | "paid" |
    * "failed" | "refunded" (nothing sets "refunded" yet). Deliberately

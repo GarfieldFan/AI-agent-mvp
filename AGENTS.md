@@ -93,7 +93,7 @@ ai-employee/
 │       └── deps.py            RBAC: Role enum + require_role() dependency, backed by real JWTs
 ├── owner-agent/               isolated LLM tool-calling loop, own container/port 8100 — see "Owner agent" below
 │   ├── deps.py                 owner-only JWT check (duplicated from backend, not imported — see below)
-│   ├── tools.py                 fixed 21-tool allowlist + execute_tool() (HTTP calls onto backend)
+│   ├── tools.py                 fixed 22-tool allowlist + execute_tool() (HTTP calls onto backend)
 │   ├── agent_loop.py             the loop itself: JSON-envelope tool selection against Ollama
 │   ├── logging_.py                action log: stdout + logs/runs.jsonl (never the bearer token)
 │   └── main.py                  FastAPI app: GET /health, POST /run
@@ -359,7 +359,7 @@ belongs in a separate, narrowly-scoped worker.
 
 That worker now exists: **`owner-agent/`** (its own docker-compose
 service, port 8100). It's a real LLM tool-calling loop — the owner types a
-command, a local Ollama model decides which of a fixed 21-tool allowlist to
+command, a local Ollama model decides which of a fixed 22-tool allowlist to
 call, in what order, chaining results turn-to-turn (see "Owner agent" in
 Phase 6 below for the full design). It independently re-verifies the
 caller's JWT and requires `Role.owner` specifically (stricter than
@@ -1792,6 +1792,77 @@ not e-commerce checkout.
   a 6-match browse ("what coffee drinks do you have?" → a `/search`
   link, not inline cards) — plus the cart-add/chat cross-surface test
   and the custom-fields/image/bundle round-trip described above.
+
+### Shipping + regional restriction (`backend/apis/products.py`)
+
+Added 2026-09-10, off a real gap the user noticed while planning an
+e-commerce simulation test: an `Order` had no concept of a shipping
+address or a region-based delivery restriction at all. Deliberately built
+as a small extension of the *existing* Order/checkout/AppSettings shapes
+rather than a new provider abstraction or third-party geocoding
+integration — a direct, explicit call from the user ("我做这个项目的目的就是
+轻量和万能组件，所以能不改就不改，现在有什么可以组合一起用就用什么" — this
+project's whole point is staying lightweight and reusing generic
+mechanisms, so change as little as possible and combine what already
+exists). "Shipping possible or not" is a plain region-allow-list check,
+not something that needs Google Maps/a real address-geocoding API.
+
+- **`Order.shipping_address`/`shipping_region`** — two new nullable
+  columns, same "just store what was typed, don't parse it" posture as
+  `pickup_time`/`note` already have. Both stay `null` for a dine-in/
+  pickup order that never collects them — zero behavior change for every
+  existing use of checkout.
+- **`AppSettings.shipping_allowed_regions`** — a plain owner-typed
+  `list[str]` (JSONB), same "null/empty means no restriction" posture as
+  every other gate in this app. Deliberately mirrors
+  `order_status_options` byte-for-byte in shape: a `GET`/`PUT
+  /agent/shipping-settings` pair (`apis/products.py`) with **no manual
+  dashboard editor in v1** — same posture as `order_status_options`
+  itself having none — reachable via a direct API call or, more
+  realistically, owner-agent's new `set_shipping_allowed_regions` tool
+  (owner-agent now 22 tools), which mirrors `set_order_status_options`
+  exactly (applies immediately, no propose-then-apply step, since a
+  region list is cheap to adjust with a follow-up command).
+- **The actual gate lives in `checkout_cart` (`POST /cart/checkout`)** —
+  deterministic Python, no LLM, no third-party API: if
+  `shipping_allowed_regions` is configured AND the checkout states a
+  `shipping_region`, that region is matched case-insensitively against
+  the list before anything else happens (before even resolving the
+  payment provider) — a blocked region 400s with a clear message and
+  never touches the order's stored fields at all (checked before the
+  mutation, not after), so a rejected checkout can't leave a
+  partially-written order behind. A checkout with no `shipping_region`
+  at all is completely unaffected regardless of configuration — this
+  only ever gates an order that actually states a region, so a
+  restaurant/dine-in business that never configures or collects this is
+  untouched.
+- **`OrderSummary`/`OrderPanel`** gained the two fields for admin
+  visibility (plain read-only lines, same pattern as the existing
+  `note`/`contact_email` display) — no new settings UI, no new panel
+  file, folded directly into the existing `OrderPanel`/`checkout-page.tsx`
+  components rather than creating new ones.
+- **Verified live end-to-end against the real running stack**: `GET
+  /agent/shipping-settings` defaults to `{"allowed_regions": []}`; `PUT`
+  with `["California", "New York"]` round-trips correctly; a real
+  add-to-cart + checkout with `shipping_region: "Texas"` correctly 400s
+  ("Sorry, we don't currently ship to 'Texas'.") with the order left
+  unmodified; the identical cart with `shipping_region: "california"`
+  (lowercase, confirming the case-insensitive match) correctly succeeds
+  and persists `shipping_address`/`shipping_region`; a checkout with no
+  shipping fields at all (the dine-in/pickup shape) succeeds regardless
+  of the configured restriction. The owner-agent tool was verified with
+  a real run — "Set the allowed shipping regions to California, New
+  York, and Washington" correctly called `set_shipping_allowed_regions`
+  with the right args and the change was confirmed persisted via a
+  follow-up `GET`. `pytest`/`tsc`/`eslint`/a real production build all
+  clean.
+- **Deliberately not built**: no real address validation/geocoding (a
+  region is just a string the visitor types, matched against another
+  list of strings the owner types), no shipping-cost calculation, no
+  carrier integration. If a real address-geocoding need shows up later,
+  this is the extension point — but nothing about the actual finding
+  that prompted this (can an order be blocked from a region at
+  checkout?) needed one.
 
 ### Payment gate (`backend/payments.py`, `backend/apis/payments.py`)
 
@@ -4784,7 +4855,7 @@ considering it fully settled.
 - **Phase 6 — Agent security layer**: **started, not complete**. The
   isolated worker now exists — `owner-agent/` (own container/port 8100,
   see "Architecture decisions" above and "Owner agent" below) — with a
-  real LLM tool-calling loop over a fixed 21-tool allowlist, its own
+  real LLM tool-calling loop over a fixed 22-tool allowlist, its own
   owner-only auth check, and action logging to stdout + a bind-mounted
   `logs/runs.jsonl` (per-step, durable). The worker's "brain" model
   selection is now wired to the owner-facing model picker too
@@ -4808,7 +4879,7 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 21 tools (`generate_poster`,
+  envelope: either call one of 22 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
   `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
@@ -4817,7 +4888,8 @@ this is the one place the model itself decides which action(s) to take.
   `list_products`, `propose_products`, `set_order_status_options`,
   `ingest_documents_from_url`, `list_scheduled_tasks`,
   `manage_scheduled_task`, `check_seo_schema` (2026-09-08, see "GEO push
-  part 2" above) — each
+  part 2" above), `set_shipping_allowed_regions` (2026-09-10, see
+  "Shipping + regional restriction" below) — each
   a thin HTTP call onto an already-real `backend/apis/agent.py`/
   `apis/intent_schemas.py`/`apis/products.py`/`apis/documents.py`/
   `apis/scheduled_tasks.py`/`apis/seo_audit.py` endpoint) or give a final
@@ -4887,7 +4959,7 @@ this is the one place the model itself decides which action(s) to take.
 - **Isolation, concretely**: `owner-agent` has no DB connection, no
   filesystem access beyond its own code/logs, no shell, no
   arbitrary-URL-fetch tool — its only I/O is `backend`'s own REST surface
-  (the 21 tools, the brain call above, and now the action-log write
+  (the 22 tools, the brain call above, and now the action-log write
   below), and it forwards the caller's real bearer token on every one of
   those calls so `backend`'s own `require_role` independently
   re-authorizes every action (defense in depth: a compromised worker

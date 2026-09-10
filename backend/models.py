@@ -287,6 +287,15 @@ class AppSettings(Base):
     # owner-agent is the only way to set it, matching how IntentView's
     # status_options also has no manual editor, only manage_review_queue.
     order_status_options: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=None)
+    # Owner-agent-set (set_shipping_allowed_regions tool, 2026-09-10) —
+    # mirrors order_status_options exactly, same "null/empty means no
+    # restriction" posture as every other gate in this app. A plain list
+    # of region strings (state/province/zip-prefix, whatever the owner's
+    # checkout form actually collects) an Order.shipping_region is
+    # matched against, case-insensitively, in POST /cart/checkout — see
+    # that function's own docstring. No manual dashboard editor in v1,
+    # same posture as order_status_options above.
+    shipping_allowed_regions: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=None)
     # Payment gate (2026-08-20, see backend/payments.py) — same
     # "swappable provider, null means use the default" posture as every
     # AI provider above, extended to a new capability domain: actually
@@ -901,6 +910,15 @@ class Order(Base):
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     pickup_time: Mapped[str | None] = mapped_column(String(255), default=None)
     note: Mapped[str | None] = mapped_column(Text, default=None)
+    # Shipping (2026-09-10) — deliberately just two free-text fields, same
+    # "store what the visitor typed" posture as pickup_time above, not a
+    # structured address/geocoding integration. shipping_region is what
+    # POST /cart/checkout matches against AppSettings.shipping_allowed_regions
+    # (case-insensitively) when the owner has configured any; both stay
+    # null for a dine-in/pickup order that never collects them, so this
+    # is a no-op for every existing use of the checkout flow.
+    shipping_address: Mapped[str | None] = mapped_column(Text, default=None)
+    shipping_region: Mapped[str | None] = mapped_column(String(100), default=None)
     total_amount: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     # Payment state (2026-08-20, backend/payments.py) — deliberately
     # separate from `status` above, not a value stuffed into that same
