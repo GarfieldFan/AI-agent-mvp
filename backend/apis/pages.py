@@ -87,11 +87,30 @@ def save_version(slug: str, req: SaveVersionRequest, db: Session = Depends(get_d
     )
 
 
-@admin_router.get("/agent/pages", response_model=list[PageSummary])
-def list_pages(db: Session = Depends(get_db)) -> list[PageSummary]:
-    """List every page that has at least one saved version — powers the
-    "save to an existing page" picker in the frontend's generator panel."""
-    pages = db.scalars(select(Page).order_by(Page.created_at.desc())).all()
+class PageListResponse(BaseModel):
+    items: list[PageSummary]
+    total: int
+
+
+@admin_router.get("/agent/pages", response_model=PageListResponse)
+def list_pages(
+    q: str | None = None, limit: int = 20, offset: int = 0, db: Session = Depends(get_db)
+) -> PageListResponse:
+    """Paginated + searchable (2026-09-10) — was a plain unbounded fetch,
+    judged fine at the time ("a handful of pages per site," see the root
+    AGENTS.md's pagination section) but real usage proved that wrong once
+    a site accumulates enough pages that both the CTE editor's page
+    picker and the dashboard's Saved-pages list become hard to navigate.
+    `q` matches a slug substring, case-insensitive — the same `ILIKE`
+    posture this app already uses for `cart.search_products`."""
+    query = select(Page)
+    count_query = select(func.count()).select_from(Page)
+    if q:
+        pattern = f"%{q}%"
+        query = query.where(Page.slug.ilike(pattern))
+        count_query = count_query.where(Page.slug.ilike(pattern))
+    total = db.execute(count_query).scalar_one()
+    pages = db.scalars(query.order_by(Page.created_at.desc()).limit(limit).offset(offset)).all()
     summaries = []
     for page in pages:
         versions = page.versions  # already ordered newest-first (see models.py)
@@ -103,7 +122,7 @@ def list_pages(db: Session = Depends(get_db)) -> list[PageSummary]:
                 latest_version_at=versions[0].created_at if versions else None,
             )
         )
-    return summaries
+    return PageListResponse(items=summaries, total=total)
 
 
 class PageVersionListResponse(BaseModel):

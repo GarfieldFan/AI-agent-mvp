@@ -65,6 +65,12 @@ export function AgentConsoleSection() {
   // starts out "verifying" instead of flashing gated panels first.
   const [verifying, setVerifying] = useState(() => role !== "user");
   const [sessionExpired, setSessionExpired] = useState(false);
+  // Bumped whenever PageGeneratorPanel's SavePageForm saves a page — the
+  // signal that tells the sibling PageManager below (a separate
+  // component instance with its own independent fetch) to reload instead
+  // of showing stale data until a manual page refresh (see PageManager's
+  // own `refreshToken` doc comment).
+  const [pagesRefreshToken, setPagesRefreshToken] = useState(0);
 
   useEffect(() => {
     if (role === "user") return; // nothing gated to verify
@@ -151,10 +157,10 @@ export function AgentConsoleSection() {
             <AccordionPanel>
               <GeoPagePanel />
               <PosterGeneratorPanel />
-              <PageGeneratorPanel />
+              <PageGeneratorPanel onSaved={() => setPagesRefreshToken((t) => t + 1)} />
               <div className="space-y-2 rounded-xl border bg-muted/40 p-4">
                 <h3 className="text-lg font-semibold">Saved pages</h3>
-                <PageManager />
+                <PageManager refreshToken={pagesRefreshToken} />
               </div>
             </AccordionPanel>
           </AccordionItem>

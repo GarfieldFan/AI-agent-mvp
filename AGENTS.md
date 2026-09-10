@@ -7,9 +7,9 @@ story of how it got built. For the full chronological development log
 **`HISTORY.md`** — read it only when you need the deep "why" behind a
 specific decision below; don't load it by default.
 
-The original project plan (positioning, tech choices, phased build order,
-interview talking points) is `ai-mvp-project-plan.pdf` — this file tracks
-status against that plan, not the plan itself.
+An original project plan (positioning, tech choices, phased build order)
+existed as a local planning document, not tracked in this repo — this
+file tracks current status against real, verified behavior, not a plan.
 
 **Keep this file current**: when you finish a chunk of work, update the
 relevant section here with the *current-state fact*, and put any bug
@@ -93,7 +93,7 @@ ai-employee/
 │       └── deps.py            RBAC: Role enum + require_role() dependency, backed by real JWTs
 ├── owner-agent/               isolated LLM tool-calling loop, own container/port 8100 — see "Owner agent" below
 │   ├── deps.py                 owner-only JWT check (duplicated from backend, not imported — see below)
-│   ├── tools.py                 fixed 16-tool allowlist + execute_tool() (HTTP calls onto backend)
+│   ├── tools.py                 fixed 21-tool allowlist + execute_tool() (HTTP calls onto backend)
 │   ├── agent_loop.py             the loop itself: JSON-envelope tool selection against Ollama
 │   ├── logging_.py                action log: stdout + logs/runs.jsonl (never the bearer token)
 │   └── main.py                  FastAPI app: GET /health, POST /run
@@ -359,7 +359,7 @@ belongs in a separate, narrowly-scoped worker.
 
 That worker now exists: **`owner-agent/`** (its own docker-compose
 service, port 8100). It's a real LLM tool-calling loop — the owner types a
-command, a local Ollama model decides which of a fixed 16-tool allowlist to
+command, a local Ollama model decides which of a fixed 21-tool allowlist to
 call, in what order, chaining results turn-to-turn (see "Owner agent" in
 Phase 6 below for the full design). It independently re-verifies the
 caller's JWT and requires `Role.owner` specifically (stricter than
@@ -1551,9 +1551,9 @@ not e-commerce checkout.
     pagination; older runs were simply unreachable past 50). Explicitly
     ruled out as NOT real candidates (small, owner-configured, doesn't
     grow with usage): `GET /agent/pages` (the list of page slugs, not a
-    slug's own version history), `GET /agent/intent-schemas`, `GET
-    /agent/intent-views`, product bundle/upsell relations,
-    `ProductFieldDefinition`.
+    slug's own version history) — **reversed 2026-09-10**, see below,
+    `GET /agent/intent-schemas`, `GET /agent/intent-views`, product
+    bundle/upsell relations, `ProductFieldDefinition`.
     - **`GET /agent/media` has no database row to paginate at the SQL
       level** — it scans two directories (`COMFYUI_OUTPUT_DIR`,
       `MEDIA_UPLOAD_DIR`), merges, sorts by mtime, then the new
@@ -1589,6 +1589,27 @@ not e-commerce checkout.
       `eslint` clean across the whole `src/` tree, a real production
       build clean, `docker compose restart frontend` used again to clear
       a stale dev-cache render mid-verification.
+  - **`GET /agent/pages`'s own "not a real candidate" call reversed,
+    2026-09-10** — off a direct user ask, looking at the CTE editor's
+    page-slug picker: "otherwise it'll be hard to manage as pages grow."
+    `list_pages` (`apis/pages.py`) gained `q`/`limit`/`offset`, returning
+    `{items, total}` like every other paginated list here — `q` matches a
+    slug substring via `ILIKE`, same posture as `cart.search_products`.
+    Every consumer of the old unpaginated `listPages()` was updated
+    together, since the response shape itself changed: `PageManager`
+    (frontend/AGENTS.md) gained a real search box + `Pagination`
+    (20/page, same debounce-and-reset-page-together pattern as
+    `ChatSessionViewerPanel`); `CteEditorPanel`'s slug `Input` lost its
+    `<datalist>` autocomplete (a plain browser dropdown that stopped
+    being usable once a site had more than a handful of pages) in favor
+    of a real "Browse saved pages" list below it — searchable, paginated
+    8/page, each row clickable to load that slug directly; and
+    `PageGeneratorPanel`'s `SavePageForm` (which only ever wanted a
+    generous batch of slugs to feed its own save-target datalist, not a
+    management UI) switched to `listPages({limit: 100}).items`. Verified
+    live against the real dev DB: `GET /agent/pages?limit=3` and `?q=home`
+    both returned correctly paginated/filtered results; `pytest`/`tsc`/
+    `eslint`/a real production build all clean.
 - **`is_open` is a deliberate, separate boolean from `status`** — a real
   design fork resolved with the user directly: `status` is free text
   owner-agent can set to whatever labels the owner wants
@@ -2156,7 +2177,7 @@ well and asked me to design and build the whole thing.
 - **Root layout's `metadata` became `generateMetadata()`** (was a static
   `export const metadata`) — once a business profile is configured, the
   site's own `<title>`/meta description reflect the actual configured
-  business instead of this portfolio project's placeholder copy ("AI
+  business instead of this app's own generic placeholder copy ("AI
   MVP..."), a real, honest fix beyond just JSON-LD: the previous
   hardcoded copy was visibly wrong for any real deployment of this app.
   Falls back to the original static text with zero configuration.
@@ -4187,6 +4208,81 @@ current, authoritative list and each route's exact window/limit — this
 paragraph names them, not their numbers, so it doesn't drift out of sync
 every time a new one is added.
 
+### Red-team + stress test (2026-09-10) — one real, serious finding, fixed and re-verified
+
+A full red-team pass (RBAC bypass, JWT tampering, IDOR, file-upload
+abuse, path traversal, SQL injection surface, prompt injection, CORS,
+brute-force on login/CRM-resume) found nothing — every one of those held
+up, verified live against the real running stack, not just reviewed.
+
+**The stress test found a real, serious gap**: every public, *read-only*
+GET route (`GET /api/pages/{slug}`, `/api/products`, `/api/products/{id}`,
+`/api/products/search`, `/api/product-fields`, `/api/business-profile`,
+`/api/map-embed`, `/api/payment-config`, `/api/checkout/session-status`,
+`/api/turnstile-config`, `/api/cart`, `/api/auth/oauth-providers`) had
+**no rate limit or concurrency ceiling of any kind** — this file's own
+prior reasoning explicitly judged them "plain SELECTs, no rule needed."
+A burst of concurrent requests to just ONE of them (`GET
+/api/pages/{slug}`, from a single machine, no auth, no botnet) proved
+that wrong: 150 concurrent was fine, but 220-300 concurrent exhausted
+`backend/db.py`'s DB connection pool (silently defaulting to
+SQLAlchemy's own `pool_size=5`/`max_overflow=10` — 15 connections total,
+no explicit `pool_timeout`) and left the **entire backend unresponsive
+to ALL traffic** — not just the flooded route — for 90+ seconds with
+**no self-recovery** (confirmed via `pg_stat_activity`: exactly 15
+connections stuck `idle in transaction`, and CPU dropped to near-idle
+rather than being busy, ruling out "just slow"). Recovering required a
+manual `docker compose restart backend`, twice, during testing. A
+genuine, free, single-machine DoS against this app's current shape.
+
+**Fixed in three places, all re-verified against the real running
+stack**, not just reviewed:
+1. **`backend/db.py`** — `create_engine` now passes explicit
+   `pool_size=10, max_overflow=20, pool_timeout=10, pool_pre_ping=True`
+   (was zero overrides). `pool_timeout=10` is the actual fix for the
+   "hangs forever" failure mode: a request that can't get a connection
+   within 10s now raises, caught by `main.py`'s already-existing global
+   exception handler (`error_alerts.py`) — logged, a clean 500,
+   optionally alerts the owner — instead of hanging indefinitely.
+2. **`backend/rate_limit.py`** — gained `PREFIX_RULES`, a second
+   rules table alongside the existing exact-match `RULES`, for route
+   *families* with a dynamic segment (a slug, a product id, a search
+   query) — `_prefix_rule_for` matches `path == prefix or
+   path.startswith(prefix + "/")` (boundary-aware, never a bare
+   substring, so `/api/products` can never swallow the real, different
+   `/api/product-fields`) and every request under one prefix shares ONE
+   per-IP budget, closing the obvious bypass of just hitting a different
+   slug/id/query each time. All ten routes above got `60 requests/10s`
+   per IP — deliberately closer to a concurrency cap than a rate limit
+   (real browsing never approaches it; 150 concurrent was already fine
+   in testing, so 60 leaves a wide margin under that while making the
+   actual failing case impossible to reproduce).
+3. **`deploy/nginx.conf.template`** — gained `limit_req_zone`/
+   `limit_conn_zone` (`rate=20r/s`, `burst=40 nodelay`, 20 concurrent
+   connections per IP, applied to the `/api/` location block). **This is
+   the layer that actually matters once a real domain deployment exists**
+   — `rate_limit.py`'s own per-IP tracking only sees whatever IP directly
+   connects to it, and once Nginx sits in front (exactly the `--domain`
+   deployment mode this file is for), every request arrives from Nginx's
+   own local connection, not the real visitor's — the same reasoning
+   `X-Forwarded-For` isn't trusted, in reverse. Nginx itself sees the real
+   client IP directly, so it's the correct enforcement point once it's in
+   the request path at all. Documented as a known, not-yet-solved caveat
+   in `rate_limit.py`'s own module docstring, rather than silently
+   assumed away.
+- **Verified live, not just reviewed**: re-ran the exact attack that
+  broke it — 300, then a clean 1000-concurrent burst against `GET
+  /api/pages/home` — both now resolve in ~2.3s total with exactly the
+  configured budget (60) returning 200 and the rest instant 429s (not
+  slow, queued failures), zero errors, zero hangs; `pg_stat_activity`
+  stayed clean (no `idle in transaction` pileup) and `GET
+  /openapi.json` stayed responsive (0.2-0.7s) throughout. A plain
+  40-concurrent burst (normal-sized traffic) still sails through
+  unaffected. The substituted `nginx.conf.template` (placeholders
+  replaced, mounted into a real `nginx:stable` container) passed a real
+  `nginx -t`. `pytest` (21 fast tests) still clean after the `db.py`/
+  `rate_limit.py` changes.
+
 - **In-memory, single-process, sliding-window-by-trimming** — deliberately
   not slowapi/Redis: this app runs as one uvicorn worker in one container
   (`docker-compose.yml`), so there's no multi-process state to share, and
@@ -4688,7 +4784,7 @@ considering it fully settled.
 - **Phase 6 — Agent security layer**: **started, not complete**. The
   isolated worker now exists — `owner-agent/` (own container/port 8100,
   see "Architecture decisions" above and "Owner agent" below) — with a
-  real LLM tool-calling loop over a fixed 16-tool allowlist, its own
+  real LLM tool-calling loop over a fixed 21-tool allowlist, its own
   owner-only auth check, and action logging to stdout + a bind-mounted
   `logs/runs.jsonl` (per-step, durable). The worker's "brain" model
   selection is now wired to the owner-facing model picker too
@@ -4791,7 +4887,7 @@ this is the one place the model itself decides which action(s) to take.
 - **Isolation, concretely**: `owner-agent` has no DB connection, no
   filesystem access beyond its own code/logs, no shell, no
   arbitrary-URL-fetch tool — its only I/O is `backend`'s own REST surface
-  (the 16 tools, the brain call above, and now the action-log write
+  (the 21 tools, the brain call above, and now the action-log write
   below), and it forwards the caller's real bearer token on every one of
   those calls so `backend`'s own `require_role` independently
   re-authorizes every action (defense in depth: a compromised worker

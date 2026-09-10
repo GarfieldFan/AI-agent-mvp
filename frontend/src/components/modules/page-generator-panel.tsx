@@ -98,7 +98,7 @@ function deleteItem(items: PreviewItem[], index: number): PreviewItem[] {
  * new version, never destructively) the live homepage, anything else
  * lives at /p/[slug]. Rendered under the preview once a generation
  * exists; see backend/apis/pages.py for the storage side. */
-function SavePageForm({ content }: { content: GeneratedPage }) {
+function SavePageForm({ content, onSaved }: { content: GeneratedPage; onSaved?: () => void }) {
   const [slug, setSlug] = React.useState("");
   const [note, setNote] = React.useState("");
   const [pages, setPages] = React.useState<PageSummary[]>([]);
@@ -106,8 +106,11 @@ function SavePageForm({ content }: { content: GeneratedPage }) {
   const [error, setError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    listPages()
-      .then(setPages)
+    // Just feeds the slug <datalist> below — a generous batch, not the
+    // full paginated list (see lib/pages.ts's listPages), since this is a
+    // plain autocomplete convenience, not a management UI.
+    listPages({ limit: 100 })
+      .then((result) => setPages(result.items))
       .catch(() => setPages([]));
   }, []);
 
@@ -120,6 +123,10 @@ function SavePageForm({ content }: { content: GeneratedPage }) {
     try {
       await savePageVersion(normalized, content, note.trim() || undefined);
       setStatus("saved");
+      // Lets a sibling PageManager (a different component instance, its
+      // own independent fetch — see agent-console-section.tsx) know a
+      // page changed, so its list updates without a manual page refresh.
+      onSaved?.();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Save failed — is the backend reachable?");
       setStatus("error");
@@ -291,7 +298,7 @@ function LockableSectionPreview({
  * name — SavePageForm below can park a generation onto any slug (home,
  * about, a promo page, ...), so this is a general page generator, not
  * just a landing-page one. */
-export function PageGeneratorPanel() {
+export function PageGeneratorPanel({ onSaved }: { onSaved?: () => void } = {}) {
   const [file, setFile] = React.useState<File | null>(null);
   const [notes, setNotes] = React.useState("");
   const [status, setStatus] = React.useState<"idle" | "loading" | "error">("idle");
@@ -455,7 +462,7 @@ export function PageGeneratorPanel() {
               </AnimatePresence>
             </div>
           </div>
-          <SavePageForm content={result} />
+          <SavePageForm content={result} onSaved={onSaved} />
         </>
       ) : null}
     </div>

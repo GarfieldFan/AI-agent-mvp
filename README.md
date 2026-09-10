@@ -1,19 +1,19 @@
 # AI Employee — AI-native small-business site MVP
 
-A resume/portfolio project: a small business website that ships with its
-own AI employee. A public visitor gets a RAG-grounded chatbot that can
-capture leads or file a structured request from a conversation (with
-file attachments), browse and order from a real product catalog, and
-manage their own cart/checkout — no separate contact form or storefront
-UI needed. An admin/owner gets a design-to-page generator, a poster
-generator, a click-to-edit page builder, a CRM with owner-defined
-structured intake forms and agent-generated review queues, chat-volume
-reporting, and a natural-language **owner agent** that can actually call
-tools on the owner's behalf — all gated behind real role-based access
-control.
+A small business website that ships with its own AI employee. A public
+visitor gets a RAG-grounded chatbot that can capture leads or file a
+structured request from a conversation (with file attachments), browse
+and order from a real product catalog, and manage their own
+cart/checkout — no separate contact form or storefront UI needed. An
+admin/owner gets a design-to-page generator, a poster generator, a
+click-to-edit page builder, a CRM with owner-defined structured intake
+forms and agent-generated review queues, chat-volume reporting, and a
+natural-language **owner agent** that can actually call tools on the
+owner's behalf — all gated behind real role-based access control.
 
-This is a local-first demo (`docker compose up`), not a deployed
-product. The interesting parts are architectural: every AI capability
+This started as a local-first demo (`docker compose up`) and now also
+ships real deployment automation for a single real server (see
+`deploy/`). The interesting parts are architectural: every AI capability
 (chat, vision, embeddings, image generation) sits behind a swappable
 provider abstraction, not a config flag bolted onto one vendor; and the
 one component that does get real LLM tool-calling access runs as a
@@ -74,10 +74,10 @@ container, own port), not another router bolted onto the public
   fields conversationally across multiple turns without re-asking for
   anything already given.
 - **Product catalog + ordering** — a visitor can browse, ask the chatbot
-  what's available, add to cart, and check out (no payment collection —
-  this tracks orders, not a checkout processor) entirely through chat or
-  the storefront pages (`/search`, `/products/[id]`, `/cart`,
-  `/checkout`). Product search/cart resolution is deterministic SQL, not
+  what's available, add to cart, and check out (real Stripe payment, or a
+  zero-config test mode — see below) entirely through chat or the
+  storefront pages (`/search`, `/products/[id]`, `/cart`, `/checkout`).
+  Product search/cart resolution is deterministic SQL, not
   an LLM guessing a product ID out of a prompt-stuffed catalog. Supports
   per-line customization notes and a dine-in "kitchen ticket" workflow
   (staff mark a line served; a served line locks against further changes
@@ -104,11 +104,27 @@ container, own port), not another router bolted onto the public
   backed by data this project actually persists and paginates.
 - **Owner agent** (owner-role only) — type a natural-language command
   ("generate a poster of X and log it as a CRM entry"), and a real LLM
-  tool-calling loop decides which of a fixed 16-tool allowlist to call,
-  in what order, chaining results turn-to-turn. Every step (tool, args,
+  tool-calling loop decides which of a fixed tool allowlist to call, in
+  what order, chaining results turn-to-turn. Every step (tool, args,
   result) is shown, not just the final answer. A higher-stakes change
   (a new intake schema, a batch of catalog products) is always drafted
   for the owner to review and explicitly apply, never written directly.
+- **Payments, notifications, maps, and GEO/SEO** — a swappable payment
+  gate (Stripe embedded checkout or a zero-config test mode), an
+  email/SMS gate (Mailgun/Twilio or test mode), a map-embed gate (Google
+  Maps or a plain redirect link), and a structured business-profile +
+  JSON-LD/`robots.txt`/`sitemap.xml`/`llms.txt` pass aimed at both search
+  engines and AI systems reading on a visitor's behalf.
+- **Accounts** — password login plus optional Google/Facebook/X OAuth for
+  the public `user` tier (admin/owner stay password-only, a deliberate
+  trust-boundary decision), a self-service "my account" view, and
+  owner-facing user/role management.
+- **Bot verification + prompt-injection defense** — Cloudflare Turnstile
+  gating the fully-public write endpoints (never a page view, so it can't
+  affect SEO/GEO), and a fixed instruction layer the chatbot's system
+  prompt can't be talked out of, backed by deterministic guardrails on
+  what a classification call is allowed to write to the database
+  regardless of what it returns.
 
 ## Why it's architecturally interesting
 
@@ -130,7 +146,7 @@ container, own port), not another router bolted onto the public
   port, its own independent JWT check requiring the `owner` role
   specifically (stricter than the console's admin-or-owner gate), no
   database connection, no filesystem access, no arbitrary-URL fetch
-  tool. Its only I/O is a fixed 16-tool allowlist of HTTP calls onto the
+  tool. Its only I/O is a fixed tool allowlist of HTTP calls onto the
   main backend's own REST API, forwarding the caller's real bearer token
   on every call so the backend's own RBAC independently re-authorizes
   every action — a compromised or misbehaving agent loop still can't do
@@ -161,8 +177,10 @@ container, own port), not another router bolted onto the public
 - **`owner-agent`**: a separate FastAPI service — the isolated LLM
   tool-calling worker described above.
 - **Infra**: fully Dockerized (`docker-compose.yml`) — backend, frontend,
-  owner-agent, and Postgres/pgvector each in their own container,
-  hot-reloading in dev.
+  owner-agent, Postgres/pgvector, and a bundled Ollama each in their own
+  container, hot-reloading in dev. Real deployment automation for a
+  single server (with an optional domain + automatic HTTPS) lives in
+  `deploy/`.
 - **Image generation**: ComfyUI by default, wrapped by a small backend
   API; OpenAI/Gemini available as alternatives.
 
@@ -177,11 +195,12 @@ docker compose up
 - Backend docs: `http://localhost:8000/docs`
 - Three seeded demo accounts (password `0000` for all, shown on `/login`):
   `owner@example.com`, `admin@example.com`, `user@example.com`.
-- Chat/vision/embedding generation each need a real backend reachable
-  from the containers — a local Ollama instance (see `AGENTS.md`'s
-  known-gotchas section: Ollama must bind to all interfaces, not just
-  loopback) or a self-hosted OpenAI-compatible server (llama.cpp, vLLM,
-  ...) configured via the owner-facing model picker.
+- Chat/vision/embedding generation each need a real model connected —
+  the bundled `ollama` container works out of the box (use `/setup` or
+  the Dashboard's Model settings to pull a model into it), or point the
+  owner-facing model picker at your own self-hosted OpenAI-compatible
+  server (llama.cpp, vLLM, ...) or a cloud provider (OpenAI, Anthropic,
+  Gemini) with a real API key.
 
 ## Documentation
 
@@ -200,14 +219,18 @@ This repo keeps two tiers of documentation, both written for whoever
 ## Scope notes
 
 This is explicitly an MVP built to demonstrate specific engineering
-judgment, not a finished product. Known, deliberate gaps: no real cloud
-deployment (local Docker only, by design), no real payment processor (an
-order is tracked, never charged), no multi-tenancy (one deployment is
-one business, not a hosted SaaS serving many owners), chat is a single
-non-streaming call (a visibility-gated short-polling loop stands in for
-push updates on the admin dashboard instead of a websocket, given the
-single-worker deployment), the chatbot's step-by-step intake flow is
-scripted rather than LLM-driven, `owner-agent` hasn't been through a
-red-team pass, and no in-browser click-through testing has been done
-(every change is verified via type-checking, linting, automated tests,
-and direct backend calls instead — see `AGENTS.md`).
+judgment, not a finished product. Known, deliberate gaps: no
+multi-tenancy (one deployment is one business, not a hosted SaaS serving
+many owners), chat is a single non-streaming call by design (a
+visibility-gated short-polling loop stands in for push updates on the
+admin dashboard instead of a websocket, given the single-worker
+deployment), payment is Stripe-or-test-mode only (no other processor),
+and no in-browser click-through testing has been done (every change is
+verified via type-checking, linting, automated tests, and direct backend
+calls instead — see `AGENTS.md`). A broad red-team + stress-test pass has
+been run against the public API surface (RBAC, IDOR, JWT tampering,
+file-upload/path-traversal abuse, prompt injection, rate limiting, DB
+connection-pool exhaustion under load — see `AGENTS.md`'s "Rate
+limiting" section for the one real finding and its fix), but
+`owner-agent`'s own tool-calling loop hasn't had a dedicated adversarial
+pass of its own yet.

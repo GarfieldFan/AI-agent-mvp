@@ -27,6 +27,7 @@ function viewHrefFor(slug: string) {
 }
 
 const VERSION_PAGE_SIZE = 20;
+const PAGE_LIST_SIZE = 20;
 
 function VersionHistory({ slug, onRestored }: { slug: string; onRestored: () => void }) {
   const [versions, setVersions] = React.useState<PageVersionSummary[] | null>(null);
@@ -107,9 +108,29 @@ function VersionHistory({ slug, onRestored }: { slug: string; onRestored: () => 
 
 /** Browse every saved page and its version history, with one-click
  * restore. Companion to PageGeneratorPanel's save form — that creates
- * versions, this one lets you see and roll back through them. */
-export function PageManager() {
+ * versions, this one lets you see and roll back through them.
+ *
+ * Paginated + searchable (2026-09-10) — was a plain unbounded fetch,
+ * fine when a site only had a handful of pages but hard to navigate once
+ * it accumulates more (a real gap the user flagged directly). Mirrors
+ * ChatSessionViewerPanel's debounce-and-reset-page-together pattern
+ * (see that component's own doc comment for why the page reset lives
+ * inside the same setTimeout rather than a separate effect).
+ *
+ * `refreshToken` (2026-09-10) — this component and PageGeneratorPanel's
+ * own `SavePageForm` are separate sibling components (see
+ * agent-console-section.tsx) with independent state; saving a page over
+ * there previously left this list showing stale data until a manual page
+ * refresh, a real UX gap the user flagged directly. Bumping this prop
+ * (any change, the value itself is meaningless) re-fetches the current
+ * page — same "shared refresh signal between sibling components"
+ * mechanism CrmPanel's own `refreshToken` already uses. */
+export function PageManager({ refreshToken }: { refreshToken?: number } = {}) {
   const [pages, setPages] = React.useState<PageSummary[] | null>(null);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(1);
+  const [searchInput, setSearchInput] = React.useState("");
+  const [searchText, setSearchText] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
   const [expandedSlug, setExpandedSlug] = React.useState<string | null>(null);
   const [deletingSlug, setDeletingSlug] = React.useState<string | null>(null);
@@ -121,24 +142,36 @@ export function PageManager() {
   // path anywhere in the app until this. Saves an empty `sections: []`
   // version to a new slug via the same savePageVersion PageGeneratorPanel
   // already uses; the new slug then shows up in this list and in the CTE
-  // editor's own slug datalist (both driven by listPages), ready to
-  // load and build up from an empty canvas via its "+" insert gaps.
+  // editor's own browsable page list (both driven by listPages), ready
+  // to load and build up from an empty canvas via its "+" insert gaps.
   const [newSlugInput, setNewSlugInput] = React.useState("");
   const [creating, setCreating] = React.useState(false);
   const [createError, setCreateError] = React.useState<string | null>(null);
 
+  React.useEffect(() => {
+    const id = window.setTimeout(() => {
+      setSearchText(searchInput);
+      setPage(1);
+    }, 300);
+    return () => window.clearTimeout(id);
+  }, [searchInput]);
+
   const load = React.useCallback(() => {
-    listPages()
-      .then((loaded) => {
-        setPages(loaded);
+    listPages({ q: searchText || undefined, limit: PAGE_LIST_SIZE, offset: (page - 1) * PAGE_LIST_SIZE })
+      .then((result) => {
+        setPages(result.items);
+        setTotal(result.total);
         setError(null);
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load pages."));
-  }, []);
+  }, [page, searchText]);
 
   React.useEffect(() => {
     load();
-  }, [load]);
+    // `refreshToken` isn't read inside `load` itself — it's purely a
+    // signal from a sibling component that something changed elsewhere,
+    // so it belongs in this effect's own deps, not `load`'s.
+  }, [load, refreshToken]);
 
   async function handleCreateBlank() {
     const slug = slugify(newSlugInput);
@@ -148,7 +181,15 @@ export function PageManager() {
     try {
       await savePageVersion(slug, { sections: [] }, "Blank page");
       setNewSlugInput("");
-      load();
+      // A new page sorts first (most-recent-first) — jump back to page 1
+      // and clear any active search so it's actually visible, mirroring
+      // ProductPanel's identical "new row sorts first" fix.
+      if (page === 1 && !searchText) load();
+      else {
+        setSearchInput("");
+        setSearchText("");
+        setPage(1);
+      }
     } catch (err) {
       setCreateError(err instanceof ApiError ? err.message : "Could not create the page.");
     } finally {
@@ -168,7 +209,10 @@ export function PageManager() {
     try {
       await deletePage(slug);
       if (expandedSlug === slug) setExpandedSlug(null);
-      load();
+      // Deleting the last item on a non-first page steps back a page,
+      // mirroring ProductPanel's identical fix.
+      if (pages && pages.length === 1 && page > 1) setPage(page - 1);
+      else load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Delete failed.");
     } finally {
@@ -207,7 +251,7 @@ export function PageManager() {
   if (error) return <ErrorMessage description={error} onRetry={load} />;
   if (pages === null) return <LoadingSpinner label="Loading saved pages…" />;
 
-  if (pages.length === 0) {
+  if (pages.length === 0 && !searchText) {
     return (
       <div className="space-y-3">
         {newPageForm}
@@ -223,45 +267,61 @@ export function PageManager() {
   return (
     <div className="space-y-3">
       {newPageForm}
-      <div className="space-y-2">
-      {pages.map((page) => {
-        const expanded = expandedSlug === page.slug;
-        return (
-          <div key={page.slug} className="rounded-lg border p-3">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <Link href={viewHrefFor(page.slug)} className="text-sm font-medium underline">
-                  {page.slug}
-                </Link>
-                <span className="ml-2 text-xs text-muted-foreground">
-                  {page.version_count} version{page.version_count === 1 ? "" : "s"}
-                </span>
+
+      <Input
+        value={searchInput}
+        onChange={(event) => setSearchInput(event.target.value)}
+        placeholder="Search by slug…"
+        className="max-w-sm"
+      />
+
+      {pages.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No pages match &quot;{searchText}&quot;.</p>
+      ) : (
+        <div className="space-y-2">
+          {pages.map((pageItem) => {
+            const expanded = expandedSlug === pageItem.slug;
+            return (
+              <div key={pageItem.slug} className="rounded-lg border p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <Link href={viewHrefFor(pageItem.slug)} className="text-sm font-medium underline">
+                      {pageItem.slug}
+                    </Link>
+                    <span className="ml-2 text-xs text-muted-foreground">
+                      {pageItem.version_count} version{pageItem.version_count === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => setExpandedSlug(expanded ? null : pageItem.slug)}
+                    >
+                      {expanded ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
+                      History
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="destructive"
+                      onClick={() => handleDelete(pageItem.slug)}
+                      disabled={deletingSlug !== null}
+                    >
+                      <Trash2 className="size-3" />
+                      {deletingSlug === pageItem.slug ? "Deleting…" : "Delete"}
+                    </Button>
+                  </div>
+                </div>
+                {expanded ? <VersionHistory slug={pageItem.slug} onRestored={load} /> : null}
               </div>
-              <div className="flex items-center gap-1">
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => setExpandedSlug(expanded ? null : page.slug)}
-                >
-                  {expanded ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
-                  History
-                </Button>
-                <Button
-                  size="xs"
-                  variant="destructive"
-                  onClick={() => handleDelete(page.slug)}
-                  disabled={deletingSlug !== null}
-                >
-                  <Trash2 className="size-3" />
-                  {deletingSlug === page.slug ? "Deleting…" : "Delete"}
-                </Button>
-              </div>
-            </div>
-            {expanded ? <VersionHistory slug={page.slug} onRestored={load} /> : null}
-          </div>
-        );
-      })}
-      </div>
+            );
+          })}
+        </div>
+      )}
+
+      {total > PAGE_LIST_SIZE ? (
+        <Pagination page={page} pageSize={PAGE_LIST_SIZE} total={total} onPageChange={setPage} />
+      ) : null}
     </div>
   );
 }

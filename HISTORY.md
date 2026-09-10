@@ -31,11 +31,10 @@ re-deriving context from scratch. Keep it current: update the relevant
 section whenever you finish a chunk of work, not just at the end of a
 session.
 
-The full project plan (positioning, tech choices, module list, phased
-build order, interview talking points) is `ai-mvp-project-plan.pdf` in this
-directory — this file tracks *status against that plan*, not the plan
-itself. Read the PDF for the "why", read this file for the "where things
-stand".
+An original project plan (positioning, tech choices, module list, phased
+build order) existed as a local planning document, not tracked in this
+repo — this file tracks *status against real, verified behavior*, not a
+plan.
 
 ## Architecture snapshot
 
@@ -200,7 +199,7 @@ further code changes; if it doesn't, that's a real bug in that provider
 file, not "it was never implemented."
 
 **The two provider roles don't swap the same way — this is the nuance
-worth remembering (and worth being able to explain in an interview):**
+worth remembering:**
 - `ChatProvider` (generation) is swappable per-call, freely. Today's
   answer can come from Ollama, tomorrow's from Claude, no side effects on
   anything already stored.
@@ -507,7 +506,7 @@ background box, viewed directly to confirm (not just checked for a 200).
 - [x] **Real auth + RBAC, 2026-08-04** — the `X-Debug-Role` header + `DevRoleSwitcher` placeholder is gone. `backend/auth.py` (bcrypt password hashing, PyJWT sign/verify) + `backend/apis/auth.py` (`POST /api/auth/login`, `GET /api/auth/me`) + `backend/apis/deps.py` (now decodes a real `Authorization: Bearer` JWT — no token or an invalid one still resolves to the anonymous `user` role, so the public chatbot keeps working without login; only `require_role`-gated routes actually reject). Frontend: `frontend/src/lib/auth.ts` (localStorage-backed session + `useAuth()` reactive hook, same `useSyncExternalStore` pattern the old dev-role switcher used), `/login` page + `LoginForm`, `AuthStatus` header widget (replaces `DevRoleSwitcher`) showing email/role/logout when signed in or a "Log in" link when not. `apiFetch` (`lib/api.ts`) now attaches the real token automatically. **Not real Firebase Auth** — deliberately self-contained (FastAPI issuing its own JWTs), see the architecture note on why this was chosen over Firebase.
   - Three seeded demo accounts, all password `0000` (changed from the original seed's `demo1234` on 2026-08-04 at the user's request, via a one-off script directly updating the 3 existing rows — `seed.py`'s own re-run doesn't update passwords on accounts that already exist, see its docstring): `owner@example.com`, `admin@example.com`, `user@example.com`. Shown directly on the `/login` page — there's nothing behind these accounts worth protecting in a local docker-compose demo, so no reason to hide them from whoever's running it.
   - **Verified end-to-end**: login issues a real JWT, `/me` round-trips it, an admin-gated route returns 501 (past the RBAC gate) with a valid admin token vs 403 with no token, wrong password correctly 401s.
-- **Scope decision (2026-08-03)**: this is a resume/portfolio MVP meant to run locally and be demoed on video — not a real deployment. Real **Firebase** Auth and an actual EC2 deploy are still explicitly **not required** — the self-issued-JWT approach above satisfies "real auth" for the demo without needing a third-party identity provider or a cloud deploy. Don't push to build actual Firebase/cloud deploy unless the user asks.
+- **Scope decision (2026-08-03)**: this is an MVP meant to run locally, not a real deployment (at the time — real deployment automation was added later, see the root AGENTS.md's "Deploying to a real server" section). Real **Firebase** Auth and an actual EC2 deploy were still explicitly **not required** at this point — the self-issued-JWT approach above satisfies "real auth" without needing a third-party identity provider or a cloud deploy. Don't push to build actual Firebase/cloud deploy unless the user asks.
 - [x] **Real bug fixed, 2026-08-05: an expired session left the header's login widget showing the old logged-in user indefinitely.** Reported directly: after a token expired, admin-gated sections correctly started 403ing (the backend was never wrong here — see `apis/deps.py`'s docstring, it deliberately never hard-401s on a bad/expired token, silently downgrading to the anonymous `user` role instead, since the public chatbot needs to keep working with no token at all), but `AuthStatus` in the header kept showing the stale logged-in email/role, since nothing ever actually cleared the stale `localStorage` entry — there was no server 401 to react to in the first place, by design. Fixed entirely client-side in `frontend/src/lib/auth.ts`: `getAuthToken()` (called by `apiFetch` on every single request, to build the `Authorization` header) now decodes the token's own `exp` claim and, if expired (or the token fails to decode at all — treated the same as expired, safest default), calls the real `clearAuth()` — removing the stored session *and* firing the change event every `useAuth()` subscriber listens for — right there, before the request even goes out. `useAuth()`'s own snapshot function (`getAuthState()`) got a matching pure (non-mutating) expiry check, since it backs `useSyncExternalStore` and mutating storage inside a snapshot read isn't safe (this file already has one documented "infinite loop" bug from a purity violation — the fix deliberately keeps the two functions' responsibilities split: `getAuthState()` stays a pure read, `getAuthToken()` is where the actual side-effecting cleanup happens, since it's called from `apiFetch`, outside any render). Net effect: the header updates to "logged out" as part of the very request that would have 403'd anyway, not on some later unrelated re-render. Verified: JWT expiry-decode logic tested directly (a real freshly-issued token → not expired; a synthetic token with a past `exp` → expired; a garbage/non-JWT string → treated as expired) via a standalone Node script mirroring the TS logic; confirmed `apiFetch` is the *only* caller of `getAuthToken()` in the codebase, so every authenticated request goes through this one fixed choke point. `tsc`/`eslint` clean, full route sweep clean after a restart.
 
 **Phase 2 — RAG core**

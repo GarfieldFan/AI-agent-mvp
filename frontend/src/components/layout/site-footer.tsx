@@ -10,8 +10,9 @@ export function SiteFooter() {
         <div className="space-y-2">
           <p className="text-sm font-semibold">AI MVP</p>
           <p className="max-w-sm text-sm text-muted-foreground">
-            Full-stack + on-prem AI portfolio project: RAG, agent tooling, and
-            an agent-permission security layer running on a self-hosted stack.
+            An AI-native small-business platform: RAG-grounded chat, agent
+            tooling, and an agent-permission security layer running on a
+            self-hosted stack.
           </p>
         </div>
 

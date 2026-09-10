@@ -31,7 +31,7 @@ __pycache__/
 # stray Windows artifact, not real project content
 /backend/nul
 
-# personal interview-prep notes, not project content
+# personal notes, not project content
 /interview-talking-points.md
 
 # local test/reference material (RAG test PDFs, template screenshots), not

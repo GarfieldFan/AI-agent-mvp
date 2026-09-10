@@ -13,9 +13,20 @@ Everything else in this backend already sits behind `require_role` — a
 stolen/guessed JWT is a much bigger problem than a fast caller, and rate-
 limiting an authenticated admin/owner (e.g. the owner-agent's own chain of
 backend calls) would get in the way of legitimate use for no real security
-benefit. So this stays scoped to the routes above, not a blanket global
-limiter — the public product read/search routes are plain SELECTs, same
-posture as the already-unlimited `GET /pages/{slug}`, so they get no rule.
+benefit. So this stays scoped to the routes above, plus (2026-09-10,
+`PREFIX_RULES` below) every fully-public GET read route.
+
+**That last part reverses this file's own earlier reasoning** — public
+GET routes ("plain SELECTs") were originally judged to need no rule at
+all, same posture as an already-unlimited `GET /pages/{slug}`. A real
+stress test found that assumption wrong: a burst of a couple hundred
+concurrent requests to just ONE such route (no auth, no botnet, one
+machine) exhausted this app's entire DB connection pool and left the
+whole backend unresponsive to ALL traffic — not just that route — for
+90+ seconds with no self-recovery, requiring a container restart. See
+`db.py`'s own `pool_size`/`pool_timeout` for the other half of this fix
+(fail fast under contention instead of hanging forever) — the rules
+below are what stop a single IP from creating that contention at all.
 
 In-memory, single-process, sliding-window-by-trimming (not a token
 bucket) — deliberately the simplest thing that works, not slowapi/Redis:
@@ -34,6 +45,20 @@ has no reverse proxy in front of `backend` (docker-compose maps its port
 straight out), so there's no trusted hop that could have set that header
 correctly; honoring it here would let any caller claim to be any IP and
 trivially bypass the limit.
+
+**Known caveat, not solved here**: once a real deployment puts Nginx in
+front of `backend` (`deploy/`'s `--domain` mode), every request this
+middleware sees arrives from Nginx's own connecting IP, not the real
+visitor's — the identical reason `X-Forwarded-For` isn't trusted above
+applies in reverse once a real trusted hop DOES exist. In that specific
+topology, per-IP limiting here degrades toward "one shared budget for
+the whole site's traffic" rather than per-visitor. This is why
+`deploy/nginx.conf.template` also gained its own `limit_req`/`limit_conn`
+(2026-09-10) — Nginx sees the real client IP directly and is the correct
+place to enforce this once it's in the request path at all; the rules in
+this file remain the real, effective protection for the plain
+docker-compose topology (no domain, no Nginx, backend port reachable
+directly) and as defense-in-depth otherwise.
 """
 
 import time
@@ -65,8 +90,8 @@ RULES: dict[tuple[str, str], RateLimitRule] = {
     # one of the 3 seeded demo passwords.
     ("POST", "/api/auth/login"): RateLimitRule(window_seconds=900, max_requests=10),
     # A real public mutation (2026-08-19, apis/products.py's add_to_cart)
-    # — same tier as /api/chat/upload, not the read-only product/search
-    # routes (no rule needed there, same posture as GET /pages/{slug}).
+    # — same tier as /api/chat/upload. The read-only product/search
+    # routes get their own, much more generous rule in PREFIX_RULES below.
     ("POST", "/api/cart/add"): RateLimitRule(window_seconds=300, max_requests=30),
     # apis/crm_resume.py (2026-08-20) — /request triggers a real email
     # send, so a generous limit here directly bounds how badly this could
@@ -83,6 +108,47 @@ RULES: dict[tuple[str, str], RateLimitRule] = {
     ("POST", "/api/contact"): RateLimitRule(window_seconds=300, max_requests=10),
 }
 
+# (method, path PREFIX) -> rule, for a public route *family* that
+# includes a dynamic segment (a slug, a product id, a search query, ...)
+# — every request under the prefix shares ONE per-IP budget, so a caller
+# can't dodge the limit by hitting a different slug/id/query each time.
+# Matched as `path == prefix or path.startswith(prefix + "/")` (see
+# `_prefix_rule_for`), never a bare substring check, so e.g.
+# "/api/products" can never accidentally also swallow the real, different
+# "/api/product-fields" route. A short window (10s) with a generous cap
+# (60) is deliberately closer to a concurrency cap than a rate limit —
+# real human browsing never approaches it; the stress test that found
+# this gap broke down somewhere between 150 (fine) and 220 (broke)
+# concurrent requests, so 60 leaves a wide margin under that while still
+# making the exact attack that was found impossible to reproduce.
+PREFIX_RULES: dict[tuple[str, str], RateLimitRule] = {
+    ("GET", "/api/pages"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/products"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/product-fields"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/business-profile"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/map-embed"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/payment-config"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/checkout/session-status"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/turnstile-config"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/cart"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/auth/oauth-providers"): RateLimitRule(window_seconds=10, max_requests=60),
+}
+
+
+def _prefix_rule_for(method: str, path: str) -> tuple[str, RateLimitRule] | None:
+    """Longest-prefix match against PREFIX_RULES — a boundary-aware
+    startswith, not a bare substring, so "/api/pages" matches
+    "/api/pages" and "/api/pages/home" but never "/api/pagesfoo"."""
+    best: tuple[str, RateLimitRule] | None = None
+    for (rule_method, prefix), rule in PREFIX_RULES.items():
+        if rule_method != method:
+            continue
+        if path == prefix or path.startswith(prefix + "/"):
+            if best is None or len(prefix) > len(best[0]):
+                best = (prefix, rule)
+    return best
+
+
 # (method, path, ip) -> recent request timestamps (monotonic clock, so a
 # system clock adjustment can't reset or extend anyone's window). A caller
 # who never revisits a limited route leaves one small entry behind for the
@@ -94,11 +160,20 @@ _hits: dict[tuple[str, str, str], deque[float]] = {}
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         rule = RULES.get((request.method, request.url.path))
+        # `bucket_path` is what every request under a matched PREFIX_RULES
+        # entry shares — the prefix itself, not each distinct slug/id/query
+        # — so hitting /api/pages/a, /api/pages/b, /api/pages/c, ... all
+        # draws from the same per-IP budget instead of each getting its
+        # own fresh one.
+        bucket_path = request.url.path
         if rule is None:
-            return await call_next(request)
+            prefix_match = _prefix_rule_for(request.method, request.url.path)
+            if prefix_match is None:
+                return await call_next(request)
+            bucket_path, rule = prefix_match
 
         client_ip = request.client.host if request.client else "unknown"
-        key = (request.method, request.url.path, client_ip)
+        key = (request.method, bucket_path, client_ip)
         now = time.monotonic()
 
         hits = _hits.get(key, deque())

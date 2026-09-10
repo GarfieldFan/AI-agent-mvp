@@ -19,7 +19,7 @@ import jwt
 # actually exposed to the internet.
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-only-insecure-secret-change-me")
 JWT_ALGORITHM = "HS256"
-# Long enough that a demo/interview run never needs a re-login mid-flow.
+# Long enough that a demo run never needs a re-login mid-flow.
 JWT_EXPIRES_MINUTES = 60 * 24
 
 

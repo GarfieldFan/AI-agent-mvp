@@ -28,8 +28,23 @@ export function savePageVersion(slug: string, content: GeneratedPage, note?: str
   });
 }
 
-export function listPages() {
-  return apiFetch<PageSummary[]>("/api/agent/pages");
+export type PageListResult = {
+  items: PageSummary[];
+  total: number;
+};
+
+/** Paginated + searchable (2026-09-10) — was a plain unbounded fetch,
+ * judged fine at the time ("a handful of pages per site") but real usage
+ * proved otherwise once a site accumulates enough pages to make both the
+ * CTE editor's page picker and the dashboard's Saved-pages list hard to
+ * navigate. `q` matches a slug substring. */
+export function listPages(params?: { q?: string; limit?: number; offset?: number }) {
+  const query = new URLSearchParams();
+  if (params?.q) query.set("q", params.q);
+  if (params?.limit !== undefined) query.set("limit", String(params.limit));
+  if (params?.offset !== undefined) query.set("offset", String(params.offset));
+  const qs = query.toString();
+  return apiFetch<PageListResult>(`/api/agent/pages${qs ? `?${qs}` : ""}`);
 }
 
 export type PageVersionListResult = {
@@ -38,10 +53,7 @@ export type PageVersionListResult = {
 };
 
 /** Paginated (2026-08-20, was a plain unbounded fetch of `page.versions`
- * loaded wholesale via the ORM relationship — see the root AGENTS.md).
- * `listPages()` above (the list of page slugs, not a slug's own version
- * history) deliberately stays unpaginated — a handful of pages per site,
- * not a real pagination candidate. */
+ * loaded wholesale via the ORM relationship — see the root AGENTS.md). */
 export function listPageVersions(slug: string, limit = 20, offset = 0) {
   return apiFetch<PageVersionListResult>(
     `/api/agent/pages/${encodeURIComponent(slug)}/versions?limit=${limit}&offset=${offset}`,

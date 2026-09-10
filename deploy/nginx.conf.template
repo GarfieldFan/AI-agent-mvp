@@ -22,6 +22,32 @@
 # __DOMAIN__/__BACKEND_PORT__/__FRONTEND_PORT__/__OWNER_AGENT_PORT__ are
 # substituted by deploy/setup-server.sh — this file is a template, never
 # used verbatim.
+#
+# limit_req_zone/limit_conn_zone (2026-09-10) — must live here, outside
+# the server block, since Nginx only allows these directives at the
+# `http` context level (this file is `include`d directly into that
+# context by setup-server.sh, same as any sites-enabled conf). Added
+# after a real stress test found that backend/apis/pages.py's `GET
+# /pages/{slug}` (and every other public, unauthenticated GET route) had
+# no request-rate or connection-count ceiling anywhere: a burst of a
+# couple hundred concurrent requests to just that one route, from a
+# single machine, exhausted the backend's entire DB connection pool and
+# left the whole app unresponsive for 90+ seconds with no self-recovery.
+# `backend/rate_limit.py` gained its own per-IP budget for these routes
+# too (see PREFIX_RULES there), but that middleware can only see
+# whatever IP actually connects to it — once THIS Nginx sits in front
+# (exactly the `--domain` deployment mode this file is for), every
+# request arrives from Nginx's own local connection, not the real
+# visitor's, so Nginx itself — which DOES see the real client IP
+# directly — is the correct place to actually enforce this once it's in
+# the request path at all. `rate=20r/s`/`burst=40` and a max of 20
+# concurrent connections per IP are both well above any real visitor's
+# normal browsing pattern (confirmed against this same stress test: 150
+# concurrent was fine, 220 broke it) while making the exact burst that
+# was found impossible to reproduce through this proxy.
+limit_req_zone $binary_remote_addr zone=api_req:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=api_conn:10m;
+
 server {
     listen 80;
     listen [::]:80;
@@ -34,6 +60,12 @@ server {
     client_max_body_size 50m;
 
     location /api/ {
+        # burst=40 nodelay: absorbs a real page load's own small burst of
+        # near-simultaneous API calls (page content, business profile,
+        # a few product cards, ...) without queuing/delaying them, while
+        # still hard-capping a sustained flood at ~20 req/s per IP.
+        limit_req zone=api_req burst=40 nodelay;
+        limit_conn api_conn 20;
         proxy_pass http://127.0.0.1:__BACKEND_PORT__;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

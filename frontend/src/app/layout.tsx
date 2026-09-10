@@ -24,12 +24,12 @@ const geistMono = Geist_Mono({
 
 const FALLBACK_TITLE = "AI MVP";
 const FALLBACK_DESCRIPTION =
-  "Full-stack + on-prem AI portfolio project: RAG, agent tooling, and an agent-permission security layer.";
+  "An AI-native small-business platform: RAG-grounded chat, agent tooling, and an agent-permission security layer.";
 
 /** Dynamic (2026-08-21, was a static `export const metadata`) — once an
  * owner configures a real business profile (BusinessProfilePanel,
  * /dashboard), the site's own title/description reflect their actual
- * business instead of this portfolio project's placeholder copy. Falls
+ * business instead of this generic placeholder copy. Falls
  * back to the original static values with zero configuration, same
  * "sensible default, no forced setup" posture as every other owner
  * setting in this app. A profile-fetch failure degrades to the fallback

@@ -6,10 +6,10 @@ import { extractPageSummary } from "@/lib/theme";
 import { getPublicPage } from "@/lib/pages";
 
 const FALLBACK_TITLE = "About";
-const FALLBACK_DESCRIPTION = "Project background, target roles, and technology choices.";
+const FALLBACK_DESCRIPTION = "Project background and technology choices.";
 
 // 2026-09-08 — was a static `export const metadata` with hardcoded
-// portfolio-project copy; now reflects the actual saved "about" content
+// placeholder copy; now reflects the actual saved "about" content
 // once the owner has customized it (same extractPageSummary this app's
 // other content pages use), falling back to the original static copy
 // for an unconfigured/default install. See the root AGENTS.md's GEO/
