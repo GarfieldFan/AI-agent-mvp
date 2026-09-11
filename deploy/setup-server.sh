@@ -66,6 +66,61 @@ if [[ ! -f /etc/os-release ]] || ! grep -qE '^ID=(ubuntu|debian)' /etc/os-releas
   exit 1
 fi
 
+# --- Cloud detection (AWS/GCP/Azure/generic) ----------------------------
+# Everything this script actually automates (apt, Docker, docker compose,
+# Nginx/Certbot) is already identical across every cloud — Ubuntu/Debian
+# doesn't care which VPS it's running on. Detection exists purely to make
+# the final summary below more useful: an auto-filled real public IP
+# (instead of a placeholder the owner has to go look up) and a pointer to
+# the right console for the ONE thing that genuinely differs per cloud —
+# where the firewall/security-group settings live — which this script
+# still can't configure itself regardless of cloud (see deploy/README.md's
+# "what this can NOT automate" note: that's an API/console-level setting
+# outside the instance, not something any in-VM tool like ufw touches on
+# any of the three).
+CLOUD="generic"
+PUBLIC_IP=""
+
+# AWS EC2 — IMDSv2 (token-based; IMDSv1 is deprecated/disabled on newer
+# instances, so this always tries the token dance first).
+AWS_TOKEN="$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" --max-time 2 2>/dev/null || true)"
+if [[ -n "$AWS_TOKEN" ]] && curl -sf -H "X-aws-ec2-metadata-token: $AWS_TOKEN" \
+  "http://169.254.169.254/latest/meta-data/instance-id" --max-time 2 >/dev/null 2>&1; then
+  CLOUD="aws"
+  PUBLIC_IP="$(curl -sf -H "X-aws-ec2-metadata-token: $AWS_TOKEN" \
+    "http://169.254.169.254/latest/meta-data/public-ipv4" --max-time 2 2>/dev/null || true)"
+# GCP Compute Engine — every metadata request needs this exact header.
+elif curl -sf -H "Metadata-Flavor: Google" \
+  "http://169.254.169.254/computeMetadata/v1/instance/id" --max-time 2 >/dev/null 2>&1; then
+  CLOUD="gcp"
+  PUBLIC_IP="$(curl -sf -H "Metadata-Flavor: Google" \
+    "http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" \
+    --max-time 2 2>/dev/null || true)"
+# Azure — IMDS needs this exact header + api-version.
+elif curl -sf -H "Metadata: true" \
+  "http://169.254.169.254/metadata/instance?api-version=2021-02-01" --max-time 2 >/dev/null 2>&1; then
+  CLOUD="azure"
+  PUBLIC_IP="$(curl -sf -H "Metadata: true" \
+    "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
+    --max-time 2 2>/dev/null || true)"
+fi
+
+# Generic fallback (a bare VPS with no cloud metadata service, or a cloud
+# whose metadata endpoint didn't respond in time) — a public IP-echo
+# service, best-effort only; leaves PUBLIC_IP empty rather than failing
+# if even this is unreachable (e.g. a server with outbound HTTPS blocked).
+if [[ -z "$PUBLIC_IP" ]]; then
+  PUBLIC_IP="$(curl -sf --max-time 3 https://api.ipify.org 2>/dev/null || curl -sf --max-time 3 https://ifconfig.me 2>/dev/null || true)"
+fi
+
+case "$CLOUD" in
+  aws) log "Detected: AWS EC2" ;;
+  gcp) log "Detected: Google Cloud Compute Engine" ;;
+  azure) log "Detected: Microsoft Azure VM" ;;
+  *) log "Detected: a generic Linux server (no AWS/GCP/Azure metadata service responded)" ;;
+esac
+
 # --- Docker install (official apt-repo method, idempotent) -------------
 log "Installing prerequisites"
 apt-get update -qq
@@ -143,6 +198,22 @@ if ! grep -q '^COMFYUI_HOST_OUTPUT_DIR=' .env || grep -q '^COMFYUI_HOST_OUTPUT_D
   set_env COMFYUI_HOST_OUTPUT_DIR "$TARGET_DIR/data/comfy_output"
 fi
 
+# The actual configured ports, read from .env itself — computed once,
+# here, and reused everywhere below (ufw, the Nginx template, the final
+# summary). Previously these were read three different, inconsistent
+# ways in three different places — the ufw block and the summary each
+# fell back to a hardcoded default via an unset shell env var
+# (${FRONTEND_PORT:-3000}, which is never actually set by anything, so
+# it silently ignored a real customized port in .env) rather than the
+# .env file itself; found and fixed while adding the cloud-detection
+# summary below.
+BACKEND_PORT_VAL="$(grep -E '^BACKEND_PORT=' .env | cut -d= -f2 || echo 8000)"
+FRONTEND_PORT_VAL="$(grep -E '^FRONTEND_PORT=' .env | cut -d= -f2 || echo 3000)"
+OWNER_AGENT_PORT_VAL="$(grep -E '^OWNER_AGENT_PORT=' .env | cut -d= -f2 || echo 8100)"
+BACKEND_PORT_VAL="${BACKEND_PORT_VAL:-8000}"
+FRONTEND_PORT_VAL="${FRONTEND_PORT_VAL:-3000}"
+OWNER_AGENT_PORT_VAL="${OWNER_AGENT_PORT_VAL:-8100}"
+
 if [[ -n "$DOMAIN" ]]; then
   log "Configuring .env for https://$DOMAIN"
   set_env HOST "$DOMAIN"
@@ -163,9 +234,9 @@ if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow 80/tcp >/dev/null
   ufw allow 443/tcp >/dev/null
   if [[ -z "$DOMAIN" ]]; then
-    ufw allow "${BACKEND_PORT:-8000}/tcp" >/dev/null 2>&1 || true
-    ufw allow "${FRONTEND_PORT:-3000}/tcp" >/dev/null 2>&1 || true
-    ufw allow "${OWNER_AGENT_PORT:-8100}/tcp" >/dev/null 2>&1 || true
+    ufw allow "${BACKEND_PORT_VAL}/tcp" >/dev/null 2>&1 || true
+    ufw allow "${FRONTEND_PORT_VAL}/tcp" >/dev/null 2>&1 || true
+    ufw allow "${OWNER_AGENT_PORT_VAL}/tcp" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -176,7 +247,7 @@ docker compose up -d --build
 
 log "Waiting for the backend to become reachable"
 for _ in $(seq 1 60); do
-  if curl -sf "http://127.0.0.1:$(grep -E '^BACKEND_PORT=' .env | cut -d= -f2 || echo 8000)/openapi.json" >/dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:${BACKEND_PORT_VAL}/openapi.json" >/dev/null 2>&1; then
     break
   fi
   sleep 3
@@ -192,15 +263,11 @@ if [[ -n "$DOMAIN" ]]; then
   log "Installing Nginx + Certbot"
   apt-get install -y -qq nginx certbot python3-certbot-nginx >/dev/null
 
-  BACKEND_PORT_VAL="$(grep -E '^BACKEND_PORT=' .env | cut -d= -f2 || echo 8000)"
-  FRONTEND_PORT_VAL="$(grep -E '^FRONTEND_PORT=' .env | cut -d= -f2 || echo 3000)"
-  OWNER_AGENT_PORT_VAL="$(grep -E '^OWNER_AGENT_PORT=' .env | cut -d= -f2 || echo 8100)"
-
   sed \
     -e "s/__DOMAIN__/$DOMAIN/g" \
-    -e "s/__BACKEND_PORT__/${BACKEND_PORT_VAL:-8000}/g" \
-    -e "s/__FRONTEND_PORT__/${FRONTEND_PORT_VAL:-3000}/g" \
-    -e "s/__OWNER_AGENT_PORT__/${OWNER_AGENT_PORT_VAL:-8100}/g" \
+    -e "s/__BACKEND_PORT__/${BACKEND_PORT_VAL}/g" \
+    -e "s/__FRONTEND_PORT__/${FRONTEND_PORT_VAL}/g" \
+    -e "s/__OWNER_AGENT_PORT__/${OWNER_AGENT_PORT_VAL}/g" \
     deploy/nginx.conf.template > /etc/nginx/sites-available/ai-employee.conf
   ln -sf /etc/nginx/sites-available/ai-employee.conf /etc/nginx/sites-enabled/ai-employee.conf
 
@@ -227,9 +294,29 @@ fi
 log "Done"
 if [[ -n "$DOMAIN" ]]; then
   echo "Site: http://$DOMAIN (https:// once DNS/certbot above succeeds)"
+elif [[ -n "$PUBLIC_IP" ]]; then
+  echo "Site: http://${PUBLIC_IP}:${FRONTEND_PORT_VAL}"
 else
-  echo "Site: http://<this-server's-public-IP>:${FRONTEND_PORT_VAL:-3000}"
+  echo "Site: http://<this-server's-public-IP>:${FRONTEND_PORT_VAL} (couldn't auto-detect the public IP — check your cloud console)"
 fi
+
+# Firewall/security-group settings live outside the instance on every
+# cloud (AWS Security Groups, GCP VPC firewall rules, Azure NSGs) — none
+# of them are configurable from inside the VM regardless of which cloud
+# this is, so the best this script can do is point at the right console.
+case "$CLOUD" in
+  aws) echo "Firewall: AWS Console -> EC2 -> Security Groups (attached to this instance)" ;;
+  gcp) echo "Firewall: Google Cloud Console -> VPC network -> Firewall rules" ;;
+  azure) echo "Firewall: Azure Portal -> this VM -> Networking -> Network security group" ;;
+  *) echo "Firewall: check your cloud/VPS provider's own firewall or security-group settings" ;;
+esac
+if [[ -z "$DOMAIN" ]]; then
+  echo "  (open: 22 for SSH, plus ${BACKEND_PORT_VAL}/${FRONTEND_PORT_VAL}/${OWNER_AGENT_PORT_VAL} for plain-IP access)"
+else
+  echo "  (open: 22 for SSH, plus 80/443 — the app ports above are bound to"
+  echo "  127.0.0.1 only in --domain mode, so they don't need to be open)"
+fi
+
 if echo "$OWNER_OUTPUT" | grep -q '^OWNER_PASSWORD='; then
   echo
   echo "############################################################"

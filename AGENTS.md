@@ -238,6 +238,35 @@ afterward — not just "the script exited 0."
   already-set `JWT_SECRET`, never re-derives an already-fixed
   `COMFYUI_HOST_OUTPUT_DIR`, never creates a second owner account, and
   reuses an already-issued TLS certificate.
+- **Cloud detection (AWS/GCP/Azure/generic), added 2026-09-11** — off a
+  direct user ask: rather than write a separate template for each cloud
+  provider, one script probes each cloud's own instance-metadata service
+  (AWS's IMDSv2 token dance, GCP's `Metadata-Flavor: Google` header,
+  Azure's `Metadata: true` header) and adapts what it PRINTS, not what it
+  automates — the actual install (apt, Docker, docker compose, Nginx/
+  Certbot) is already identical across every cloud, since Ubuntu/Debian
+  doesn't care which VPS it's hosted on. What detection actually buys:
+  an auto-filled real public IP in the final summary (falls back to a
+  public IP-echo service, `api.ipify.org`/`ifconfig.me`, if no cloud
+  metadata service responds at all — verified directly, not assumed: run
+  standalone inside a plain dev container with no cloud metadata
+  present, it correctly detected "generic" and correctly fetched a real
+  public IP via the fallback) and a pointer to the right console for the
+  ONE thing that genuinely differs per cloud — where firewall/security-
+  group settings actually live (AWS Security Groups, GCP VPC firewall
+  rules, Azure NSGs) — none of which are configurable from inside the
+  VM on any of the three, so this was never something to automate, only
+  to point at correctly. **Not independently verified against a real AWS/
+  GCP/Azure instance** — no real cloud account was available in this
+  sandboxed session; only the metadata-absent "generic" fallback path was
+  exercised for real. A real, previously-undetected bug was found and
+  fixed while adding this: the script's own summary and its `ufw`
+  firewall-rule block both referenced an unset shell environment variable
+  (`${FRONTEND_PORT:-3000}`, never actually set by anything) instead of
+  the real value from `.env`, so a customized `FRONTEND_PORT` was always
+  silently ignored in both places — now both read the same
+  once-computed `FRONTEND_PORT_VAL`/etc. the Nginx template substitution
+  already used.
 - **Never seeds `backend/seed.py`'s demo accounts onto a real server —
   a real security decision, not an oversight.** Those three accounts
   (shared password `0000`, displayed openly on the frontend's own
