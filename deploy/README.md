@@ -1,4 +1,28 @@
-# Deploying to a real server (AWS EC2 or any VPS)
+# Getting this running — local testing or a real server
+
+Three install paths, one for each situation — pick the one that matches
+where you're actually running this:
+
+| Situation | Script |
+|---|---|
+| Testing locally on a Mac | `./deploy/install-mac.sh` |
+| Testing locally on Windows | `.\deploy\install-windows.ps1` (PowerShell) |
+| A real Linux cloud server (EC2/any VPS) — see below | `sudo ./deploy/setup-server.sh` |
+
+The two local scripts only need Docker Desktop already installed (they
+tell you how, then stop, if it isn't) — they do the same `.env`
+bootstrap + `docker compose up` + owner-account creation as the server
+script below, just without anything server-specific (no `apt`-installed
+Docker, no `ufw` firewall, no Nginx/Certbot/domain — none of that
+applies to a local test machine). Both are safe to re-run: they never
+overwrite a `.env` you've already customized, never create a second
+owner account, and leave an already-valid `COMFYUI_HOST_OUTPUT_DIR`
+alone rather than replacing it with a placeholder. Once either finishes,
+the site is at `http://localhost:3000` — reachable from any device on
+the same machine or LAN, including a phone/tablet's browser once you
+swap `localhost` for the machine's real IP.
+
+## Deploying to a real server (AWS EC2 or any VPS)
 
 This automates everything that happens **on the server itself** —
 installing Docker, pulling the code, generating a real `.env`, starting
@@ -13,7 +37,7 @@ The one-time steps below are exactly that boundary: a normal AWS
 console walkthrough, no different from setting up any other EC2-hosted
 app.
 
-## 1. One-time setup in your cloud provider's console (you do this part)
+### 1. One-time setup in your cloud provider's console (you do this part)
 
 Using AWS EC2 as the concrete example — any other VPS (Lightsail,
 DigitalOcean, Linode, a bare server) needs the equivalent of the same
@@ -44,7 +68,7 @@ three things:
    already resolve before it can issue a certificate — DNS propagation
    can take a few minutes to a few hours.
 
-## 2. Run the actual deploy script (this is what's automated)
+### 2. Run the actual deploy script (this is what's automated)
 
 SSH into the instance, then:
 
@@ -102,7 +126,7 @@ own comments for the full detail on any one step:
 re-clobber your `.env`, won't create a second owner account, and reuses
 an already-issued certificate.
 
-## 3. Afterward
+### 3. Afterward
 
 - **Log in** with the owner email/password printed at the end of the
   run (not shown again — if you lost it, see `backend/create_owner.py`'s

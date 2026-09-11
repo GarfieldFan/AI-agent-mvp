@@ -58,11 +58,13 @@ ai-employee/
 ├── HISTORY.md                 full chronological development log — read on demand, not by default
 ├── docker-compose.yml        backend + frontend + postgres-db + owner-agent + ollama services
 ├── .env / .env.example       host/ports/ComfyUI config — see "Configuration" below
-├── deploy/                   real-server deployment automation — see "Deploying to a real server" below
+├── deploy/                   real-server deployment automation + local-machine installers — see "Deploying to a real server" below
 │   ├── setup-server.sh         one-command bootstrap for a fresh Ubuntu/Debian server
 │   ├── update.sh                pulls latest code + restarts an already-deployed stack
+│   ├── install-mac.sh            one-command local install/start for a Mac tester (2026-09-11)
+│   ├── install-windows.ps1       same, for a Windows tester (2026-09-11)
 │   ├── nginx.conf.template      reverse-proxy config template for the optional --domain mode
-│   └── README.md                 the one-time manual AWS-console (or any VPS) steps + full walkthrough
+│   └── README.md                 all three install paths — which script for which situation, plus the one-time manual AWS-console (or any VPS) steps
 ├── backend/                  FastAPI (Python) — see backend/main.py
 │   ├── db.py                  SQLAlchemy engine/session (DATABASE_URL), Base, get_db dependency
 │   ├── models.py               User / Page / PageVersion / Document / DocumentChunk / AppSettings / ChatSession / ChatMessage / CrmEntry ORM models
@@ -184,6 +186,46 @@ instance, open its firewall/security-group ports, point a domain's DNS
 at it — as a normal manual walkthrough; `deploy/setup-server.sh` is
 everything from "SSH into a fresh Ubuntu/Debian box" to "the app is
 running" in one command.
+
+**Local-machine installers, added 2026-09-11** — a genuinely different
+job from the server script above, off a direct user ask ("检测windows，
+mac还是网络情况，做不同的安装方案" — detect Windows, Mac, or a networked-server
+situation, and use a different install path for each). `deploy/
+install-mac.sh` and `deploy/install-windows.ps1` are one-command
+install/start scripts for a Mac or Windows tester running this locally
+— deliberately NOT a stripped-down copy of `setup-server.sh`, since
+almost everything that script automates (installing Docker itself via
+`apt`, `ufw`, Nginx + Certbot for a real domain) doesn't apply to a
+local test machine at all: Docker Desktop is a GUI app a script can't
+silently install on either OS, and there's no public domain/HTTPS or
+firewall to configure. Both scripts only handle what's actually
+different locally: verify Docker Desktop is installed and running (if
+not, print the install instructions — Homebrew/the official DMG on Mac,
+winget/the official installer on Windows — and stop, never try to force
+an install), find-or-clone the repo, then the same `.env` bootstrap +
+`docker compose up -d --build` + `create_owner.py` call
+`setup-server.sh` already does. Both fix `COMFYUI_HOST_OUTPUT_DIR` the
+same way `setup-server.sh` does for Linux (this project's own dev
+machine's literal path won't exist on a fresh test machine — replaced
+with a local, empty directory so the bind mount stays valid; image
+generation just reports "not reachable," same graceful-degradation
+behavior every other unconfigured provider already has) — but only if
+the currently-configured path doesn't actually exist on disk, so a
+tester who already has a real ComfyUI output directory configured never
+gets it silently overwritten. `install-mac.sh` verified via `shellcheck`
+(clean, same bar `setup-server.sh`/`update.sh` were held to — a real
+Mac to execute it on wasn't available in this sandboxed session).
+`install-windows.ps1` avoids all non-ASCII characters (em dashes
+included) specifically to sidestep Windows PowerShell 5.1's encoding
+quirks with a `.ps1` file that has no BOM, and was verified for real,
+live, twice: once via `[System.Management.Automation.Language.Parser]
+::ParseFile` (clean), then a genuine live run against this project's own
+real Windows dev-machine checkout — correctly left an already-valid
+`.env`/`COMFYUI_HOST_OUTPUT_DIR` untouched, rebuilt and recreated every
+container, correctly detected the already-existing owner account
+("nothing to do," no duplicate created), and the resulting site was
+confirmed actually reachable (`curl` 200 on both frontend and backend)
+afterward — not just "the script exited 0."
 
 - **`deploy/setup-server.sh`** — installs Docker (official apt-repo
   method) if missing, clones/updates this repo, generates a real `.env`
