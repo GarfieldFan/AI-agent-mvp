@@ -4409,7 +4409,12 @@ nothing in it writes anything.
   `searchText`, so there's no longer a second effect watching derived
   state at all — the fix that's actually more correct anyway (page reset
   happens exactly when the debounced search value would change, not from
-  a separately-reactive watcher).
+  a separately-reactive watcher). **This exact single-effect shape was
+  later extracted into a shared `useDebouncedSearch` hook (2026-09-11,
+  `frontend/AGENTS.md`'s `lib/` table) once the identical pattern turned
+  up hand-copied into `CteEditorPanel`/`PageManager` too — this
+  component no longer has its own inline effect at all, it just calls
+  the hook.**
 - **Verified end-to-end**: session list pagination/search all correct
   against real logged sessions from earlier in this project's history;
   a real transcript (`quick-test` session) rendered its exact 2 messages
