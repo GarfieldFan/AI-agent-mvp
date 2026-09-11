@@ -238,28 +238,37 @@ afterward — not just "the script exited 0."
   already-set `JWT_SECRET`, never re-derives an already-fixed
   `COMFYUI_HOST_OUTPUT_DIR`, never creates a second owner account, and
   reuses an already-issued TLS certificate.
-- **Cloud detection (AWS/GCP/Azure/generic), added 2026-09-11** — off a
-  direct user ask: rather than write a separate template for each cloud
-  provider, one script probes each cloud's own instance-metadata service
-  (AWS's IMDSv2 token dance, GCP's `Metadata-Flavor: Google` header,
-  Azure's `Metadata: true` header) and adapts what it PRINTS, not what it
-  automates — the actual install (apt, Docker, docker compose, Nginx/
-  Certbot) is already identical across every cloud, since Ubuntu/Debian
-  doesn't care which VPS it's hosted on. What detection actually buys:
-  an auto-filled real public IP in the final summary (falls back to a
-  public IP-echo service, `api.ipify.org`/`ifconfig.me`, if no cloud
-  metadata service responds at all — verified directly, not assumed: run
-  standalone inside a plain dev container with no cloud metadata
-  present, it correctly detected "generic" and correctly fetched a real
-  public IP via the fallback) and a pointer to the right console for the
-  ONE thing that genuinely differs per cloud — where firewall/security-
-  group settings actually live (AWS Security Groups, GCP VPC firewall
-  rules, Azure NSGs) — none of which are configurable from inside the
-  VM on any of the three, so this was never something to automate, only
-  to point at correctly. **Not independently verified against a real AWS/
-  GCP/Azure instance** — no real cloud account was available in this
-  sandboxed session; only the metadata-absent "generic" fallback path was
-  exercised for real. A real, previously-undetected bug was found and
+- **Cloud detection (AWS/GCP/Azure/OCI/generic), added 2026-09-11, OCI
+  added the same day off a direct follow-up ask** — rather than write a
+  separate template for each cloud provider, one script probes each
+  cloud's own instance-metadata service (AWS's IMDSv2 token dance, GCP's
+  `Metadata-Flavor: Google` header, Azure's `Metadata: true` header,
+  OCI's `Authorization: Bearer Oracle` header against its v2 metadata
+  endpoint) and adapts what it PRINTS, not what it automates — the
+  actual install (apt, Docker, docker compose, Nginx/Certbot) is already
+  identical across every cloud, since Ubuntu/Debian doesn't care which
+  VPS it's hosted on. What detection actually buys: an auto-filled real
+  public IP in the final summary (falls back to a public IP-echo
+  service, `api.ipify.org`/`ifconfig.me`, if no cloud metadata service
+  responds at all — verified directly, not assumed: run standalone
+  inside a plain dev container with no cloud metadata present, it
+  correctly detected "generic" and correctly fetched a real public IP
+  via the fallback, and separately confirmed the OCI check specifically
+  doesn't false-positive in that same environment) and a pointer to the
+  right console for the ONE thing that genuinely differs per cloud —
+  where firewall/security-group settings actually live (AWS Security
+  Groups, GCP VPC firewall rules, Azure NSGs, OCI Security Lists/NSGs)
+  — none of which are configurable from inside the VM on any of them,
+  so this was never something to automate, only to point at correctly.
+  OCI's public-IP lookup is a separate VNIC-info endpoint (not the
+  instance one), parsed with a plain `grep`/`sed` field extraction since
+  this script has no `jq` dependency — verified directly against a
+  synthetic sample matching OCI's own documented response shape, not
+  assumed to work. **Not independently verified against a real AWS/GCP/
+  Azure/OCI instance** — no real cloud account was available in this
+  sandboxed session; only the metadata-absent "generic" fallback path
+  (and OCI's own non-false-positive check) was exercised for real. A
+  real, previously-undetected bug was found and
   fixed while adding this: the script's own summary and its `ufw`
   firewall-rule block both referenced an unset shell environment variable
   (`${FRONTEND_PORT:-3000}`, never actually set by anything) instead of

@@ -66,7 +66,7 @@ if [[ ! -f /etc/os-release ]] || ! grep -qE '^ID=(ubuntu|debian)' /etc/os-releas
   exit 1
 fi
 
-# --- Cloud detection (AWS/GCP/Azure/generic) ----------------------------
+# --- Cloud detection (AWS/GCP/Azure/OCI/generic) ------------------------
 # Everything this script actually automates (apt, Docker, docker compose,
 # Nginx/Certbot) is already identical across every cloud — Ubuntu/Debian
 # doesn't care which VPS it's running on. Detection exists purely to make
@@ -77,7 +77,7 @@ fi
 # still can't configure itself regardless of cloud (see deploy/README.md's
 # "what this can NOT automate" note: that's an API/console-level setting
 # outside the instance, not something any in-VM tool like ufw touches on
-# any of the three).
+# any of them).
 CLOUD="generic"
 PUBLIC_IP=""
 
@@ -104,6 +104,18 @@ elif curl -sf -H "Metadata: true" \
   PUBLIC_IP="$(curl -sf -H "Metadata: true" \
     "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
     --max-time 2 2>/dev/null || true)"
+# Oracle Cloud (OCI) — v2 metadata needs this exact bearer header (OCI's
+# own current recommendation over the header-less v1 endpoint). Public
+# IP is on a separate VNIC-info endpoint, not the instance one; parsed
+# with a plain grep/sed since this script has no jq dependency — the
+# same lightweight single-field extraction posture used nowhere else in
+# this script only because nothing else here needed it until now.
+elif curl -sf -H "Authorization: Bearer Oracle" \
+  "http://169.254.169.254/opc/v2/instance/" --max-time 2 >/dev/null 2>&1; then
+  CLOUD="oci"
+  PUBLIC_IP="$(curl -sf -H "Authorization: Bearer Oracle" \
+    "http://169.254.169.254/opc/v2/vnics/" --max-time 2 2>/dev/null \
+    | grep -o '"publicIp" *: *"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/' || true)"
 fi
 
 # Generic fallback (a bare VPS with no cloud metadata service, or a cloud
@@ -118,7 +130,8 @@ case "$CLOUD" in
   aws) log "Detected: AWS EC2" ;;
   gcp) log "Detected: Google Cloud Compute Engine" ;;
   azure) log "Detected: Microsoft Azure VM" ;;
-  *) log "Detected: a generic Linux server (no AWS/GCP/Azure metadata service responded)" ;;
+  oci) log "Detected: Oracle Cloud Infrastructure (OCI)" ;;
+  *) log "Detected: a generic Linux server (no AWS/GCP/Azure/OCI metadata service responded)" ;;
 esac
 
 # --- Docker install (official apt-repo method, idempotent) -------------
@@ -301,13 +314,15 @@ else
 fi
 
 # Firewall/security-group settings live outside the instance on every
-# cloud (AWS Security Groups, GCP VPC firewall rules, Azure NSGs) — none
-# of them are configurable from inside the VM regardless of which cloud
-# this is, so the best this script can do is point at the right console.
+# cloud (AWS Security Groups, GCP VPC firewall rules, Azure NSGs, OCI
+# Security Lists/NSGs) — none of them are configurable from inside the
+# VM regardless of which cloud this is, so the best this script can do
+# is point at the right console.
 case "$CLOUD" in
   aws) echo "Firewall: AWS Console -> EC2 -> Security Groups (attached to this instance)" ;;
   gcp) echo "Firewall: Google Cloud Console -> VPC network -> Firewall rules" ;;
   azure) echo "Firewall: Azure Portal -> this VM -> Networking -> Network security group" ;;
+  oci) echo "Firewall: OCI Console -> Networking -> Virtual Cloud Networks -> Security Lists (or Network Security Groups)" ;;
   *) echo "Firewall: check your cloud/VPS provider's own firewall or security-group settings" ;;
 esac
 if [[ -z "$DOMAIN" ]]; then
