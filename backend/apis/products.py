@@ -39,7 +39,7 @@ import os
 from datetime import datetime
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import Text, cast, func, or_, select
 from sqlalchemy.orm import Session, selectinload
@@ -50,11 +50,12 @@ from apis.media import resolve_media_local_path
 from apis.model_settings import resolve_chat_provider
 from apis.notifications import notify_owner
 from apis.payments import resolve_payment_provider
+from receipts import build_order_receipt_pdf
 from cart import apply_order_delta, count_search_products, decrement_stock_and_notify, find_active_order, search_products
 from db import get_db
 from ingest import parse_document
 from llm_json import parse_lenient_json_array
-from models import AppSettings, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation, StockItem
+from models import AppSettings, ChatSession, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation, StockItem
 from payments import PaymentProviderNotConfigured
 from providers.base import ProviderNotConfigured
 
@@ -981,6 +982,27 @@ async def update_order(order_id: int, req: UpdateOrderRequest, db: Session = Dep
     return _to_order_summary(row)
 
 
+@admin_router.get("/agent/orders/{order_id}/receipt.pdf")
+def get_order_receipt_admin(order_id: int, db: Session = Depends(get_db)) -> Response:
+    """Admin/owner-facing PDF receipt download (2026-09-21,
+    backend/receipts.py) — for staff record-keeping, printing, or
+    emailing a copy to a customer, from `OrderPanel`. See `receipts.py`'s
+    own module docstring for why this is a separate small module rather
+    than inline formatting here — the identical PDF is also reachable by
+    a customer themselves via `get_order_receipt_self`/
+    `get_order_receipt_public` below."""
+    order = db.get(Order, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    business = db.get(AppSettings, 1)
+    pdf_bytes = build_order_receipt_pdf(order, business)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="receipt-order-{order.id}.pdf"'},
+    )
+
+
 class UpdateOrderItemRequest(BaseModel):
     served: bool | None = None
     comment: str | None = None
@@ -1318,15 +1340,22 @@ class CheckoutRequest(BaseModel):
 
 class CheckoutResponse(BaseModel):
     order: OrderSummary
-    # Set only when the configured payment provider needs the visitor to
-    # actually pay through a real UI (Stripe's embedded Checkout, see
-    # backend/payments.py) — null when payment already resolved
-    # synchronously (the "test" provider). The frontend mounts Stripe's
-    # own `<EmbeddedCheckout>` modal with this when set (2026-09-10 — a
+    # Which provider actually processed this checkout (2026-09-21) —
+    # tells the frontend which modal, if any, to mount. "test" means
+    # payment already resolved synchronously, no modal needed.
+    provider: str
+    # Set only when `provider == "stripe"` — Stripe's embedded Checkout
+    # (see backend/payments.py). The frontend mounts Stripe's own
+    # `<EmbeddedCheckout>` modal with this when set (2026-09-10 — a
     # popup on this page, not a full-page redirect, see payments.py's own
     # docstring for the "why"), shows the normal confirmation screen when
     # not.
     client_secret: str | None
+    # Set only when `provider == "adyen"` (2026-09-21) — mount Adyen's
+    # own Drop-in with `{id: adyen_session_id, sessionData:
+    # adyen_session_data}`, see AdyenPaymentProvider's own docstring.
+    adyen_session_id: str | None = None
+    adyen_session_data: str | None = None
 
 
 @public_router.post("/cart/checkout", response_model=CheckoutResponse)
@@ -1335,13 +1364,18 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
     configured payment gate (backend/payments.py) — "test" (the default)
     skips straight to a paid, closed order with no real charge; "stripe"
     creates a real embedded Checkout Session and hands back its
-    `client_secret` instead of closing the order immediately. The order
-    only actually closes (`is_open = False`) once payment is confirmed —
-    synchronously here for "test," asynchronously via
-    `POST /webhooks/stripe` for a real Stripe payment, since a visitor
-    can close the tab right after paying and before the embedded
-    checkout's own return trip completes. 400s on an empty/missing cart
-    rather than creating an empty Order — nothing to check out.
+    `client_secret`; "adyen" (2026-09-21, the aggregator gateway added
+    for local/regional payment methods Stripe doesn't cover for a given
+    account — China UnionPay in particular) creates a real Adyen
+    Checkout Session and hands back `adyen_session_id`/
+    `adyen_session_data` instead — either way, the order isn't closed
+    immediately. The order only actually closes (`is_open = False`) once
+    payment is confirmed — synchronously here for "test," asynchronously
+    via `POST /webhooks/stripe`/`POST /webhooks/adyen` for a real
+    payment, since a visitor can close the tab right after paying and
+    before the embedded checkout's own return trip completes. 400s on an
+    empty/missing cart rather than creating an empty Order — nothing to
+    check out.
 
     **Shipping-region gate (2026-09-10)** — deterministic Python, no
     third-party geocoding: if the owner has configured
@@ -1450,4 +1484,38 @@ async def checkout_cart(req: CheckoutRequest, db: Session = Depends(get_db)) -> 
         )
         await decrement_stock_and_notify(db, order)
 
-    return CheckoutResponse(order=_to_order_summary(order), client_secret=result.client_secret)
+    return CheckoutResponse(
+        order=_to_order_summary(order),
+        provider=provider_name,
+        client_secret=result.client_secret,
+        adyen_session_id=result.adyen_session_id,
+        adyen_session_data=result.adyen_session_data,
+    )
+
+
+@public_router.get("/orders/{order_id}/receipt.pdf")
+def get_order_receipt_public(order_id: int, session_id: str, db: Session = Depends(get_db)) -> Response:
+    """Public, no-auth PDF receipt download for a guest checkout (most
+    orders in this app never involve a login) — the same `session_id`
+    (this visitor's own chat/cart session, from `getChatSessionId()`)
+    every other public cart/order route already trusts as a de facto
+    capability token (see `GET /cart`'s identical `session_id`-scoping,
+    and the root AGENTS.md's "Cart/order recovery via ?sid=" entry for
+    why that's an accepted trust model in this app, not a new one).
+    Deliberately does NOT reuse `_get_or_create_session` — that helper
+    CREATES a session row for an unrecognized key, which would let
+    anyone probing random ids quietly seed junk `ChatSession` rows; this
+    is a read-only lookup, a miss is just a 404."""
+    order = db.get(Order, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    session = db.query(ChatSession).filter(ChatSession.session_key == session_id).first()
+    if session is None or order.chat_session_id != session.id:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    business = db.get(AppSettings, 1)
+    pdf_bytes = build_order_receipt_pdf(order, business)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="receipt-order-{order.id}.pdf"'},
+    )

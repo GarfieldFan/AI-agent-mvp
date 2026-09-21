@@ -26,6 +26,7 @@ from apis.media import router as media_router
 from apis.crm_resume import router as crm_resume_router
 from apis.maps import admin_router as maps_admin_router
 from apis.maps import public_router as maps_public_router
+from apis.marketing import router as marketing_router
 from apis.model_settings import router as model_settings_router
 from apis.my_account import router as my_account_router
 from apis.notifications import router as notifications_router
@@ -113,6 +114,7 @@ app.include_router(media_router, prefix="/api")
 app.include_router(payments_admin_router, prefix="/api")
 app.include_router(payments_public_router, prefix="/api")
 app.include_router(notifications_router, prefix="/api")
+app.include_router(marketing_router, prefix="/api")
 app.include_router(crm_resume_router, prefix="/api")
 app.include_router(maps_admin_router, prefix="/api")
 app.include_router(maps_public_router, prefix="/api")

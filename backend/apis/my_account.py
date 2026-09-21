@@ -12,7 +12,7 @@ only really matters if there's somewhere for a newly-authenticated
 visitor to actually see their own history afterward; this is that
 somewhere."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -21,7 +21,8 @@ from apis.agent import CrmEntryResponse, _crm_entry_response
 from apis.deps import CurrentUser, require_authenticated_user
 from apis.products import OrderListResponse, _to_order_summary
 from db import get_db
-from models import ChatMessage, ChatSession, CrmEntry, Order
+from models import AppSettings, ChatMessage, ChatSession, CrmEntry, Order
+from receipts import build_order_receipt_pdf
 
 router = APIRouter(prefix="/my")
 
@@ -41,6 +42,27 @@ def list_my_orders(
         .all()
     )
     return OrderListResponse(items=[_to_order_summary(r) for r in rows], total=total)
+
+
+@router.get("/orders/{order_id}/receipt.pdf")
+def get_my_order_receipt(
+    order_id: int, db: Session = Depends(get_db), current: CurrentUser = Depends(require_authenticated_user)
+) -> Response:
+    """PDF receipt download for a logged-in visitor's own order
+    (2026-09-21, backend/receipts.py) — same "user isolation" posture as
+    every other route in this file: 404, not 403, on an order that
+    exists but isn't the caller's own, so an id-guessing attempt learns
+    nothing either way."""
+    order = db.get(Order, order_id)
+    if order is None or order.contact_email != current.email:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    business = db.get(AppSettings, 1)
+    pdf_bytes = build_order_receipt_pdf(order, business)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="receipt-order-{order.id}.pdf"'},
+    )
 
 
 @router.get("/crm-entries", response_model=list[CrmEntryResponse])

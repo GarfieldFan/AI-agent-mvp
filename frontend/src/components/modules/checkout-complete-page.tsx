@@ -9,6 +9,7 @@ import { Container } from "@/components/layout/container";
 import { EmptyState } from "@/components/common/empty-state";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { getCheckoutSessionStatus } from "@/lib/payments";
+import { publicOrderReceiptUrl } from "@/lib/orders";
 
 /** `/checkout/complete` (2026-09-10) — where Stripe's own embedded
  * Checkout navigates the top-level page once a visitor finishes paying
@@ -29,6 +30,14 @@ export function CheckoutCompletePage() {
   const [sessionId] = React.useState(() => {
     if (typeof window === "undefined") return null;
     return new URLSearchParams(window.location.search).get("session_id");
+  });
+  // The backend's own return_url (and AdyenCheckoutDialog's matching
+  // redirect) both carry this — the real order id, not the payment
+  // provider's own session id above — so a receipt link can be offered
+  // here regardless of which provider was used.
+  const [orderId] = React.useState(() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("order_id");
   });
   const [status, setStatus] = React.useState<"checking" | "paid" | "pending" | "unknown">(
     sessionId ? "checking" : "unknown",
@@ -61,9 +70,20 @@ export function CheckoutCompletePage() {
         title={status === "paid" ? "Payment received" : "Thanks for your order"}
         description={description}
         action={
-          <Button render={<Link href="/" />} nativeButton={false} variant="outline">
-            Back to home
-          </Button>
+          <div className="flex items-center justify-center gap-2">
+            {orderId ? (
+              <Button
+                render={<a href={publicOrderReceiptUrl(Number(orderId))} target="_blank" rel="noreferrer" />}
+                nativeButton={false}
+                variant="outline"
+              >
+                Download receipt
+              </Button>
+            ) : null}
+            <Button render={<Link href="/" />} nativeButton={false} variant="outline">
+              Back to home
+            </Button>
+          </div>
         }
       />
     </Container>

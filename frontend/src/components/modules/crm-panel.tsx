@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Headset, Paperclip, Trash2, Users } from "lucide-react";
+import { Headset, Megaphone, Paperclip, Trash2, Users } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,6 +24,7 @@ import {
   type CrmStatus,
 } from "@/lib/crm";
 import { listIntentSchemas, type IntentSchema } from "@/lib/intent-schemas";
+import { syncCrmEntryToMarketing } from "@/lib/marketing";
 
 // Fixed display order + labels for the known categories apis/chat.py's
 // automatic capture and this panel's manual form both use. Anything else
@@ -261,6 +262,8 @@ function CrmCategoryCard({
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [statusErrorByEntry, setStatusErrorByEntry] = React.useState<Record<string, string>>({});
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  const [syncingId, setSyncingId] = React.useState<string | null>(null);
+  const [syncMessageByEntry, setSyncMessageByEntry] = React.useState<Record<string, string>>({});
 
   const refresh = React.useCallback(() => {
     listCrmEntries({ category: categoryKey, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE })
@@ -300,6 +303,28 @@ function CrmCategoryCard({
       setLoadError(err instanceof ApiError ? err.message : "Failed to delete entry.");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  async function handleSync(entry: CrmEntry) {
+    setSyncingId(entry.crm_id);
+    setSyncMessageByEntry((prev) => ({ ...prev, [entry.crm_id]: "" }));
+    try {
+      const result = await syncCrmEntryToMarketing(entry.crm_id);
+      setSyncMessageByEntry((prev) => ({
+        ...prev,
+        [entry.crm_id]:
+          result.provider === "test"
+            ? "Test mode — nothing was really synced. Configure a real provider in Marketing settings."
+            : `Synced to ${result.provider}.`,
+      }));
+    } catch (err) {
+      setSyncMessageByEntry((prev) => ({
+        ...prev,
+        [entry.crm_id]: err instanceof ApiError ? err.message : "Sync failed.",
+      }));
+    } finally {
+      setSyncingId(null);
     }
   }
 
@@ -367,6 +392,15 @@ function CrmCategoryCard({
                 <Button
                   variant="ghost"
                   size="icon-xs"
+                  aria-label="Sync to marketing platform"
+                  disabled={syncingId === entry.crm_id}
+                  onClick={() => handleSync(entry)}
+                >
+                  <Megaphone className="size-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
                   aria-label="Delete entry"
                   disabled={deletingId === entry.crm_id}
                   onClick={() => handleDelete(entry)}
@@ -375,6 +409,9 @@ function CrmCategoryCard({
                 </Button>
               </div>
             </div>
+            {syncMessageByEntry[entry.crm_id] ? (
+              <p className="text-xs text-muted-foreground">{syncMessageByEntry[entry.crm_id]}</p>
+            ) : null}
             <p className="text-sm text-muted-foreground">{entry.summary}</p>
             {entry.intent_schema_id && Object.keys(entry.collected_fields).length > 0 ? (
               <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 rounded-md bg-muted/50 p-2 text-xs">

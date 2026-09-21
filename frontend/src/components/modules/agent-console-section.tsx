@@ -16,6 +16,7 @@ import { GeoPagePanel } from "@/components/modules/geo-page-panel";
 import { IntentSchemaPanel } from "@/components/modules/intent-schema-panel";
 import { MapSettingsPanel } from "@/components/modules/map-settings-panel";
 import { ModelSettingsPanel } from "@/components/modules/model-settings-panel";
+import { MarketingSettingsPanel } from "@/components/modules/marketing-settings-panel";
 import { NotificationSettingsPanel } from "@/components/modules/notification-settings-panel";
 import { ErrorLogPanel } from "@/components/modules/error-log-panel";
 import { OAuthSettingsPanel } from "@/components/modules/oauth-settings-panel";
@@ -191,6 +192,7 @@ export function AgentConsoleSection() {
               <OrderPanel />
               <PaymentSettingsPanel />
               <NotificationSettingsPanel />
+              <MarketingSettingsPanel />
               <ErrorLogPanel />
               <MapSettingsPanel />
             </AccordionPanel>

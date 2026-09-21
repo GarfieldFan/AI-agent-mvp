@@ -95,7 +95,7 @@ ai-employee/
 │       └── deps.py            RBAC: Role enum + require_role() dependency, backed by real JWTs
 ├── owner-agent/               isolated LLM tool-calling loop, own container/port 8100 — see "Owner agent" below
 │   ├── deps.py                 owner-only JWT check (duplicated from backend, not imported — see below)
-│   ├── tools.py                 fixed 29-tool allowlist + execute_tool() (HTTP calls onto backend)
+│   ├── tools.py                 fixed 30-tool allowlist + execute_tool() (HTTP calls onto backend)
 │   ├── agent_loop.py             the loop itself: JSON-envelope tool selection against Ollama
 │   ├── logging_.py                action log: stdout + logs/runs.jsonl (never the bearer token)
 │   └── main.py                  FastAPI app: GET /health, POST /run
@@ -439,7 +439,7 @@ belongs in a separate, narrowly-scoped worker.
 
 That worker now exists: **`owner-agent/`** (its own docker-compose
 service, port 8100). It's a real LLM tool-calling loop — the owner types a
-command, a local Ollama model decides which of a fixed 29-tool allowlist to
+command, a local Ollama model decides which of a fixed 30-tool allowlist to
 call, in what order, chaining results turn-to-turn (see "Owner agent" in
 Phase 6 below for the full design). It independently re-verifies the
 caller's JWT and requires `Role.owner` specifically (stricter than
@@ -2223,6 +2223,69 @@ that package is specifically AI providers, and payment isn't one.
   surfaces the exact webhook URL to paste into Stripe's own dashboard.
   `OrderPanel`'s summary row gained a `payment_status` `Badge`
   (paid/unpaid/failed) next to the total, visible without expanding.
+- **Wallet payment methods — Apple Pay / Google Pay / WeChat Pay /
+  Alipay / Stripe's own PayPal (2026-09-20)**, off a direct user ask for
+  a "universal" payment interface. Researched against Stripe's own live
+  docs (not assumed from training data) before building anything: none
+  of these are separate providers — they're payment METHODS within the
+  one `stripe` provider above. `StripePaymentProvider.create_checkout`
+  already passes no `payment_method_types` at all, which is Stripe's own
+  "Dynamic Payment Methods" behavior — every eligible method (enabled in
+  the merchant's Dashboard, plus currency/country/session eligibility)
+  already shows up automatically with zero code on our side, and this
+  was already true before this round, not something this change added.
+  WeChat Pay is the same story (business-location- and currency-
+  eligible for a US Stripe account, confirmed against Stripe's docs) —
+  purely a Dashboard toggle, no code. The one thing that genuinely
+  needed a real API call: Apple Pay and Google Pay both require the
+  domain SHOWING the Checkout UI to be registered with Stripe (`POST
+  /v1/payment_method_domains`) — but only for `ui_mode="embedded"` (this
+  app's mode since 2026-09-10); Stripe's hosted/redirect Checkout needs
+  no such registration since that page is served from Stripe's own,
+  already-registered domain, while embedded mode serves an iframe inside
+  OUR page, so our domain has to prove it's really hosting that iframe.
+  `backend/payments.py` gained `get_payment_method_domain_status`/
+  `register_payment_method_domain` (idempotent — looks up an existing
+  registration before creating a new one, per Stripe's own "don't
+  register twice" guidance); `apis/payments.py`'s `PaymentSettings`
+  gained `wallet_domain` (always present, derived from
+  `FRONTEND_PUBLIC_URL`'s hostname) and `wallet_domain_status` (a
+  best-effort live read on every `GET`, swallows `StripeError` rather
+  than 500ing); a new owner-triggered `POST .../register-wallet-domain`
+  does the actual one-time registration. `PaymentSettingsPanel` gained a
+  "Wallet payments" block: explanatory copy (Apple/Google/WeChat/Alipay
+  are Dashboard toggles, not settings on this page), a live status badge
+  per method (`apple_pay`/`google_pay`/`link`/`paypal`), and the
+  register button. **Standard Stripe-processed PayPal is business-
+  location-gated to a specific list of European countries** — a non-EU
+  merchant account needs a genuinely different, larger integration (a
+  self-hosted "PayPal adapter" Stripe provides, plus extra Stripe fees
+  on top of PayPal's own) — explicitly out of scope for this round, a
+  real, deliberate scope boundary, not an oversight; if a non-EU PayPal
+  need shows up later, that adapter is the documented path, not a small
+  extension of this work. **Verified live against the real running
+  stack and Stripe's real production API**, same pattern already
+  established elsewhere in this file (no real Stripe account available,
+  same as every other Stripe-adjacent round): default state correctly
+  reports `wallet_domain: "localhost"` (this dev environment's own
+  `FRONTEND_PUBLIC_URL` default) and `wallet_domain_status: null`;
+  `register-wallet-domain` correctly 503s before Stripe is configured;
+  switching to `stripe` with a fake secret key and calling
+  `register-wallet-domain` genuinely reached Stripe's real
+  `payment_method_domains` endpoint and got a real "Invalid API Key
+  provided" rejection back (proving the request shape is well-formed,
+  the identical verification pattern this file's own Checkout-Session
+  work already used), correctly surfaced as a clean 502 rather than a
+  crash — and a follow-up `GET /agent/payment-settings` correctly kept
+  working (`wallet_domain_status: null`, no 500) confirming the
+  best-effort swallow holds. Settings restored to the original clean
+  `test`/no-key state afterward. `pytest` (21 tests)/`tsc`/`eslint` all
+  clean. **Not independently verified this round**: an actual
+  successful domain registration against a real, live Stripe account
+  and a real, reachable public domain — needs infrastructure (a real
+  Stripe account, a real deployed domain) this sandboxed session has no
+  access to, same disclosed gap as every other real-Stripe-account-
+  dependent item in this file.
 - **Verified end-to-end against the real running stack, including
   genuine live rejections from Stripe's actual production API** (no real
   Stripe account was available either session — confirmed directly with
@@ -2316,6 +2379,310 @@ that package is specifically AI providers, and payment isn't one.
   refunding it again, and attempting to refund a `"failed"` order, both
   correctly 400 with the exact rejection reason rather than silently
   succeeding. `pytest`/`tsc`/`eslint`/a real production build all clean.
+
+### Adyen — the aggregator payment gateway (`backend/payments.py`'s `AdyenPaymentProvider`)
+
+Added 2026-09-21, off a direct user ask for a "universal payment
+interface" so this app isn't limited to whatever Stripe covers —
+specifically named China UnionPay, alongside Apple Pay/Google Pay/
+WeChat Pay (all already free via Stripe, see "Wallet payment methods"
+above). Researched against both vendors' own live docs before building
+anything, not assumed: Stripe doesn't meaningfully support UnionPay;
+Adyen does, for a merchant account based in 40+ countries (notably NOT
+mainland China itself — the same "account location gates the method"
+shape Stripe's own PayPal/WeChat Pay support already has). Rather than
+hand-integrate UnionPay directly, or one gateway per country, the
+decision (discussed with the user first) was to add ONE more
+aggregator-style provider that already bundles a lot of local/regional
+methods under one API — Adyen was picked specifically because it
+covers the gap Stripe leaves (UnionPay) while also duplicating Alipay/
+WeChat Pay coverage, giving a second path to those two if a merchant's
+Stripe account isn't eligible for them.
+
+- **A third, independent `PaymentProvider` implementation, not a
+  replacement for Stripe** — `payment_provider` is now a 3-way choice
+  (`test`/`stripe`/`adyen`), same "swappable, not hardcoded" pattern
+  every provider in this app follows. `AdyenPaymentProvider.
+  create_checkout` builds a real Adyen Checkout Session (`POST /sessions`
+  via the official `Adyen` Python SDK — same "vetted HMAC over hand-
+  rolled" reasoning that picked `stripe`'s own SDK over raw HTTP calls,
+  since Adyen webhook notifications are HMAC-signed the same security-
+  critical way) — `merchantAccount`/`amount` (minor units, matching
+  Stripe's own `unit_amount` convention)/`reference` (`str(order.id)`,
+  the same role Stripe's `client_reference_id` plays)/`returnUrl`/
+  `channel: "Web"`. Returns `adyen_session_id`/`adyen_session_data`
+  (Adyen's own equivalent of Stripe's `client_secret`) rather than
+  closing the order immediately, identical "confirm asynchronously via
+  webhook, never trust the return trip" posture as Stripe.
+  `CheckoutResult`/`CheckoutResponse` (`apis/products.py`) both gained a
+  `provider` field alongside the existing `client_secret` so the
+  frontend knows which embedded-checkout UI (if any) to mount — Stripe's
+  `client_secret` and Adyen's session pair are mutually exclusive, never
+  both set.
+- **`POST /webhooks/adyen`** (`apis/payments.py`) — mirrors
+  `stripe_webhook` in intent, but Adyen's own webhook shape genuinely
+  differs in three ways, confirmed against Adyen's docs before building:
+  (1) **per-item HMAC**, not one signature over the whole body — each
+  `NotificationRequestItem` carries its own `additionalData.
+  hmacSignature`, verified via `verify_adyen_webhook_item` (wraps
+  `Adyen.util.is_valid_hmac_notification`); any item failing
+  verification (or no `adyen_hmac_key` configured at all) rejects the
+  WHOLE request, same "loud failure" posture as the Stripe webhook.
+  (2) **the response must be the literal body `[accepted]` with HTTP
+  200** — not 204, not JSON — or Adyen keeps retrying. (3) **success/
+  failure is one event type (`AUTHORISATION`) with a `success` flag**,
+  not two distinct event types the way Stripe's `checkout.session.
+  completed`/`async_payment_failed` are. `merchantReference` is how the
+  event matches back to a real `Order`, same role as Stripe's
+  `client_reference_id`.
+- **Same write-only-secret split as every other credential in this
+  app**: `adyen_api_key`/`adyen_hmac_key` never echoed back by `GET
+  /agent/payment-settings`, only `adyen_api_key_set`/`adyen_hmac_key_set`
+  booleans; `adyen_client_key` (Adyen's own public, browser-embeddable
+  key — the direct equivalent of Stripe's publishable key) and
+  `adyen_merchant_account` (an account identifier, not a secret) ARE
+  echoed back, and also exposed via the public, no-auth `GET
+  /api/payment-config` (alongside `adyen_environment`) for the same
+  reason Stripe's publishable key is — a public checkout page has no
+  admin JWT to fetch the gated settings endpoint with.
+  `PaymentSettingsPanel` gained a third provider option + its own config
+  block (environment `test`/`live` picker, merchant account, API key,
+  client key, HMAC key) mirroring the Stripe block's UX exactly, plus
+  the exact webhook URL to paste into Adyen's Customer Area.
+- **Frontend: `AdyenCheckoutDialog`** (new,
+  `components/modules/adyen-checkout-dialog.tsx`) — mounted in the same
+  `Dialog` popup shape as `StripeCheckoutDialog`, but a genuinely
+  different integration style: `@adyen/adyen-web` (v6, new dependency)
+  ships a plain imperative JS API (`AdyenCheckout()` is an async
+  factory, `Dropin` mounts onto a DOM node directly) rather than a real
+  React wrapper the way `@stripe/react-stripe-js` is — this component is
+  a thin `useEffect`-based wrapper around that imperative API, same
+  "imperative widget library inside React" shape as `TurnstileWidget`.
+  `countryCode` is hardcoded to `"US"` (Adyen Web v6's Drop-in requires
+  it) — a real, disclosed limitation: this app has no per-visitor
+  country field anywhere yet, same class of gap as the already-hardcoded
+  `"usd"` currency. `checkout-page.tsx` branches on `CheckoutResult.
+  provider`/`adyen_session_id`/`adyen_session_data` to decide whether to
+  mount `AdyenCheckoutDialog` instead of `StripeCheckoutDialog`.
+- **Verified live against the real running stack and Adyen's real
+  production API**, same rigor as every other Stripe-adjacent round in
+  this file (no real Adyen account available either — confirmed
+  structurally, not assumed): switching to `adyen` with a fake API key
+  and calling `POST /cart/checkout` genuinely reached Adyen's real
+  `/sessions` endpoint and got a real `AdyenAPIAuthenticationError` (401
+  "Unauthorized") back — proving the request shape (`merchantAccount`/
+  `amount`/`reference`/`returnUrl`/`channel`) is well-formed, correctly
+  surfaced as a clean 503, not a crash. **The webhook was verified with a
+  genuinely, correctly signed notification, not just a rejection path**
+  — generated a real HMAC-SHA256 signature using the exact same
+  `Adyen.util.generate_notification_sig` function the SDK itself uses to
+  verify, against a real random 64-hex-char test key saved as
+  `adyen_hmac_key`: a real signed `AUTHORISATION`/`success: "true"`
+  notification correctly flipped a real test order to `payment_status:
+  "paid"`/`is_open: false` and returned the literal `[accepted]` body;
+  the identical mechanism with `success: "false"` correctly flipped a
+  second order to `"failed"`; a tampered signature (one flipped
+  character) was correctly rejected with a clean 400; no `adyen_hmac_key`
+  configured at all correctly 503s. Settings and test orders cleaned up
+  after. `pytest` (21 tests)/`tsc`/`eslint`/a real production build (with
+  the new `@adyen/adyen-web` dependency actually baked into a rebuilt
+  image via `npm install --package-lock-only` + rebuild, not just
+  live-installed) all clean.
+- **Not independently verified this round**: an actual successful Adyen
+  Drop-in payment completing inside the modal, and the Drop-in actually
+  rendering/mounting correctly in a real browser — needs a real Adyen
+  test account (client key + merchant account) this sandboxed session
+  has no access to, same disclosed gap as Stripe's own embedded-Checkout
+  modal when it shipped. The `AdyenCheckout()`/`Dropin` JS API shape was
+  built from Adyen's own current docs/README (v6, confirmed via
+  `docs.adyen.com` and `github.com/Adyen/adyen-web`), not independently
+  exercised end-to-end.
+
+### PDF order receipts (`backend/receipts.py`)
+
+Added 2026-09-21, off a direct user ask confirmed earlier in the same
+planning conversation as Adyen above — this app had no document-
+generation capability of any kind before this. Scoped to order receipts
+specifically (not a generic invoicing system, not tax-deductible
+donation receipts — this isn't a nonprofit platform) since that's the
+concrete, universally-applicable need every business using this app's
+Product/Order catalog already has.
+
+- **`build_order_receipt_pdf(order, business) -> bytes`** — a pure
+  function (`reportlab`, see requirements.txt's own comment for why over
+  e.g. `weasyprint`: pure Python, no system Cairo/Pango dependency to
+  risk in this image's build) rendering an already-loaded `Order` (with
+  its `items` relationship) plus the owner's `AppSettings` business-
+  profile fields (name/address/phone/email — same fields
+  `BusinessProfilePanel`/`SiteJsonLd` already use, see the GEO/business-
+  profile section above) into a one-page receipt: business header, order
+  #/date/payment status/reference, billed-to block (contact/pickup/
+  shipping/note, each only rendered when actually set), and a line-item
+  table with a computed-nowhere-else total (always `Order.total_amount`
+  as already stored, never recomputed here — same "never trust
+  arithmetic outside cart.py" posture the rest of this app holds).
+  Deliberately text-only in v1 — no business logo image embedded, a
+  real, disclosed scope cut (would need this module to also resolve/
+  fetch an already-uploaded media file, a second concern deferred for
+  now).
+- **Three routes, one shared PDF, three different access checks** — the
+  same content is genuinely reachable three ways because most orders in
+  this app are guest checkouts (chat/cart, no login) and this app has no
+  single existing gate that covers "the visitor themselves, logged in or
+  not":
+  1. **`GET /agent/orders/{id}/receipt.pdf`** (`apis/products.py`,
+     admin/owner) — for staff record-keeping/printing/emailing, from
+     `OrderPanel`'s new "Download receipt" button.
+  2. **`GET /api/orders/{id}/receipt.pdf?session_id=...`**
+     (`apis/products.py`'s `public_router`, no auth) — for a guest
+     checkout, the overwhelming majority of orders here. Deliberately
+     reuses the SAME trust model `GET /api/cart` already established
+     (the visitor's own `getChatSessionId()` value, held in
+     `localStorage`, accepted as a de facto capability token — see the
+     root AGENTS.md's "Cart/order recovery via `?sid=`" precedent for
+     why this is an already-accepted pattern in this app, not a new
+     security decision). Looks up the `ChatSession` by `session_key`
+     directly (never `_get_or_create_session`, which would CREATE a
+     session row for an unrecognized key — a read-only 404 on a miss,
+     not a side effect an id-probing attempt could exploit to seed junk
+     rows) and checks `order.chat_session_id` matches.
+  3. **`GET /my/orders/{id}/receipt.pdf`** (`apis/my_account.py`,
+     any logged-in account) — for a signed-in customer viewing their own
+     order history on `/account`, same "user isolation," 404-not-403
+     posture every other route in that file already holds.
+  All three set `Content-Disposition: inline` (opens in the browser's
+  own PDF viewer, save-as from there) rather than forcing a download.
+- **Frontend**: `lib/api.ts` gained `apiFetchBlob`/`openBlobInNewTab` —
+  the admin and self-service routes need an `Authorization` header a
+  plain `<a href>` can't send, so both fetch a `Blob` via JS and open it
+  in a new tab; the public session-scoped route needs no auth header at
+  all, so `lib/orders.ts`'s `publicOrderReceiptUrl(orderId)` is just a
+  plain link. Wired into `OrderPanel` (admin), `AccountPage` (self-
+  service), and both post-checkout confirmation screens
+  (`checkout-page.tsx`'s test-mode `placedOrder` state, and
+  `checkout-complete-page.tsx` for a real Stripe/Adyen payment).
+  **A real, pre-existing gap in the Adyen work above was caught and
+  fixed while wiring this in** — `AdyenCheckoutDialog`'s own completion
+  redirect only ever carried `session_id`, never `order_id`, unlike the
+  backend-built Stripe `return_url` which already carries both; fixed by
+  threading a new `orderId` prop through so `/checkout/complete` can
+  offer a receipt link regardless of which payment provider was used.
+- **Verified end-to-end against the real running stack, with real
+  generated PDFs, not just a 200 status check**: `file`/`pdftotext`
+  confirmed a real, valid PDF (1 page, correct order #/date/payment
+  status/line items/total, e.g. two $3.00 lattes — one with a `(no
+  sugar)` comment correctly appended — summing to a correct $6.00
+  total) from the admin route against real historical order data. A
+  fresh real order (checkout via the "test" provider, `contact_email:
+  user@example.com`) confirmed all four access-control branches for
+  real: the public route succeeds with the correct `session_id` and
+  404s with a wrong one; the self-service route succeeds when
+  `user@example.com` is logged in and 404s (not 403 — no existence
+  leak) when a different account (`owner@example.com`) requests the
+  same order id. `pytest` (21 tests)/`tsc`/`eslint`/a real production
+  build all clean. Test orders cleaned up after.
+- **Deliberately out of scope this round**: no business logo embedded
+  (text-only), no non-order document types (quotes, generic invoices
+  unrelated to a real `Order`), no emailing the PDF automatically on
+  payment (`notify_owner`'s existing order-paid notification is a plain
+  text email, unchanged) — all real, plausible follow-ups if a concrete
+  need shows up, not built preemptively.
+
+### Marketing/CRM platform sync (`backend/marketing.py`, `backend/apis/marketing.py`)
+
+Added 2026-09-21, closing the "接 Mailchimp/HubSpot" backlog item
+discussed earlier the same planning conversation as Adyen/PDF receipts
+above. The design question going in — should the AI itself construct
+and send the Mailchimp/HubSpot API calls — was deliberately answered
+**no**, confirmed directly with the user: owner-agent's whole safety
+model is a fixed, narrow tool allowlist with no arbitrary-external-API-
+call capability (see the root "Owner agent" section's isolation
+paragraph), and "push this lead's fields to a vendor" is a plain,
+low-judgment data-mapping task an LLM adds latency/cost/hallucination
+risk to for zero benefit. So this is built exactly like every other
+vendor integration in this app: a deterministic `MarketingProvider`
+abstraction or agent constructs the request — the model only ever
+decides **whether/which** lead is worth syncing, never **how**.
+
+- **`MarketingProvider` — a fifth provider family**, same "swappable,
+  null/'test' means the default no-op" shape as payment/email-SMS/map/
+  business-profile before it. `TestMarketingProvider` (default) does
+  nothing. Two real providers, both plain `httpx` (no vendor SDK — same
+  "simple REST call, no security-critical webhook-signing concern"
+  reasoning `notifications.py`'s Mailgun/Twilio already established,
+  this module only ever sends outbound):
+  - **`MailchimpProvider`** — `PUT /lists/{audience_id}/members/
+    {subscriber_hash}` (Marketing API v3), Mailchimp's own idiomatic
+    upsert-by-MD5-hashed-email pattern, confirmed against Mailchimp's
+    own docs before building. A real, easy-to-miss requirement also
+    confirmed from those docs: the API base URL's datacenter subdomain
+    (`https://{dc}.api.mailchimp.com`) is encoded in the API key's own
+    suffix (after the last `-`), not a separate field — `MailchimpProvider`
+    extracts it directly from the key.
+  - **`HubSpotProvider`** — `POST /crm/v3/objects/contacts/batch/upsert`
+    (CRM API v3) with a single input, matched by email (`idProperty:
+    "email"`) — HubSpot's own documented upsert-in-one-call shape,
+    avoiding a separate search-then-create-or-update round trip. Bearer
+    auth with a private app access token (HubSpot's modern auth method;
+    the older API-key auth is deprecated, not implemented).
+  - Both map `CrmEntry.contact_email`/`contact_name` (best-effort split
+    into first/last name — a real, disclosed approximation, see
+    `_split_name`'s own docstring)/`contact_phone`/`tags`+`category`
+    (Mailchimp only — HubSpot has no equivalent generic tag field
+    without custom property setup, a real v1 scope cut) into each
+    vendor's own field shape.
+- **One real endpoint does double duty as both the feature and its own
+  verification** — `POST /agent/crm/entries/{id}/sync-to-marketing`
+  (`apis/marketing.py`). Unlike `notifications.py`'s ephemeral test-send
+  (an email/SMS that leaves no lasting trace), there's no side-effect-
+  free way to "test" a platform whose entire job is upserting a real
+  contact record — so this app doesn't pretend otherwise: syncing a
+  real (or deliberately throwaway test) `CrmEntry` from `CrmPanel`'s own
+  new "Sync to marketing platform" button (a `Megaphone` icon next to
+  Delete) IS the verification step, same posture `MarketingSettingsPanel`'s
+  own copy states plainly instead of building a parallel no-op test path.
+- **`sync_crm_entry_to_marketing` — owner-agent's 30th tool** — a thin
+  `ToolSpec` calling the exact same route above (`{crm_id}` path-param
+  substitution, the same generic mechanism `scan_crm_attachment`/
+  `crm_delete_entry` already use) — the model constructs no vendor
+  request body at all, only the CRM entry id to sync.
+- **`MarketingSettingsPanel`** (frontend, "Products & orders" accordion
+  group, alongside `PaymentSettingsPanel`/`NotificationSettingsPanel`/
+  `MapSettingsPanel` — continuing that group's already-acknowledged
+  provisional role as the home for third-party service credentials) —
+  provider `Select` + write-only-secret `Input`s (API key/access token
+  never echoed, audience id echoed normally, same split as every other
+  credential panel here).
+- **Verified end-to-end against the real running stack, including
+  genuine live rejections from both vendors' real production APIs, and
+  a real owner-agent run**, same rigor as every other integration in
+  this file: default test-mode sync against a real historical `CrmEntry`
+  correctly returns `{"provider": "test", "result": {"synced": false}}`;
+  syncing a nonexistent entry id correctly 404s; switching to `mailchimp`
+  with a fake (but correctly-shaped, real datacenter suffix) API key
+  genuinely reached Mailchimp's real `us21.api.mailchimp.com` and got a
+  real `"API Key Invalid"` 401 rejection back, correctly surfaced as a
+  clean 503; switching to `hubspot` with a fake access token genuinely
+  reached HubSpot's real `api.hubapi.com` batch/upsert endpoint and got
+  a real `INVALID_AUTHENTICATION` rejection back, likewise a clean 503.
+  **A real owner-agent run** ("Sync CRM entry 483 to our marketing
+  platform.") correctly selected `sync_crm_entry_to_marketing` with
+  `{"crm_id": 483}` on the first turn (no `crm_list_entries` detour
+  needed since the id was already given), got the real test-provider
+  result back, and gave an honest final answer explaining nothing was
+  really synced because no real provider is configured yet — never
+  claimed a fake success. `pytest` (21 tests)/`tsc`/`eslint`/a real
+  production build all clean. Settings restored to the clean `test`
+  state afterward.
+- **Deliberately out of scope this round**: no automatic sync on lead
+  capture (every sync is owner/owner-agent-triggered, never fires from
+  `apis/chat.py`'s own lead-extraction path) — a real, deliberate
+  boundary matching the user's own framing that this should be a
+  decision, not an automatic side effect of every captured lead; no
+  bulk/batch sync of many entries at once (one entry per call, matching
+  the tool's own "you decide which lead" framing); no HubSpot tags/lists
+  membership (a separate API surface from the contact-properties call
+  this round makes).
 
 ### Email + SMS gate (`backend/notifications.py`, `backend/apis/notifications.py`)
 
@@ -5186,7 +5553,7 @@ considering it fully settled.
 - **Phase 6 — Agent security layer**: **started, not complete**. The
   isolated worker now exists — `owner-agent/` (own container/port 8100,
   see "Architecture decisions" above and "Owner agent" below) — with a
-  real LLM tool-calling loop over a fixed 29-tool allowlist, its own
+  real LLM tool-calling loop over a fixed 30-tool allowlist, its own
   owner-only auth check, and action logging to stdout + a bind-mounted
   `logs/runs.jsonl` (per-step, durable). The worker's "brain" model
   selection is now wired to the owner-facing model picker too
@@ -5210,7 +5577,7 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 29 tools (`generate_poster`,
+  envelope: either call one of 30 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
   `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
@@ -5224,11 +5591,15 @@ this is the one place the model itself decides which action(s) to take.
   part 2" above), `set_shipping_allowed_regions` (2026-09-10, see
   "Shipping + regional restriction" below), `search_knowledge`,
   `edit_page_field`, `create_document`, `suggest_business_profile`
-  (2026-09-10, see "Owner talks, AI operates" below) — each
+  (2026-09-10, see "Owner talks, AI operates" below),
+  `sync_crm_entry_to_marketing` (2026-09-21, see "Marketing/CRM platform
+  sync" below) — each
   a thin HTTP call onto an already-real `backend/apis/agent.py`/
   `apis/intent_schemas.py`/`apis/products.py`/`apis/documents.py`/
-  `apis/scheduled_tasks.py`/`apis/seo_audit.py` endpoint) or give a final
-  answer. Up to 6 turns, a 300s overall budget. The full step trace
+  `apis/scheduled_tasks.py`/`apis/seo_audit.py`/`apis/marketing.py`
+  endpoint) or give a final
+  answer. Up to 12 turns, a 1200s overall budget (see "Owner talks, AI
+  operates" below for why this was raised from 6/300s). The full step trace
   (tool, args, result, ok/error) is returned to the frontend and
   rendered, not just the final answer.
 - **`generate_landing_page`** (2026-08-19) takes an already-uploaded

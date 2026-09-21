@@ -13,7 +13,15 @@ import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { Pagination } from "@/components/common/pagination";
 import { ApiError } from "@/lib/api";
-import { listOrders, listOrderStatusOptions, updateOrder, updateOrderItemServed, type Order } from "@/lib/orders";
+import {
+  getOrderReceiptBlob,
+  listOrders,
+  listOrderStatusOptions,
+  updateOrder,
+  updateOrderItemServed,
+  type Order,
+} from "@/lib/orders";
+import { openBlobInNewTab } from "@/lib/api";
 import { useDebouncedSearch } from "@/lib/use-debounced-search";
 
 const FALLBACK_STATUS_OPTIONS = ["received", "preparing", "ready", "delivered", "paid", "refunded"];
@@ -154,6 +162,23 @@ export function OrderPanel() {
         prev ? prev.map((o) => (o.id === order.id ? { ...o, payment_status: previous } : o)) : prev,
       );
       setFieldErrorByOrder((prev) => ({ ...prev, [order.id]: err instanceof ApiError ? err.message : "Refund failed." }));
+    }
+  }
+
+  async function handleDownloadReceipt(order: Order) {
+    try {
+      const blob = await getOrderReceiptBlob(order.id);
+      openBlobInNewTab(blob);
+      setFieldErrorByOrder((prev) => {
+        const next = { ...prev };
+        delete next[order.id];
+        return next;
+      });
+    } catch (err) {
+      setFieldErrorByOrder((prev) => ({
+        ...prev,
+        [order.id]: err instanceof ApiError ? err.message : "Couldn't load the receipt.",
+      }));
     }
   }
 
@@ -352,6 +377,9 @@ export function OrderPanel() {
               </div>
               <p className="flex items-center gap-2 font-medium">
                 Total: ${order.total_amount.toFixed(2)}
+                <Button size="xs" variant="outline" onClick={() => handleDownloadReceipt(order)}>
+                  Download receipt
+                </Button>
                 {order.payment_status === "paid" ? (
                   <Button size="xs" variant="outline" onClick={() => handleMarkRefunded(order)}>
                     Mark refunded

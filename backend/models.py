@@ -319,6 +319,23 @@ class AppSettings(Base):
     stripe_secret_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     stripe_publishable_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     stripe_webhook_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Adyen (2026-09-21, see backend/payments.py's AdyenPaymentProvider) —
+    # the "aggregator" gateway added specifically for local/regional
+    # payment methods Stripe doesn't cover for this account (China
+    # UnionPay in particular — see payments.py's own module docstring for
+    # the full research/reasoning). Same write-only-secret split as
+    # Stripe's own fields: `adyen_api_key`/`adyen_hmac_key` are never
+    # echoed back; `adyen_client_key` (Adyen's own public, browser-
+    # embeddable key — the direct equivalent of Stripe's publishable key)
+    # and `adyen_merchant_account` (an account identifier, not a secret)
+    # ARE echoed back. `adyen_environment` is `"test"`/`"live"` — unlike
+    # Stripe, an Adyen API key's own prefix doesn't reliably signal which
+    # one it is, so this is a real, explicit field, defaulting to `"test"`.
+    adyen_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    adyen_client_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    adyen_merchant_account: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    adyen_hmac_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    adyen_environment: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Email + SMS gate (2026-08-20, see backend/notifications.py) — the
     # identical "swappable provider, null/'test' means the default no-op"
     # pattern as payment above, applied to a third capability domain.
@@ -345,6 +362,17 @@ class AppSettings(Base):
     # posture as `is_email_configured` above: an alert fires whenever
     # BOTH a real email provider (not "test") AND this address are set.
     alert_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Marketing/CRM platform sync (2026-09-21, see backend/marketing.py) —
+    # same "swappable provider, null/'test' means the default no-op"
+    # pattern as email/SMS above, extended to pushing a captured
+    # `CrmEntry` lead out to Mailchimp/HubSpot. `mailchimp_api_key`/
+    # `hubspot_access_token` are write-only, same echo-back rule as
+    # `mailgun_api_key`/`twilio_auth_token` above; `mailchimp_audience_id`
+    # isn't a secret (just a list identifier) — safe to echo back.
+    marketing_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mailchimp_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mailchimp_audience_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hubspot_access_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Map embed gate (2026-08-21, see backend/maps.py) — same "swappable
     # provider, null/'test' means the safe zero-config default" pattern as
     # payment/email above, extended to a fourth capability domain: showing

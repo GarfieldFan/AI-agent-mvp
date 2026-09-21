@@ -1,4 +1,4 @@
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchBlob } from "@/lib/api";
 import type { CrmEntry } from "@/lib/crm";
 import type { Order } from "@/lib/orders";
 
@@ -17,6 +17,13 @@ export type MyOrdersResult = {
 
 export function listMyOrders(limit = 20, offset = 0) {
   return apiFetch<MyOrdersResult>(`/api/my/orders?limit=${limit}&offset=${offset}`);
+}
+
+/** PDF receipt download for the caller's own order (2026-09-21,
+ * backend/receipts.py) — `AccountPage`'s "Download receipt" opens the
+ * returned Blob in a new tab via `lib/api.ts`'s `openBlobInNewTab`. */
+export function getMyOrderReceiptBlob(orderId: number) {
+  return apiFetchBlob(`/api/my/orders/${orderId}/receipt.pdf`);
 }
 
 export function listMyCrmEntries() {

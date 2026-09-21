@@ -14,10 +14,12 @@ import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
+import { AdyenCheckoutDialog } from "@/components/modules/adyen-checkout-dialog";
 import { StripeCheckoutDialog } from "@/components/modules/stripe-checkout-dialog";
 import { ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { checkoutCart, getCart, type Cart } from "@/lib/cart";
+import { publicOrderReceiptUrl } from "@/lib/orders";
 import { getPaymentConfig } from "@/lib/payments";
 
 /** `/checkout` (2026-08-20, payment gate added same day — see
@@ -28,7 +30,11 @@ import { getPaymentConfig } from "@/lib/payments";
  * opens Stripe's own embedded Checkout in a popup on this page
  * (2026-09-10, `StripeCheckoutDialog` — a `client_secret` in the
  * response, not a redirect URL, see backend/payments.py's own docstring
- * for the "why" behind embedded over a full-page redirect). A prefilled
+ * for the "why" behind embedded over a full-page redirect); a real Adyen
+ * provider (2026-09-21, the aggregator gateway added for local/regional
+ * methods Stripe doesn't cover, UnionPay in particular) opens Adyen's
+ * own Drop-in the same way (`AdyenCheckoutDialog` — `adyen_session_id`/
+ * `adyen_session_data` in the response instead). A prefilled
  * `contact_email`/`contact_name` (if the cart already carries one, e.g.
  * from an earlier chat turn) is editable, never locked.
  *
@@ -64,11 +70,30 @@ export function CheckoutPage() {
   // client_secret comes back from POST /cart/checkout.
   const [publishableKey, setPublishableKey] = React.useState<string | null>(null);
   const [checkoutClientSecret, setCheckoutClientSecret] = React.useState<string | null>(null);
+  // Adyen (2026-09-21) — same "fetch the public config up front" shape as
+  // Stripe's publishable key above; the Drop-in only actually mounts once
+  // a real session comes back from POST /cart/checkout.
+  const [adyenConfig, setAdyenConfig] = React.useState<{ clientKey: string; environment: "test" | "live" } | null>(
+    null,
+  );
+  const [checkoutAdyenSession, setCheckoutAdyenSession] = React.useState<
+    { id: string; sessionData: string; orderId: number } | null
+  >(null);
 
   React.useEffect(() => {
     getPaymentConfig()
-      .then((config) => setPublishableKey(config.provider === "stripe" ? config.publishable_key : null))
-      .catch(() => setPublishableKey(null));
+      .then((config) => {
+        setPublishableKey(config.provider === "stripe" ? config.publishable_key : null);
+        setAdyenConfig(
+          config.provider === "adyen" && config.adyen_client_key
+            ? { clientKey: config.adyen_client_key, environment: (config.adyen_environment as "test" | "live") ?? "test" }
+            : null,
+        );
+      })
+      .catch(() => {
+        setPublishableKey(null);
+        setAdyenConfig(null);
+      });
   }, []);
 
   React.useEffect(() => {
@@ -108,6 +133,14 @@ export function CheckoutPage() {
         setCheckoutClientSecret(result.client_secret);
         return;
       }
+      if (result.adyen_session_id && result.adyen_session_data) {
+        setCheckoutAdyenSession({
+          id: result.adyen_session_id,
+          sessionData: result.adyen_session_data,
+          orderId: result.order.id,
+        });
+        return;
+      }
       setPlacedOrder(result.order);
     } catch (err) {
       setPlaceError(err instanceof ApiError ? err.message : "Couldn't place your order — please try again.");
@@ -124,9 +157,14 @@ export function CheckoutPage() {
           title="Order placed"
           description={`Order #${placedOrder.id} — total $${placedOrder.total_amount.toFixed(2)}. No real payment was collected (test mode); the team will follow up on ${placedOrder.contact_email ?? "the contact info you provided"}.`}
           action={
-            <Button render={<Link href="/" />} nativeButton={false} variant="outline">
-              Back to home
-            </Button>
+            <div className="flex items-center justify-center gap-2">
+              <Button render={<a href={publicOrderReceiptUrl(placedOrder.id)} target="_blank" rel="noreferrer" />} nativeButton={false} variant="outline">
+                Download receipt
+              </Button>
+              <Button render={<Link href="/" />} nativeButton={false} variant="outline">
+                Back to home
+              </Button>
+            </div>
           }
         />
       </Container>
@@ -234,6 +272,20 @@ export function CheckoutPage() {
           }}
           publishableKey={publishableKey}
           clientSecret={checkoutClientSecret}
+        />
+      ) : null}
+
+      {checkoutAdyenSession && adyenConfig ? (
+        <AdyenCheckoutDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setCheckoutAdyenSession(null);
+          }}
+          clientKey={adyenConfig.clientKey}
+          environment={adyenConfig.environment}
+          sessionId={checkoutAdyenSession.id}
+          sessionData={checkoutAdyenSession.sessionData}
+          orderId={checkoutAdyenSession.orderId}
         />
       ) : null}
     </Container>

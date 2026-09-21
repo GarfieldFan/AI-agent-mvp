@@ -496,6 +496,20 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="GET",
         path="/api/agent/seo/check",
     ),
+    "sync_crm_entry_to_marketing": ToolSpec(
+        name="sync_crm_entry_to_marketing",
+        description=(
+            "Pushes one captured lead's contact info (email/name/phone/tags) to the owner's configured "
+            "marketing/CRM platform (Mailchimp or HubSpot — set up in the dashboard's Marketing "
+            'settings). Args: {"crm_id": <entry id, as a number>}. Use crm_list_entries first to find '
+            "the right id if you don't already have it. This is a plain, deterministic data sync — you "
+            "decide WHICH entry is worth syncing (e.g. the owner asks to push a specific lead, or every "
+            "new lead from a given category), never how the sync itself works. Fails with a clear error "
+            "if no real provider is configured yet (the default \"test\" provider does nothing)."
+        ),
+        method="POST",
+        path="/api/agent/crm/entries/{crm_id}/sync-to-marketing",
+    ),
 }
 
 

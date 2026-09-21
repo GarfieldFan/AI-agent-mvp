@@ -1,4 +1,5 @@
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchBlob } from "@/lib/api";
+import { getChatSessionId } from "@/lib/chat";
 
 /** Orders captured against the Product catalog (lib/products.ts) as
  * visitors talk to the chatbot — see backend/models.py's Order/OrderItem
@@ -94,4 +95,22 @@ export function listOrderStatusOptions() {
  * kitchen-floor action, not a cheap-to-adjust config value. */
 export function updateOrderItemServed(itemId: number, served: boolean) {
   return apiFetch<Order>(`/api/agent/order-items/${itemId}`, { method: "PATCH", body: { served } });
+}
+
+/** PDF receipt download (2026-09-21, backend/receipts.py) — admin/owner
+ * only; `OrderPanel`'s "Download receipt" button opens the returned
+ * Blob in a new tab via `lib/api.ts`'s `openBlobInNewTab`. */
+export function getOrderReceiptBlob(id: number) {
+  return apiFetchBlob(`/api/agent/orders/${id}/receipt.pdf`);
+}
+
+/** Public, no-auth PDF receipt link for a guest checkout (2026-09-21,
+ * backend/apis/products.py's `get_order_receipt_public`) — trusts this
+ * visitor's own `getChatSessionId()` the same way `GET /api/cart`
+ * already does, not a new auth mechanism. A plain `<a href>`, not a
+ * fetch call — no Authorization header to attach, so no Blob/new-tab
+ * dance needed the way the admin/self-service versions above need. */
+export function publicOrderReceiptUrl(orderId: number) {
+  const base = typeof window === "undefined" ? "" : (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000");
+  return `${base}/api/orders/${orderId}/receipt.pdf?session_id=${encodeURIComponent(getChatSessionId())}`;
 }

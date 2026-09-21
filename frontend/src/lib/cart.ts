@@ -117,23 +117,31 @@ export type CheckoutInput = {
 
 export type CheckoutResult = {
   order: Cart;
-  /** Set only when the owner's configured payment provider needs the
-   * visitor to actually pay through a real UI — Stripe's embedded
+  /** Which provider actually processed this checkout — tells the
+   * caller which modal (if any) to mount. "test" means payment already
+   * resolved synchronously, no modal needed. */
+  provider: "test" | "stripe" | "adyen";
+  /** Set only when `provider === "stripe"` — Stripe's embedded
    * Checkout as of 2026-09-10 (a modal on this page, see
    * components/modules/stripe-checkout-dialog.tsx and
    * backend/payments.py's own docstring for the "why" behind embedded
-   * over a full-page redirect). Null means payment already resolved
-   * synchronously (the default "test" provider) — the caller should show
-   * the normal confirmation screen instead of opening the modal. */
+   * over a full-page redirect). */
   client_secret: string | null;
+  /** Set only when `provider === "adyen"` (2026-09-21) — mount Adyen's
+   * own Drop-in with `{id: adyen_session_id, sessionData:
+   * adyen_session_data}`, see components/modules/adyen-checkout-dialog.tsx. */
+  adyen_session_id: string | null;
+  adyen_session_data: string | null;
 };
 
 /** Finalizes the cart through the owner's configured payment gate
  * (2026-08-20, backend/payments.py) — records contact/pickup details,
  * then either closes the order immediately as paid (the default "test"
- * provider, no real charge) or hands back a Stripe `client_secret` to
- * mount the embedded-Checkout modal with; the order only actually
- * closes once that payment is confirmed via a webhook. */
+ * provider, no real charge) or hands back a real checkout session
+ * (Stripe's `client_secret`, or Adyen's `adyen_session_id`/
+ * `adyen_session_data` as of 2026-09-21) to mount the matching embedded
+ * checkout UI with; the order only actually closes once that payment is
+ * confirmed via that provider's own webhook. */
 export function checkoutCart(input: CheckoutInput) {
   return apiFetch<CheckoutResult>("/api/cart/checkout", {
     method: "POST",

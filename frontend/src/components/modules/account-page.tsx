@@ -12,11 +12,12 @@ import { EmptyState } from "@/components/common/empty-state";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ChatMessageBubble } from "@/components/modules/chat/chat-message-bubble";
-import { ApiError } from "@/lib/api";
+import { ApiError, openBlobInNewTab } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { CrmEntry } from "@/lib/crm";
 import {
   getMyChatSessionMessages,
+  getMyOrderReceiptBlob,
   listMyChatSessions,
   listMyCrmEntries,
   listMyOrders,
@@ -49,6 +50,24 @@ export function AccountPage() {
   const [openSessionId, setOpenSessionId] = React.useState<number | null>(null);
   const [messages, setMessages] = React.useState<MyChatMessageSummary[] | null>(null);
   const [messagesError, setMessagesError] = React.useState<string | null>(null);
+  const [receiptErrorByOrder, setReceiptErrorByOrder] = React.useState<Record<number, string>>({});
+
+  async function handleDownloadReceipt(orderId: number) {
+    try {
+      const blob = await getMyOrderReceiptBlob(orderId);
+      openBlobInNewTab(blob);
+      setReceiptErrorByOrder((prev) => {
+        const next = { ...prev };
+        delete next[orderId];
+        return next;
+      });
+    } catch (err) {
+      setReceiptErrorByOrder((prev) => ({
+        ...prev,
+        [orderId]: err instanceof ApiError ? err.message : "Couldn't load the receipt.",
+      }));
+    }
+  }
 
   const refresh = React.useCallback(() => {
     if (!auth.token) return;
@@ -107,18 +126,26 @@ export function AccountPage() {
           <EmptyState title="No orders yet" description="Anything you order will show up here." />
         ) : null}
         {orders?.map((order) => (
-          <div key={order.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3 text-sm">
-            <div>
-              <p className="font-medium">Order #{order.id}</p>
-              <p className="text-xs text-muted-foreground">
-                {new Date(order.created_at).toLocaleString()} · {order.items.length} item
-                {order.items.length === 1 ? "" : "s"} · ${order.total_amount.toFixed(2)}
-              </p>
+          <div key={order.id} className="rounded-lg border p-3 text-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="font-medium">Order #{order.id}</p>
+                <p className="text-xs text-muted-foreground">
+                  {new Date(order.created_at).toLocaleString()} · {order.items.length} item
+                  {order.items.length === 1 ? "" : "s"} · ${order.total_amount.toFixed(2)}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge variant="outline">{order.status ?? "new"}</Badge>
+                <Badge variant={order.payment_status === "paid" ? "default" : "outline"}>{order.payment_status}</Badge>
+                <Button size="xs" variant="outline" onClick={() => handleDownloadReceipt(order.id)}>
+                  Download receipt
+                </Button>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <Badge variant="outline">{order.status ?? "new"}</Badge>
-              <Badge variant={order.payment_status === "paid" ? "default" : "outline"}>{order.payment_status}</Badge>
-            </div>
+            {receiptErrorByOrder[order.id] ? (
+              <p className="mt-1 text-xs text-destructive">{receiptErrorByOrder[order.id]}</p>
+            ) : null}
           </div>
         ))}
       </section>

@@ -33,3 +33,16 @@ stripe==15.5.1
 # deps aren't.
 apscheduler==3.11.3
 trafilatura==2.2.0
+# 2026-09-21 — backend/payments.py's AdyenPaymentProvider, the aggregator
+# payment gateway added alongside Stripe specifically for local/regional
+# methods Stripe doesn't cover for a given merchant account (China
+# UnionPay in particular). Official SDK, same "vetted HMAC check over a
+# hand-rolled one" reasoning already applied to `stripe` above — Adyen
+# webhook notifications are HMAC-signed the same security-critical way.
+Adyen==16.0.0
+# 2026-09-21 — backend/receipts.py's PDF order-receipt generation. Pure
+# Python (no system Cairo/Pango dependency the way weasyprint would need,
+# which would bloat this image and risk build issues), mature, BSD-
+# licensed, well-suited to a structured table-based document like a
+# receipt/invoice.
+reportlab==5.0.1

@@ -103,3 +103,31 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
 
   return (await response.json()) as T;
 }
+
+/** Same auth/base-URL/error-handling as `apiFetch` above, but for a
+ * binary response (2026-09-21, PDF receipt downloads) — `apiFetch`
+ * always calls `.json()`, which would throw on a real PDF body. GET
+ * only; no caller needs a binary POST/PUT yet. */
+export async function apiFetchBlob(path: string, options: { token?: string } = {}): Promise<Blob> {
+  const authToken = options.token ?? getAuthToken();
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    cache: "no-store",
+    headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+  });
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => undefined);
+    throw new ApiError(response.status, extractErrorMessage(errorBody, response.statusText), errorBody);
+  }
+  return response.blob();
+}
+
+/** Opens a fetched Blob in a new tab (2026-09-21) — the standard way to
+ * hand the browser a same-origin-fetched binary without a real download
+ * URL to link to; the tab's own PDF viewer handles save-as from there.
+ * Revokes the object URL after a short delay, long enough for the new
+ * tab to have actually loaded it. */
+export function openBlobInNewTab(blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  window.open(url, "_blank", "noopener,noreferrer");
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
