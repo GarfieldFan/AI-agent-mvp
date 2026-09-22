@@ -38,6 +38,8 @@ function summarizeChild(block: Block): LayoutAdjustChildSummary {
       return { kind: "product card", summary: "" };
     case "map":
       return { kind: "map", summary: block.query };
+    case "intent-form":
+      return { kind: "intake form", summary: block.schema_key ?? "(no schema picked yet)" };
   }
 }
 

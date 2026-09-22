@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { ListChecks, Plus, Trash2 } from "lucide-react";
+import { FileText, ListChecks, Plus, Sparkles, Trash2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,7 +20,9 @@ import {
   deleteIntentSchema,
   FIELD_TYPE_OPTIONS,
   listIntentSchemas,
+  proposeFormTemplate,
   updateIntentSchema,
+  type FormTemplate,
   type IntentField,
   type IntentFieldInput,
   type IntentFieldType,
@@ -29,7 +31,27 @@ import {
 } from "@/lib/intent-schemas";
 
 function blankField(): IntentFieldInput {
-  return { field_key: "", label: "", field_type: "text", required: true, prompt_hint: "" };
+  return { field_key: "", label: "", field_type: "text", required: true, prompt_hint: "", options: null };
+}
+
+/** "Label | value" per line, "Label" alone means value === label —
+ * the simplest text-editable shape for a select field's own choices,
+ * avoiding a repeatable label+value row editor for what's realistically
+ * a handful of options. */
+function optionsToText(options: IntentField["options"]): string {
+  return (options ?? []).map((o) => (o.label === o.value ? o.label : `${o.label} | ${o.value}`)).join("\n");
+}
+
+function parseOptionsText(text: string): IntentField["options"] {
+  const options = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [label, value] = line.split("|").map((p) => p.trim());
+      return { label, value: value || label };
+    });
+  return options.length > 0 ? options : null;
 }
 
 function draftFromSchema(schema: IntentSchema): IntentSchemaInput {
@@ -43,11 +65,19 @@ function draftFromSchema(schema: IntentSchema): IntentSchemaInput {
       field_type: f.field_type,
       required: f.required,
       prompt_hint: f.prompt_hint ?? "",
+      options: f.options,
     })),
+    form_template: schema.form_template,
   };
 }
 
-const BLANK_DRAFT: IntentSchemaInput = { key: "", label: "", description: "", fields: [blankField()] };
+const BLANK_DRAFT: IntentSchemaInput = {
+  key: "",
+  label: "",
+  description: "",
+  fields: [blankField()],
+  form_template: null,
+};
 
 /** Owner-configurable structured data collection (2026-08-19) — see
  * backend/models.py's IntentSchema/IntentField docstrings and
@@ -139,6 +169,11 @@ export function IntentSchemaPanel() {
       fields: draft.fields
         .filter((f) => f.field_key.trim() && f.label.trim())
         .map((f) => ({ ...f, field_key: f.field_key.trim(), label: f.label.trim(), prompt_hint: f.prompt_hint?.trim() || null })),
+      // Full-replace, same as fields — echoed back unchanged unless the
+      // Upfront form editor below actually touched it, so an ordinary
+      // field/label edit can never silently wipe an already-saved
+      // form_template.
+      form_template: draft.form_template ?? null,
     };
     try {
       if (editingId === "new") {
@@ -294,52 +329,68 @@ export function IntentSchemaPanel() {
           <div className="space-y-2">
             <Label className="text-xs text-muted-foreground">Fields to collect</Label>
             {draft.fields.map((field, i) => (
-              <div key={i} className="grid grid-cols-[1fr_1fr_auto_auto_auto] items-center gap-2">
-                <Input
-                  placeholder="field_key (auto)"
-                  value={field.field_key}
-                  disabled
-                  className="font-mono text-muted-foreground"
-                />
-                <Input
-                  placeholder="Label"
-                  value={field.label}
-                  onChange={(e) => {
-                    const label = e.target.value;
-                    // Only auto-derive for a field that's new in this
-                    // editing session — a field that already existed has
-                    // its key locked, same reasoning as the schema-level
-                    // key above (something else may already reference it
-                    // by that exact key).
-                    const isExisting = existingFieldKeysRef.current.has(field.field_key);
-                    updateFieldAt(i, { label, field_key: isExisting ? field.field_key : slugifyKey(label) });
-                  }}
-                />
-                <Select
-                  value={field.field_type}
-                  onValueChange={(v) => v && updateFieldAt(i, { field_type: v as IntentFieldType })}
-                >
-                  <SelectTrigger className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {FIELD_TYPE_OPTIONS.map((opt) => (
-                      <SelectItem key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <div className="flex items-center gap-1.5">
-                  <Switch
-                    checked={field.required}
-                    onCheckedChange={(checked) => updateFieldAt(i, { required: checked })}
+              <div key={i} className="space-y-1.5">
+                <div className="grid grid-cols-[1fr_1fr_auto_auto_auto] items-center gap-2">
+                  <Input
+                    placeholder="field_key (auto)"
+                    value={field.field_key}
+                    disabled
+                    className="font-mono text-muted-foreground"
                   />
-                  <Label className="text-xs text-muted-foreground">Required</Label>
+                  <Input
+                    placeholder="Label"
+                    value={field.label}
+                    onChange={(e) => {
+                      const label = e.target.value;
+                      // Only auto-derive for a field that's new in this
+                      // editing session — a field that already existed has
+                      // its key locked, same reasoning as the schema-level
+                      // key above (something else may already reference it
+                      // by that exact key).
+                      const isExisting = existingFieldKeysRef.current.has(field.field_key);
+                      updateFieldAt(i, { label, field_key: isExisting ? field.field_key : slugifyKey(label) });
+                    }}
+                  />
+                  <Select
+                    value={field.field_type}
+                    onValueChange={(v) => v && updateFieldAt(i, { field_type: v as IntentFieldType })}
+                  >
+                    <SelectTrigger className="w-32">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FIELD_TYPE_OPTIONS.map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <div className="flex items-center gap-1.5">
+                    <Switch
+                      checked={field.required}
+                      onCheckedChange={(checked) => updateFieldAt(i, { required: checked })}
+                    />
+                    <Label className="text-xs text-muted-foreground">Required</Label>
+                  </div>
+                  <Button variant="ghost" size="icon-xs" aria-label="Remove field" onClick={() => removeFieldAt(i)}>
+                    <Trash2 className="size-3.5" />
+                  </Button>
                 </div>
-                <Button variant="ghost" size="icon-xs" aria-label="Remove field" onClick={() => removeFieldAt(i)}>
-                  <Trash2 className="size-3.5" />
-                </Button>
+                {field.field_type === "select" ? (
+                  <div className="space-y-1 pl-1">
+                    <Label className="text-xs text-muted-foreground">
+                      Options — one per line, &quot;Label | value&quot; (or just &quot;Label&quot; if the stored
+                      value should match what&apos;s shown)
+                    </Label>
+                    <Textarea
+                      rows={3}
+                      placeholder={"Australia | AU\nNew Zealand | NZ"}
+                      value={optionsToText(field.options)}
+                      onChange={(e) => updateFieldAt(i, { options: parseOptionsText(e.target.value) })}
+                    />
+                  </div>
+                ) : null}
               </div>
             ))}
             <Button variant="outline" size="sm" onClick={addField}>
@@ -347,6 +398,12 @@ export function IntentSchemaPanel() {
               Add field
             </Button>
           </div>
+
+          <FormTemplateEditor
+            schemaId={editingId === "new" ? null : editingId}
+            template={draft.form_template ?? null}
+            onChange={(template) => setDraft((d) => ({ ...d, form_template: template }))}
+          />
 
           <div className="flex items-center gap-2">
             <Button onClick={handleSave} disabled={!draft.key.trim() || !draft.label.trim() || saveStatus === "saving"}>
@@ -366,6 +423,101 @@ export function IntentSchemaPanel() {
           New intent schema
         </Button>
       )}
+    </div>
+  );
+}
+
+type FormTemplateEditorProps = {
+  /** null for a schema that hasn't been saved yet — proposeFormTemplate
+   * needs a real schema id (and its already-saved fields) to run against. */
+  schemaId: number | null;
+  template: FormTemplate | null;
+  onChange: (template: FormTemplate | null) => void;
+};
+
+/** "Upfront form" section of the schema editor (2026-09-22) — lets the
+ * owner turn on StructuredIntakeForm for this schema: an AI-drafted,
+ * section-grouped layout the owner accepts, regenerates, or removes.
+ * Deliberately no manual section/field-reassignment editor in this round
+ * (regenerate-or-remove only) — the same "AI drafts, owner applies, no
+ * separate manual editor" posture this app already holds for
+ * order_status_options/shipping_allowed_regions, not a gap. Manually
+ * fine-tuning a proposed layout is still possible via the backend's own
+ * PUT .../form-template endpoint if a real need for it shows up later. */
+function FormTemplateEditor({ schemaId, template, onChange }: FormTemplateEditorProps) {
+  const [status, setStatus] = React.useState<"idle" | "loading" | "error">("idle");
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function suggest() {
+    if (schemaId === null) return;
+    setStatus("loading");
+    setError(null);
+    try {
+      const result = await proposeFormTemplate(schemaId);
+      onChange(result.proposed_template);
+      setStatus("idle");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Couldn't draft a form layout — is a chat model configured?");
+      setStatus("error");
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border p-3">
+      <div className="flex items-center gap-2">
+        <FileText className="h-4 w-4 text-muted-foreground" />
+        <p className="text-sm font-medium">Upfront form (optional)</p>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        A whole-form wizard a visitor fills out in one go (sections of fields, e.g. Personal details,
+        Address), instead of answering the chatbot&apos;s questions turn by turn. Drafted by AI from this
+        schema&apos;s own already-saved fields — save field changes above first if you&apos;ve just edited
+        them.
+      </p>
+
+      {schemaId === null ? (
+        <p className="text-xs text-muted-foreground italic">Save this schema first, then come back to add one.</p>
+      ) : template ? (
+        <div className="space-y-2">
+          <div className="space-y-1 rounded-md bg-muted/40 p-2">
+            <p className="text-sm font-medium">{template.title}</p>
+            {template.subtitle ? <p className="text-xs text-muted-foreground">{template.subtitle}</p> : null}
+            {template.sections.map((section, i) => (
+              <div key={i} className="pt-1">
+                <p className="text-xs font-medium">{section.title}</p>
+                <div className="flex flex-wrap gap-1 pt-0.5">
+                  {section.items.map((item, j) =>
+                    item.kind === "field" ? (
+                      <Badge key={j} variant="outline" className="text-xs">
+                        {item.field_key}
+                      </Badge>
+                    ) : (
+                      <Badge key={j} variant="secondary" className="text-xs italic">
+                        {item.text}
+                      </Badge>
+                    ),
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={suggest} disabled={status === "loading"}>
+              <Sparkles className="size-3.5" />
+              {status === "loading" ? "Regenerating…" : "Regenerate"}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => onChange(null)}>
+              Remove form
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <Button variant="outline" size="sm" onClick={suggest} disabled={status === "loading"}>
+          <Sparkles className="size-3.5" />
+          {status === "loading" ? "Drafting…" : "Suggest form layout"}
+        </Button>
+      )}
+      {status === "error" && error ? <ErrorMessage description={error} onRetry={() => setStatus("idle")} /> : null}
     </div>
   );
 }

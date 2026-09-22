@@ -19,7 +19,10 @@ import { updateBusinessProfile, type BusinessProfile, type SuggestBusinessProfil
 import {
   createIntentSchema,
   FIELD_TYPE_OPTIONS,
+  listIntentSchemas,
+  setFormTemplate,
   updateIntentSchema,
+  type FormTemplate,
   type IntentFieldInput,
   type IntentFieldType,
   type IntentSchemaInput,
@@ -53,7 +56,7 @@ type ProposedSchema = {
 };
 
 function blankProposalField(): IntentFieldInput {
-  return { field_key: "", label: "", field_type: "text", required: true, prompt_hint: "" };
+  return { field_key: "", label: "", field_type: "text", required: true, prompt_hint: "", options: null };
 }
 
 /** Shape returned by backend/apis/products.py's propose_products — a
@@ -67,15 +70,15 @@ type ProposedProduct = {
 /** Owner only (see owner-agent/deps.py — stricter than every other panel
  * in this section, which are admin OR owner). Sends a natural-language
  * command to the owner-agent container's `POST /run`, a real LLM
- * tool-calling loop over a fixed 29-tool allowlist (poster/landing-page
+ * tool-calling loop over a fixed 31-tool allowlist (poster/landing-page
  * generation, CRM capture/list/delete, reporting, GEO page regeneration,
  * attachment scanning, upload cleanup, intake-schema/product/stock/
- * business-profile proposals — including drafting products/restocks
- * straight from an already-uploaded PDF, knowledge-base search, a
- * targeted single-instruction page edit, and creating a knowledge-base
- * document directly from composed text — and more, see owner-agent/
- * tools.py for the current, authoritative list) — the first capability
- * in this app where
+ * business-profile/upfront-form-layout proposals — including drafting
+ * products/restocks straight from an already-uploaded PDF, knowledge-base
+ * search, a targeted single-instruction page edit, and creating a
+ * knowledge-base document directly from composed text — and more, see
+ * owner-agent/tools.py for the current, authoritative list) — the first
+ * capability in this app where
  * the model itself decides which action(s) to take, not a single
  * deterministic pipeline call. Renders the full step trace so a run's
  * reasoning is visible, not just its final answer. Also lists past runs
@@ -127,6 +130,18 @@ export function OwnerAgentPanel() {
   const [pendingBusinessProfile, setPendingBusinessProfile] = React.useState<BusinessProfile | null>(null);
   const businessProfileApply = useAsyncApply();
 
+  // Form-template-proposal review (2026-09-22) — same propose-then-
+  // owner-applies posture, see propose_form_template's description in
+  // owner-agent/tools.py. Carries the target schema_id alongside the
+  // draft (unlike the other proposal types here) since applying it calls
+  // setFormTemplate(schemaId, template) directly rather than resending a
+  // whole IntentSchemaInput.
+  const [pendingFormTemplate, setPendingFormTemplate] = React.useState<{
+    schemaId: number;
+    template: FormTemplate;
+  } | null>(null);
+  const formTemplateApply = useAsyncApply();
+
   const refreshHistory = React.useCallback(() => {
     listOwnerAgentRuns(HISTORY_PAGE_SIZE, (historyPage - 1) * HISTORY_PAGE_SIZE)
       .then((result) => {
@@ -150,6 +165,7 @@ export function OwnerAgentPanel() {
     setPendingProducts(null);
     setPendingStock(null);
     setPendingBusinessProfile(null);
+    setPendingFormTemplate(null);
     try {
       const runResult = await runOwnerAgentCommand(command.trim());
       setResult(runResult);
@@ -194,6 +210,15 @@ export function OwnerAgentPanel() {
         const { suggestion } = businessProfileStep.result as unknown as SuggestBusinessProfileResult;
         setPendingBusinessProfile(suggestion);
       }
+
+      const formTemplateStep = runResult.steps.find((step) => step.tool === "propose_form_template" && step.ok);
+      if (formTemplateStep?.result) {
+        const { proposed_template } = formTemplateStep.result as unknown as { proposed_template: FormTemplate };
+        const schemaId = Number(formTemplateStep.args.schema_id);
+        if (Number.isFinite(schemaId)) {
+          setPendingFormTemplate({ schemaId, template: proposed_template });
+        }
+      }
     } catch (err) {
       setError(
         err instanceof ApiError
@@ -227,15 +252,27 @@ export function OwnerAgentPanel() {
   async function applyProposal() {
     if (!pendingProposal || !proposalDraft) return;
     if (!proposalDraft.key.trim() || !proposalDraft.label.trim()) return;
-    const payload: IntentSchemaInput = {
-      key: proposalDraft.key.trim(),
-      label: proposalDraft.label.trim(),
-      description: proposalDraft.description.trim(),
-      fields: proposalDraft.fields
-        .filter((f) => f.field_key.trim() && f.label.trim())
-        .map((f) => ({ ...f, field_key: f.field_key.trim(), label: f.label.trim(), prompt_hint: f.prompt_hint?.trim() || null })),
-    };
     await schemaApply.run(async () => {
+      // propose_intent_schema's draft never carries a form_template (a
+      // separate proposal, see propose_form_template below) — when
+      // updating an ALREADY-EXISTING schema, its own currently-saved
+      // form_template has to be fetched and echoed back explicitly, or
+      // omitting the field here would silently wipe it (full-replace
+      // semantics, same as the fields list).
+      let existingFormTemplate: FormTemplate | null = null;
+      if (pendingProposal.already_exists && pendingProposal.existing_id !== null) {
+        const current = await listIntentSchemas();
+        existingFormTemplate = current.find((s) => s.id === pendingProposal.existing_id)?.form_template ?? null;
+      }
+      const payload: IntentSchemaInput = {
+        key: proposalDraft.key.trim(),
+        label: proposalDraft.label.trim(),
+        description: proposalDraft.description.trim(),
+        fields: proposalDraft.fields
+          .filter((f) => f.field_key.trim() && f.label.trim())
+          .map((f) => ({ ...f, field_key: f.field_key.trim(), label: f.label.trim(), prompt_hint: f.prompt_hint?.trim() || null })),
+        form_template: existingFormTemplate,
+      };
       if (pendingProposal.already_exists && pendingProposal.existing_id !== null) {
         await updateIntentSchema(pendingProposal.existing_id, payload);
       } else {
@@ -330,6 +367,27 @@ export function OwnerAgentPanel() {
     await businessProfileApply.run(async () => {
       await updateBusinessProfile(pendingBusinessProfile);
       setPendingBusinessProfile(null);
+    });
+  }
+
+  function updateFormTemplateSectionTitle(index: number, title: string) {
+    setPendingFormTemplate((p) =>
+      p
+        ? { ...p, template: { ...p.template, sections: p.template.sections.map((s, i) => (i === index ? { ...s, title } : s)) } }
+        : p,
+    );
+  }
+
+  function discardFormTemplate() {
+    setPendingFormTemplate(null);
+    formTemplateApply.reset();
+  }
+
+  async function applyFormTemplate() {
+    if (!pendingFormTemplate) return;
+    await formTemplateApply.run(async () => {
+      await setFormTemplate(pendingFormTemplate.schemaId, pendingFormTemplate.template);
+      setPendingFormTemplate(null);
     });
   }
 
@@ -705,6 +763,67 @@ export function OwnerAgentPanel() {
               </div>
               {businessProfileApply.status === "error" && businessProfileApply.error ? (
                 <ErrorMessage description={businessProfileApply.error} onRetry={businessProfileApply.reset} />
+              ) : null}
+            </div>
+          ) : null}
+
+          {pendingFormTemplate ? (
+            <div className="space-y-3 rounded-lg border border-dashed p-3">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">Upfront form layout draft — review before applying</p>
+                <p className="text-xs text-muted-foreground">
+                  The agent never saves this itself. Section titles can be renamed below; Apply saves it as
+                  that schema&apos;s StructuredIntakeForm layout, replacing any existing one.
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Form title</Label>
+                <Input
+                  value={pendingFormTemplate.template.title}
+                  onChange={(e) =>
+                    setPendingFormTemplate((p) =>
+                      p ? { ...p, template: { ...p.template, title: e.target.value } } : p,
+                    )
+                  }
+                />
+              </div>
+
+              <div className="space-y-2">
+                {pendingFormTemplate.template.sections.map((section, i) => (
+                  <div key={i} className="space-y-1 rounded-md bg-muted/40 p-2">
+                    <Input
+                      className="h-8 text-sm font-medium"
+                      value={section.title}
+                      onChange={(e) => updateFormTemplateSectionTitle(i, e.target.value)}
+                    />
+                    <div className="flex flex-wrap gap-1">
+                      {section.items.map((item, j) =>
+                        item.kind === "field" ? (
+                          <Badge key={j} variant="outline" className="text-xs">
+                            {item.field_key}
+                          </Badge>
+                        ) : (
+                          <Badge key={j} variant="secondary" className="text-xs italic">
+                            {item.text}
+                          </Badge>
+                        ),
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button onClick={applyFormTemplate} disabled={formTemplateApply.status === "saving"}>
+                  {formTemplateApply.status === "saving" ? "Applying…" : "Apply"}
+                </Button>
+                <Button variant="ghost" onClick={discardFormTemplate}>
+                  Discard
+                </Button>
+              </div>
+              {formTemplateApply.status === "error" && formTemplateApply.error ? (
+                <ErrorMessage description={formTemplateApply.error} onRetry={formTemplateApply.reset} />
               ) : null}
             </div>
           ) : null}

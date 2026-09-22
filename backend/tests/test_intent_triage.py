@@ -56,3 +56,26 @@ def test_build_triage_control_degrades_checkbox_to_text_when_every_option_is_mal
     control = _build_triage_control(triage)
     assert control.type == "text"
     assert control.options is None
+
+
+def test_build_triage_control_passes_through_a_valid_form_schema_key():
+    """A schema_key the caller confirms actually has a form_template
+    (2026-09-22, StructuredIntakeForm's chat-embedded trigger)."""
+    control = _build_triage_control({"control_type": "form", "schema_key": "insurance_claim"}, {"insurance_claim"})
+    assert control.type == "form"
+    assert control.schema_key == "insurance_claim"
+
+
+def test_build_triage_control_degrades_form_with_unknown_schema_key_to_text():
+    """The model naming a schema_key that isn't actually one of the
+    caller-confirmed form-enabled schemas must never render a form that
+    doesn't exist — degrades to plain text instead."""
+    control = _build_triage_control({"control_type": "form", "schema_key": "made_up"}, {"insurance_claim"})
+    assert control.type == "text"
+    assert control.schema_key is None
+
+
+def test_build_triage_control_degrades_form_with_no_form_schemas_at_all_to_text():
+    control = _build_triage_control({"control_type": "form", "schema_key": "insurance_claim"})
+    assert control.type == "text"
+    assert control.schema_key is None

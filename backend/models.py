@@ -710,7 +710,23 @@ class IntentSchema(Base):
     ... — the mechanism is identical, only the fields differ, so adding
     a new vertical is the owner filling in this table again, not new
     code. See apis/chat.py's `_lead_extraction_system_prompt` for how
-    this actually drives collection during a conversation."""
+    this actually drives collection during a conversation.
+
+    `form_template` (2026-09-22) is a second, optional way to collect
+    this same schema's fields — a whole-form upfront wizard
+    (StructuredIntakeForm, frontend) instead of the conversational
+    turn-by-turn collection above. Shape:
+    `{title, subtitle?, description?, sections: [{title, subtitle?,
+    description?, items: [{kind: "field", field_key} | {kind: "label",
+    text}]}]}` — sections group already-existing IntentFields (by
+    field_key, never duplicating their type/required/options) under
+    their own heading/description, plus optional static "label" items
+    for inline instructional text. Deliberately generated ONCE (see
+    apis/intent_schemas.py's propose_form_template) and stored here,
+    not regenerated per visitor — every visitor who opens the form sees
+    the identical, owner-reviewed layout, with zero per-render LLM cost.
+    Null means "no upfront form configured for this schema" — the
+    chatbot's own conversational collection is unaffected either way."""
 
     __tablename__ = "intent_schemas"
 
@@ -720,6 +736,7 @@ class IntentSchema(Base):
     # Tells the model *when* this schema applies — e.g. "the visitor
     # wants to file or check on an existing insurance claim."
     description: Mapped[str] = mapped_column(Text)
+    form_template: Mapped[dict | None] = mapped_column(JSONB, default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     fields: Mapped[list["IntentField"]] = relationship(
@@ -734,7 +751,17 @@ class IntentField(Base):
     apis/chat.py's extraction prompt and CrmEntry.collected_fields both
     key on; label/prompt_hint are what actually get shown to the model
     (and, for label, the dashboard) so the field means something beyond
-    a raw identifier."""
+    a raw identifier. Also what StructuredIntakeForm (frontend) renders
+    directly when this schema has a form_template — label is the visible
+    field label, prompt_hint doubles as the small helper text under the
+    input, both reused as-is rather than adding form-specific copies.
+
+    `options` (2026-09-22, only meaningful when field_type == "select")
+    is `[{label, value}]` — same shape as frontend/src/lib/types.ts's
+    ChatOption, for consistency with the other structured-choice contract
+    this app already has (ChatControl's radio/checkbox/select options),
+    rather than a plain string list that couldn't distinguish a displayed
+    label from its stored value (e.g. "Australia" shown, "AU" stored)."""
 
     __tablename__ = "intent_fields"
 
@@ -742,13 +769,15 @@ class IntentField(Base):
     intent_schema_id: Mapped[int] = mapped_column(ForeignKey("intent_schemas.id", ondelete="CASCADE"))
     field_key: Mapped[str] = mapped_column(String(64))
     label: Mapped[str] = mapped_column(String(255))
-    # text|email|phone|date|number|note — a fixed, small vocabulary
-    # (mirrors this project's other enum-not-free-text style knobs, e.g.
-    # BlockWidth in the page schema) rather than an open type string.
+    # text|email|phone|date|number|note|select — a fixed, small
+    # vocabulary (mirrors this project's other enum-not-free-text style
+    # knobs, e.g. BlockWidth in the page schema) rather than an open type
+    # string. "select" (2026-09-22) is the one type that needs `options`.
     field_type: Mapped[str] = mapped_column(String(16), default="text")
     required: Mapped[bool] = mapped_column(Boolean, default=True)
     prompt_hint: Mapped[str | None] = mapped_column(Text, default=None)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    options: Mapped[list[dict] | None] = mapped_column(JSONB, default=None)
 
     intent_schema: Mapped["IntentSchema"] = relationship(back_populates="fields")
 

@@ -21,6 +21,7 @@ from apis.contact import router as contact_router
 from apis.documents import router as documents_router
 from apis.error_log import router as error_log_router
 from apis.intent_schemas import router as intent_schemas_router
+from apis.intent_schemas import public_router as intent_schemas_public_router
 from apis.media import MEDIA_UPLOAD_DIR
 from apis.media import router as media_router
 from apis.crm_resume import router as crm_resume_router
@@ -107,6 +108,7 @@ app.include_router(pages_public_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(intent_schemas_router, prefix="/api")
+app.include_router(intent_schemas_public_router, prefix="/api")
 app.include_router(products_admin_router, prefix="/api")
 app.include_router(products_public_router, prefix="/api")
 app.include_router(model_settings_router, prefix="/api")

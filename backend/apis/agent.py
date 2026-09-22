@@ -360,6 +360,21 @@ class MapBlock(BaseModel):
     width: BlockWidth = "auto"
 
 
+class IntentFormBlock(BaseModel):
+    """Added 2026-09-22 — a whole StructuredIntakeForm wizard, owner-bound
+    to one IntentSchema (see models.py's IntentSchema.form_template
+    docstring and frontend/src/components/modules/structured-intake-
+    form.tsx). Owner-inserted only via CTE, same posture as
+    ProductListBlock/MapBlock (never vision-generated — a vision model
+    has no way to know which of the owner's schemas a design mockup is
+    for). `schema_key: None` (the freshly-inserted default) renders an
+    empty-state placeholder until the owner picks one."""
+
+    type: Literal["intent-form"] = "intent-form"
+    schema_key: str | None = None
+    width: BlockWidth = "auto"
+
+
 Block = Annotated[
     Union[
         ImageBlock,
@@ -369,6 +384,7 @@ Block = Annotated[
         ProductListBlock,
         ProductCardBlock,
         MapBlock,
+        IntentFormBlock,
     ],
     Field(discriminator="type"),
 ]

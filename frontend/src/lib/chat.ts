@@ -74,11 +74,21 @@ export function restoreChatSessionId(sid: string): void {
  * here. See backend/apis/chat.py and the repo root AGENTS.md's
  * architecture note for why this is deliberately the only backend path
  * the public chatbot can reach. */
+/** Set when the visitor filled out a whole StructuredIntakeForm and hit
+ * Submit, instead of typing a free-text message (2026-09-22) — see
+ * backend/apis/chat.py's StructuredSubmissionRequest. Deterministically
+ * written to a CrmEntry server-side, no LLM re-extraction. */
+export type StructuredSubmissionInput = {
+  schema_key: string;
+  fields: Record<string, string>;
+};
+
 export async function sendChatMessage(
   message: string,
   history: ChatApiTurn[] = [],
   attachmentUrl?: string,
   turnstileToken?: string,
+  structuredSubmission?: StructuredSubmissionInput,
 ): Promise<{
   reply: string;
   sources: RagSource[];
@@ -97,6 +107,7 @@ export async function sendChatMessage(
       // a conversation's first turn (empty history); harmless to include
       // on every call, see backend/apis/chat.py's own gate.
       turnstile_token: turnstileToken ?? null,
+      structured_submission: structuredSubmission ?? null,
     },
   });
   return {

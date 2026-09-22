@@ -32,8 +32,10 @@ export type RagSource = {
 export type ChatRole = "user" | "assistant";
 
 /** The LLM is expected to respond with one of these control types so the
- * frontend can render the matching input instead of plain text. */
-export type ChatControlType = "text" | "radio" | "checkbox" | "select";
+ * frontend can render the matching input instead of plain text. "form"
+ * (2026-09-22) renders a whole StructuredIntakeForm inline instead of a
+ * single-question widget — see `schema_key` below. */
+export type ChatControlType = "text" | "radio" | "checkbox" | "select" | "form";
 
 export type ChatOption = {
   label: string;
@@ -44,6 +46,9 @@ export type ChatControl = {
   type: ChatControlType;
   label?: string;
   options?: ChatOption[];
+  /** Set only when type === "form" — the IntentSchema.key whose
+   * form_template StructuredIntakeForm should fetch and render. */
+  schema_key?: string | null;
 };
 
 export type ChatProductCard = {

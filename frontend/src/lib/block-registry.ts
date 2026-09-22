@@ -64,6 +64,13 @@ export const BLOCK_REGISTRY: BlockTypeDef[] = [
     insertable: true,
     createDefault: () => ({ type: "map", query: "" }),
   },
+  {
+    type: "intent-form",
+    label: "Intake form",
+    description: "A whole multi-step form for one of your intent schemas — pick which one after inserting.",
+    insertable: true,
+    createDefault: () => ({ type: "intent-form", schema_key: null }),
+  },
 ];
 
 export const INSERTABLE_BLOCK_TYPES = BLOCK_REGISTRY.filter((def) => def.insertable);

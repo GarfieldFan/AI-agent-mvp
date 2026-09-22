@@ -462,6 +462,127 @@ def _available_request_types_block(schemas: list[IntentSchema]) -> str | None:
     )
 
 
+class StructuredSubmissionRequest(BaseModel):
+    """Set when the visitor filled out a whole StructuredIntakeForm
+    (frontend) — see models.py's IntentSchema.form_template docstring —
+    and hit Submit, rather than typing a free-text message. `fields` is
+    already client-validated (required fields present, right-shaped
+    values), but chat() re-validates server-side (never trusts a client
+    alone, see `_validate_structured_submission`) and writes the
+    CrmEntry deterministically — no LLM re-extraction of data that's
+    already known and structured (2026-09-22)."""
+
+    schema_key: str
+    fields: dict[str, str]
+
+
+def _validate_structured_submission(
+    schema: IntentSchema, submitted: StructuredSubmissionRequest
+) -> tuple[dict[str, str], str | None, str | None, str | None]:
+    """Filters submitted.fields to this schema's own known field_keys (an
+    unknown key is silently dropped — the same defense
+    _apply_lead_capture's matched_schema branch already applies to a
+    model's output, here against a client-supplied dict instead, an
+    equally untrusted source), then checks every required field actually
+    has a value — never trusts the frontend's own client-side validation
+    alone. Also best-effort resolves contact_email/contact_phone from
+    whichever field carries that field_type, and contact_name from a
+    field literally keyed "name" or "full_name" if present. Raises
+    HTTPException(400) on a missing required field. Doesn't resolve the
+    final contact_email fallback (a signed-in visitor's account email) —
+    that's chat()'s job, since only it has `current.email` in scope."""
+    valid_fields = {f.field_key: f for f in schema.fields}
+    clean: dict[str, str] = {
+        k: str(v).strip()
+        for k, v in submitted.fields.items()
+        if k in valid_fields and v is not None and str(v).strip()
+    }
+    missing = [f.label for f in schema.fields if f.required and not clean.get(f.field_key)]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}.")
+
+    email_field = next((f for f in schema.fields if f.field_type == "email" and clean.get(f.field_key)), None)
+    phone_field = next((f for f in schema.fields if f.field_type == "phone" and clean.get(f.field_key)), None)
+    name_key = next((k for k in ("name", "full_name") if clean.get(k)), None)
+
+    return (
+        clean,
+        clean.get(email_field.field_key) if email_field else None,
+        clean.get(name_key) if name_key else None,
+        clean.get(phone_field.field_key) if phone_field else None,
+    )
+
+
+def _structured_submission_context_block(schema: IntentSchema, fields: dict[str, str]) -> str:
+    """Folded into the main reply's context — same "tell the prose what
+    the code already decided" posture as _order_turn_context_block/
+    _in_progress_context_block."""
+    lines = "; ".join(f"{k}: {v}" for k, v in fields.items()) or "no details"
+    return (
+        f"(The visitor just submitted a completed {schema.label} form with these details: {lines}. "
+        "Acknowledge receipt and briefly confirm what was submitted in your reply — don't ask for any "
+        "of this information again.)"
+    )
+
+
+async def apply_structured_submission(
+    db: Session,
+    schema: IntentSchema,
+    fields: dict[str, str],
+    contact_email: str,
+    contact_name: str | None,
+    contact_phone: str | None,
+    chat_session_id: int | None,
+    active_entry: CrmEntry | None,
+    active_schema: IntentSchema | None,
+) -> CrmEntry:
+    """Deterministic create-or-merge write for a one-shot structured form
+    submission (2026-09-22, see the StructuredIntakeForm component) —
+    mirrors _apply_lead_capture's matched_schema branch (same merge-by-
+    session-and-schema rule, same notify_owner-on-genuinely-new-entry
+    rule) but skips the LLM classification step entirely: the schema_key
+    and field values are already known and server-validated by the time
+    this runs (see _validate_structured_submission above). Kept as its
+    own function rather than reshaping _apply_lead_capture to take a
+    second caller — that function's signature is built around an LLM's
+    already-parsed JSON blob, and duplicating the small amount of
+    create-or-merge logic here is simpler and lower-risk than reworking
+    an already-verified path for a second, differently-shaped caller. If
+    either function's merge/notify behavior changes, check whether the
+    other needs the same change."""
+    if active_entry is not None and active_schema is not None and active_schema.id == schema.id:
+        active_entry.collected_fields = {**active_entry.collected_fields, **fields}
+        if contact_name and not active_entry.contact_name:
+            active_entry.contact_name = contact_name
+        if contact_phone and not active_entry.contact_phone:
+            active_entry.contact_phone = contact_phone
+        db.commit()
+        return active_entry
+
+    entry = CrmEntry(
+        contact_email=contact_email,
+        contact_name=contact_name,
+        contact_phone=contact_phone,
+        summary=f"Submitted the {schema.label} form.",
+        category=schema.key,
+        tags=["source:form"],
+        intent_schema_id=schema.id,
+        collected_fields=fields,
+        chat_session_id=chat_session_id,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    await notify_owner(
+        db,
+        f"[AI MVP] New {schema.label.lower()} from {entry.contact_email}",
+        f"{entry.summary}\n\nCategory: {schema.label}\nContact: {entry.contact_email}"
+        + (f" / {entry.contact_phone}" if entry.contact_phone else "")
+        + (f"\n\n{entry.collected_fields}" if entry.collected_fields else ""),
+    )
+    return entry
+
+
 def _lead_extraction_system_prompt(
     known_email: str | None,
     attachment_info: dict | None,
@@ -1163,6 +1284,7 @@ class ChatRequest(BaseModel):
     # verification. Every later turn in the same conversation is never
     # asked to re-verify.
     turnstile_token: str | None = None
+    structured_submission: StructuredSubmissionRequest | None = None
 
 
 class ChatSource(BaseModel):
@@ -1179,8 +1301,12 @@ class ChatOptionOut(BaseModel):
 
 
 class ChatControlOut(BaseModel):
-    type: str  # "radio" | "checkbox" | "select" | "text" — matches frontend/src/lib/types.ts's ChatControlType
+    type: str  # "radio" | "checkbox" | "select" | "text" | "form" — matches types.ts's ChatControlType
     options: list[ChatOptionOut] | None = None
+    # Set only when type == "form" (2026-09-22) — the IntentSchema.key
+    # StructuredIntakeForm (frontend) should fetch and render inline in
+    # the chat transcript, instead of a plain single-question control.
+    schema_key: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -1298,7 +1424,7 @@ def _get_or_create_session(db: Session, session_key: str, user_email: str | None
     return session
 
 
-_TRIAGE_CONTROL_TYPES = {"radio", "checkbox", "select", "text"}
+_TRIAGE_CONTROL_TYPES = {"radio", "checkbox", "select", "text", "form"}
 
 
 def _intent_triage_system_prompt(intent_prompt: str, schemas: list[IntentSchema], products: list[Product]) -> str:
@@ -1311,12 +1437,28 @@ def _intent_triage_system_prompt(intent_prompt: str, schemas: list[IntentSchema]
     the visitor has said enough to know what's relevant to retrieve, and
     the built-in default prompt is written to work fine without them
     (schemas/products alone are usually the real "what does this business
-    offer" signal for a fresh visitor)."""
+    offer" signal for a fresh visitor).
+
+    `form_schemas` (2026-09-22) — schemas that have an owner-reviewed
+    StructuredIntakeForm layout (IntentSchema.form_template) available —
+    are called out separately so the model can offer the whole-form
+    wizard (control_type "form") instead of a single-question control
+    when the visitor's need clearly matches one of them; every other
+    schema/product is unaffected."""
     context_parts = []
     if schemas:
         context_parts.append(
             "This business has these configured request types:\n"
             + "\n".join(f"- {s.label}: {s.description}" for s in schemas)
+        )
+    form_schemas = [s for s in schemas if s.form_template]
+    if form_schemas:
+        context_parts.append(
+            'These request types have a ready-made multi-section form available (control_type "form", '
+            'schema_key set to the key below) — prefer offering the form over a single question when the '
+            "visitor's need clearly matches one of these, since it collects everything needed in one "
+            "step instead of several back-and-forth turns:\n"
+            + "\n".join(f'- schema_key "{s.key}": {s.label}' for s in form_schemas)
         )
     if products:
         context_parts.append(
@@ -1328,11 +1470,13 @@ def _intent_triage_system_prompt(intent_prompt: str, schemas: list[IntentSchema]
         f"{intent_prompt}\n"
         f"{context_block}\n\n"
         "Respond with ONLY a single JSON object, no markdown fences, no commentary before or after it:\n"
-        '{"ask": true or false, "question": "<the single clarifying question to ask, or null if ask is '
-        'false>", "control_type": "radio" or "checkbox" or "select" or "text", "options": '
-        '[{"label": "<shown to the visitor>", "value": "<short machine value>"}, ...]}\n\n'
+        '{"ask": true or false, "question": "<the single clarifying question to ask, or, for control_type '
+        '\"form\", a short one-sentence intro to the form; null if ask is false>", "control_type": "radio" '
+        'or "checkbox" or "select" or "text" or "form", "options": [{"label": "<shown to the visitor>", '
+        '"value": "<short machine value>"}, ...], "schema_key": "<one of the schema_keys listed above '
+        'with a ready-made form, only when control_type is \"form\" — otherwise null>"}\n\n'
         'Only include "options" (2-5 of them) when control_type is "radio"/"checkbox"/"select" — omit it '
-        '(or use an empty list) for "text", where the visitor just types their answer normally. Set ask to '
+        '(or use an empty list) for "text"/"form". Set ask to '
         "false — and question to null — whenever the visitor's very first message already gives you enough "
         "to answer directly, or is just a greeting/general question with no real ambiguity to resolve."
     ) + _CLASSIFICATION_INJECTION_DEFENSE_CLAUSE
@@ -1370,13 +1514,20 @@ async def _intent_triage_call(
         return None
 
 
-def _build_triage_control(triage: dict) -> ChatControlOut | None:
+def _build_triage_control(triage: dict, form_schema_keys: set[str] | None = None) -> ChatControlOut | None:
     """Turns _intent_triage_call's already-parsed JSON into the real
     ChatControlOut the frontend renders — never trusts the model's
-    control_type/options shape blindly: an unrecognized type or missing/
-    malformed options both degrade to a plain "text" control (no special
-    widget, the visitor just types normally) rather than surfacing a
-    broken control with nothing to click."""
+    control_type/options/schema_key shape blindly: an unrecognized type,
+    missing/malformed options, or (for "form") a schema_key that isn't
+    actually one of the schemas WITH a real form_template configured, all
+    degrade to a plain "text" control (no special widget, the visitor
+    just types normally) rather than surfacing a broken control with
+    nothing to click or a form that doesn't exist.
+
+    `form_schema_keys` (2026-09-22) — the set of schema keys that
+    genuinely have a form_template right now, computed by the caller
+    (chat()) from the same `intent_schemas` list the prompt itself was
+    built from — never trusts the model to have echoed back a real key."""
     control_type = triage.get("control_type")
     if control_type not in _TRIAGE_CONTROL_TYPES:
         control_type = "text"
@@ -1394,7 +1545,15 @@ def _build_triage_control(triage: dict) -> ChatControlOut | None:
     if control_type in ("radio", "checkbox", "select") and not options:
         control_type = "text"
 
-    return ChatControlOut(type=control_type, options=options)
+    schema_key: str | None = None
+    if control_type == "form":
+        candidate = triage.get("schema_key")
+        if isinstance(candidate, str) and candidate in (form_schema_keys or set()):
+            schema_key = candidate
+        else:
+            control_type = "text"
+
+    return ChatControlOut(type=control_type, options=options, schema_key=schema_key)
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -1476,6 +1635,50 @@ async def chat(
             else None
         )
 
+        # Structured form submission (2026-09-22, see
+        # StructuredSubmissionRequest's docstring and models.py's
+        # IntentSchema.form_template) — a fully separate, deterministic
+        # path: no LLM classification needed, the schema_key and field
+        # values are already known. Runs BEFORE the intent-triage/lead-
+        # capture/order-extraction machinery below so those can be
+        # skipped outright for this turn (nothing left for them to
+        # extract) and so active_entry/active_schema reflect the
+        # just-applied write for every downstream context block.
+        structured_submission_block: str | None = None
+        if req.structured_submission is not None:
+            submission_schema = next(
+                (s for s in intent_schemas if s.key == req.structured_submission.schema_key), None
+            )
+            if submission_schema is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown schema_key {req.structured_submission.schema_key!r}.",
+                )
+            clean_fields, form_email, form_name, form_phone = _validate_structured_submission(
+                submission_schema, req.structured_submission
+            )
+            contact_email = form_email or current.email
+            if not contact_email:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This form has no email field configured and you're not signed in — "
+                    "can't record this submission.",
+                )
+            submitted_entry = await apply_structured_submission(
+                db,
+                submission_schema,
+                clean_fields,
+                contact_email,
+                form_name,
+                form_phone,
+                chat_session_id,
+                active_entry,
+                active_schema,
+            )
+            active_entry = submitted_entry
+            active_schema = submission_schema
+            structured_submission_block = _structured_submission_context_block(submission_schema, clean_fields)
+
         # Product ordering (2026-08-19, see this module's docstring's
         # "Order capture" section) — same "look up once, reuse for both
         # the reply's context and the post-reply capture call" shape as
@@ -1495,7 +1698,7 @@ async def chat(
         # "don't ask," never blocks the turn — same swallow-and-degrade
         # posture as every other best-effort classification call in this
         # module.
-        if not history and not req.attachment_url:
+        if not history and not req.attachment_url and req.structured_submission is None:
             try:
                 triage_provider = resolve_chat_provider(db)
             except ProviderNotConfigured:
@@ -1509,7 +1712,8 @@ async def chat(
                     if session is not None:
                         db.add(ChatMessage(session_id=session.id, role="assistant", content=question))
                         db.commit()
-                    return ChatResponse(reply=question, control=_build_triage_control(triage))
+                    form_schema_keys = {s.key for s in intent_schemas if s.form_template}
+                    return ChatResponse(reply=question, control=_build_triage_control(triage, form_schema_keys))
 
         try:
             embedder = resolve_embedding_provider(db)
@@ -1566,7 +1770,9 @@ async def chat(
             if visitor_context:
                 user_content = f"{visitor_context}\n\n{user_content}"
 
-        if active_schema is not None and active_entry is not None:
+        if structured_submission_block:
+            user_content = f"{structured_submission_block}\n\n{user_content}"
+        elif active_schema is not None and active_entry is not None:
             user_content = f"{_in_progress_context_block(active_schema, active_entry)}\n\n{user_content}"
 
         available_request_types_block = _available_request_types_block(intent_schemas)
@@ -1597,21 +1803,25 @@ async def chat(
         # order/total — see this module's "Product ordering" section.
         order_extraction_task = (
             asyncio.create_task(_order_extraction_call(provider, history, req.message, active_order))
-            if products
+            if products and req.structured_submission is None
             else None
         )
-        lead_extraction_task = asyncio.create_task(
-            _lead_extraction_call(
-                provider,
-                history,
-                req.message,
-                current.email,
-                req.attachment_url,
-                attachment_info,
-                intent_schemas,
-                active_schema,
-                active_entry,
+        lead_extraction_task = (
+            asyncio.create_task(
+                _lead_extraction_call(
+                    provider,
+                    history,
+                    req.message,
+                    current.email,
+                    req.attachment_url,
+                    attachment_info,
+                    intent_schemas,
+                    active_schema,
+                    active_entry,
+                )
             )
+            if req.structured_submission is None
+            else None
         )
 
         order_parsed = await order_extraction_task if order_extraction_task is not None else None
@@ -1635,25 +1845,28 @@ async def chat(
             # about to be abandoned unawaited, so cancel it explicitly
             # rather than leaving it running in the background for no
             # caller to ever use the result of.
-            lead_extraction_task.cancel()
+            if lead_extraction_task is not None:
+                lead_extraction_task.cancel()
             raise HTTPException(status_code=503, detail=str(e))
         except httpx.HTTPError as e:
-            lead_extraction_task.cancel()
+            if lead_extraction_task is not None:
+                lead_extraction_task.cancel()
             raise HTTPException(status_code=502, detail=f"Chat provider request failed: {e}")
 
-        lead_parsed = await lead_extraction_task
-        await _apply_lead_capture(
-            db,
-            lead_parsed,
-            message=req.message,
-            known_email=current.email,
-            attachment_url=req.attachment_url,
-            attachment_info=attachment_info,
-            chat_session_id=chat_session_id,
-            schemas=intent_schemas,
-            active_schema=active_schema,
-            active_entry=active_entry,
-        )
+        if lead_extraction_task is not None:
+            lead_parsed = await lead_extraction_task
+            await _apply_lead_capture(
+                db,
+                lead_parsed,
+                message=req.message,
+                known_email=current.email,
+                attachment_url=req.attachment_url,
+                attachment_info=attachment_info,
+                chat_session_id=chat_session_id,
+                schemas=intent_schemas,
+                active_schema=active_schema,
+                active_entry=active_entry,
+            )
 
         apply_resolved_order_turn(db, chat_session_id, current.email, active_order, order_turn)
 

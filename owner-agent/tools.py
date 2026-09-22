@@ -227,6 +227,22 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="POST",
         path="/api/agent/intent-schemas/propose",
     ),
+    "propose_form_template": ToolSpec(
+        name="propose_form_template",
+        description=(
+            "Drafts a section-grouped upfront form layout for an ALREADY-EXISTING intent schema's own "
+            "fields (call list_intent_schemas first to get its real id) — this is StructuredIntakeForm, a "
+            "whole-form wizard a visitor fills out in one go instead of answering the chatbot's questions "
+            "turn by turn, grouped into sections (e.g. Personal details, Address) so a long field list "
+            'doesn\'t overwhelm one page. Args: {"schema_id": <the schema\'s numeric id>}. This NEVER '
+            "saves anything itself, it only returns a draft — after calling this, tell the owner a draft "
+            "form layout is ready to review and apply in the Owner agent panel. The schema must already "
+            "have fields defined (in the dashboard, or via a previously-applied propose_intent_schema "
+            "draft) or this fails."
+        ),
+        method="POST",
+        path="/api/agent/intent-schemas/{schema_id}/propose-form-template",
+    ),
     "list_products": ToolSpec(
         name="list_products",
         description=(

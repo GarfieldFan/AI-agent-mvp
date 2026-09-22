@@ -413,6 +413,23 @@ export type MapBlock = {
   width?: BlockWidth;
 };
 
+/** A whole-form StructuredIntakeForm wizard, owner-bound to one
+ * IntentSchema (2026-09-22) — an owner drops this anywhere on a page to
+ * let a visitor fill out a multi-section upfront form (an application, a
+ * registration, ...) instead of collecting it conversationally. See
+ * components/modules/structured-intake-form.tsx and backend/models.py's
+ * IntentSchema.form_template docstring. `schema_key: null` (the
+ * freshly-inserted default) renders an empty-state placeholder until the
+ * owner picks a schema in the CTE editor, mirroring ProductCardBlock's
+ * own `product_id: null` posture. Owner-inserted only via CTE, never
+ * vision-generated (a vision model has no way to know which of the
+ * owner's schemas a design mockup is for). */
+export type IntentFormBlock = {
+  type: "intent-form";
+  schema_key: string | null;
+  width?: BlockWidth;
+};
+
 export type Block =
   | ImageBlock
   | TextContentBlock
@@ -420,7 +437,8 @@ export type Block =
   | ContainerBlock
   | ProductListBlock
   | ProductCardBlock
-  | MapBlock;
+  | MapBlock
+  | IntentFormBlock;
 
 export type PageSection =
   | HeroSection

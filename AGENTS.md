@@ -1207,6 +1207,219 @@ facts only.
   touching disk), the owner-agent's `cleanup_chat_uploads` tool, or
   `CrmPanel`'s "Clean up unused uploads" button.
 
+## Structured intake forms (`StructuredIntakeForm`)
+
+Added 2026-09-22, off a direct user ask modeled on real multi-section
+intake flows (an event-registration page, an ATO tax return, a visa
+application): an upfront, all-fields-at-once form — grouped into
+sections (Personal, Address, ...) so a long field list doesn't
+overwhelm one page — as an alternative to `apis/chat.py`'s existing
+turn-by-turn conversational collection (see "Chat lead capture" above).
+Deliberately built as a second, optional layer ON TOP of the existing
+`IntentSchema`/`IntentField` mechanism rather than a separate form
+schema — the two collection modes (conversational, upfront-form) share
+the exact same field definitions and the exact same `CrmEntry` write
+path; only how the visitor is asked differs.
+
+- **`IntentField` gained `select` as a field type** (was `text|email|
+  phone|date|number|note`) **+ an `options: list[{label, value}] | None`
+  column** — `{label, value}` deliberately mirrors `ChatControl`'s own
+  `ChatOption` shape (the other structured-choice contract this app
+  already has), not a flat string list, so a displayed label
+  ("Australia") can differ from its stored value ("AU").
+- **`IntentSchema.form_template: dict | None`** — the section-grouped
+  layout: `{title, subtitle?, description?, sections: [{title,
+  subtitle?, description?, items: [{kind: "field", field_key} |
+  {kind: "label", text}]}]}`. Deliberately generated ONCE and stored,
+  never regenerated per visitor (same "cache the design decision"
+  posture as `PageVersion`) — every visitor sees the identical,
+  owner-reviewed layout with zero per-render LLM cost. Sections
+  reference fields by `field_key` only, never duplicating
+  type/required/options — `IntentField` stays the single source of
+  truth. A `"label"` item is inline static instructional text, not a
+  real collected field (never appears in `CrmEntry.collected_fields`).
+  `null` means this schema has no upfront form configured — the
+  conversational path is completely unaffected either way.
+- **`POST /agent/intent-schemas/{id}/propose-form-template`** — drafts a
+  `form_template` from a schema's own already-saved fields via
+  `resolve_chat_provider`, same propose-then-owner-applies posture as
+  `propose_intent_schema` (never writes; validates every referenced
+  `field_key` actually exists and that the model didn't drop any field
+  before returning the draft). **`PUT /agent/intent-schemas/{id}/
+  form-template`** applies a reviewed (or hand-edited) template directly
+  — `null` body clears it. `IntentSchemaPayload`/`update_intent_schema`'s
+  full-replace `IntentSchemaInput` also carries `form_template` now (the
+  same whole-list-replace convention `fields` already had) — the
+  frontend always echoes the currently-loaded template back on an
+  ordinary field edit, never omits it, so a plain field-editing save can
+  never silently wipe an already-saved form.
+- **`GET /api/intent-schemas/{key}/form`** (new public, no-auth router in
+  `apis/intent_schemas.py`) — what `StructuredIntakeForm` fetches: key/
+  label/description/fields (with options)/form_template. 404 on an
+  unknown key; `form_template: null` is a normal response (frontend
+  shows an "unavailable" state), not an error.
+- **Submission is fully deterministic, never re-extracted by an LLM** —
+  `ChatRequest` gained an optional `structured_submission:
+  {schema_key, fields}`. `chat()` detects it early (right after loading
+  `intent_schemas`/`active_entry`/`active_schema`, before intent triage/
+  order extraction/lead extraction — all three are skipped outright for
+  this turn, nothing left for them to extract), server-side re-validates
+  (`_validate_structured_submission`: filters to known `field_key`s,
+  never trusts the client alone, checks every `required` field is
+  actually present, resolves `contact_email`/`contact_phone` from
+  whichever field carries that `field_type`, falling back to a signed-in
+  visitor's account email if no email field exists), then
+  `apply_structured_submission` does the same create-or-merge-by-
+  `(chat_session_id, schema)` write and `notify_owner` call
+  `_apply_lead_capture`'s matched-schema branch already does for the
+  conversational path — kept as its own function rather than reshaping
+  that one, since it takes an already-validated dict, not an LLM's
+  parsed JSON. **The write happens BEFORE the main reply is generated**,
+  so if the configured chat provider is unreachable and the confirmation
+  reply itself fails, the visitor's actual submission is still recorded
+  — verified live: a valid submission against an unreachable provider
+  correctly 502'd on the reply while the `CrmEntry` was still created
+  with the right `collected_fields`. The AI's only job on this turn is
+  narrating a natural confirmation, via a new
+  `_structured_submission_context_block` folded into the reply's
+  context, same "tell the prose what the code already decided" pattern
+  as `_order_turn_context_block`.
+- **`StructuredIntakeForm`** (frontend,
+  `components/modules/structured-intake-form.tsx`) — a generic,
+  reusable multi-step wizard: one step per `form_template` section, a
+  progress bar, per-step client validation (required fields, email
+  format) before allowing Next, full re-validation of every step on
+  Submit. Renders `select`→`<Select>`, `note`→`<Textarea>`, everything
+  else→a typed `<Input>`; a `"label"` item renders as small italic text.
+  Includes `TurnstileWidget` on the final step when bot verification is
+  enabled (the same public no-auth endpoint this hits always evaluates
+  `not req.history`, and this component always sends `history: []`, so
+  it's gated exactly like any conversation's genuine first turn). Two
+  usage surfaces this round:
+  1. **CTE Block `intent-form`** (`lib/theme.ts`'s `IntentFormBlock`,
+     mirrors `ProductCardBlock`'s `product_id: null` empty-state
+     posture for `schema_key: null`) — an owner drops this anywhere on a
+     page, picks a schema from a `Select` in the CTE editor
+     (`"block-intent-form"` fieldType, `CteEditorPopover`). Owner-
+     inserted only, never vision-generated (same reasoning as
+     `MapBlock`/`ProductListBlock` — a vision model has no way to know
+     which schema a design mockup is for).
+  2. **Chat-bubble embed** — `ChatControl` gained a `"form"` type +
+     `schema_key`. `_intent_triage_system_prompt` now separately lists
+     schemas that actually have a `form_template` configured and tells
+     the model it may offer the whole form (instead of one clarifying
+     question) when a visitor's stated need clearly matches one.
+     `_build_triage_control` never trusts the model's `schema_key`
+     blindly — degrades to a plain `"text"` control unless the key is
+     genuinely one of the schemas the caller already confirmed has a
+     template (locked in as a regression test,
+     `test_intent_triage.py`). `ChatControlRenderer` renders
+     `StructuredIntakeForm` (compact mode) inline in the transcript
+     instead of the usual radio/checkbox/select widget; its own inline
+     "Submitted ✓ <reply>" state is the confirmation — it doesn't push a
+     second message into the transcript via `onSubmit` (a deliberately
+     different flow from the other three control types, which resolve a
+     click into a plain-language message for the *next*
+     `sendChatMessage` call).
+- **Owner-agent's `propose_form_template` tool** (31st tool) — same
+  propose-then-owner-applies posture, reviewed in a new `OwnerAgentPanel`
+  card (section titles editable inline, `Apply` calls
+  `setFormTemplate(schemaId, template)` directly). A real clobbering risk
+  was caught and fixed while wiring this: `propose_intent_schema`'s own,
+  unrelated review card (`applyProposal`) updates an *existing* schema's
+  fields via the same full-replace `IntentSchemaInput` — since that
+  proposal never carries a `form_template`, applying it without
+  first fetching and re-attaching the schema's own currently-saved
+  template would have silently wiped it. Fixed by fetching the current
+  schema list and echoing its `form_template` back unchanged before
+  calling `updateIntentSchema`.
+- **Verified live against the real running stack, first with no chat
+  provider reachable (this sandbox's own environment), then a second
+  round against the owner's own real, locally-running 27B model once
+  they started it**: created a schema with a `select` field (options
+  round-trip correctly, `{label, value}` pairs), saved a form template
+  directly (the AI-propose call itself correctly 502'd while
+  unreachable — same known external-dependency gap as every other
+  provider-dependent feature in this file), the public read endpoint
+  returned the right shape and 404'd on an unknown key, template
+  validation correctly rejected a `field_key` that doesn't exist on the
+  schema (400), a structured submission missing required fields
+  correctly 400'd, a valid one correctly created the right `CrmEntry`
+  with the right `collected_fields` even though the confirmation reply
+  itself failed (unreachable provider), and clearing a template via a
+  `null` body round-tripped correctly. `pytest` (24 tests, +3 new
+  regression tests for the `"form"` control-type degrade path)/`tsc`/
+  `eslint`/a real production build all clean.
+- **Full real, live, model-reachable round-trip verified 2026-09-22,
+  once the owner's own local llama-server came up** — the actual
+  `owner-agent` two-command workflow end to end, not just individual
+  endpoint calls: (1) `POST /run` "Create an intent schema... Contact
+  Request... full name, email, phone, message" → `list_intent_schemas`
+  (checked for a key collision first, as instructed) →
+  `propose_intent_schema` → the real draft applied via `POST
+  /agent/intent-schemas` (exactly what `OwnerAgentPanel`'s Apply button
+  does); (2) a second `POST /run` "Draft an upfront form layout for the
+  Contact Request schema" → `list_intent_schemas` → `propose_form_
+  template(schema_id)` → a genuinely sensible 2-section draft ("Your
+  Details": name/email/phone, "Inquiry": message) → applied via `PUT
+  .../form-template`. `GET /api/intent-schemas/contact_request/form`
+  then served the correct shape, and a real structured submission
+  through `/api/chat` produced a natural, accurate AI confirmation
+  reply ("Thanks, Jane! I've received your contact request with your
+  phone number... asking for a quote on a website redesign...") and the
+  right `CrmEntry` (`collected_fields`, plus `contact_name`/
+  `contact_phone` correctly best-effort-resolved from the `full_name`/
+  phone-type fields).
+  - **A second, larger real test — 25 fields, off a direct user
+    follow-up ("100+ is too many, try 25")** — a "Tourist Visa
+    Application" schema (name, DOB, gender, nationality, passport
+    number/expiry, address/city/country, email/phone, emergency
+    contact ×3, employer/job title/income/start date, marital status,
+    dependents, purpose/arrival/departure dates, accommodation address,
+    prior-visit history): `propose_intent_schema` correctly generated
+    all 25 fields with no drops and sensible types/keys (dates as
+    `date`, email/phone correctly typed, income as `number`) on the
+    first try. `propose_form_template` correctly grouped all 25 into 7
+    sensible sections (Personal Details, Passport Information, Contact
+    & Residence, Emergency Contact, Employment & Income, Family Status,
+    Travel Details) — `_validate_form_template`'s "every field
+    referenced exactly once" check passed cleanly, no retry needed.
+  - **A real, honest limitation found in the same 25-field test**: the
+    command explicitly asked for `select` (with options) on
+    fixed-choice fields (gender, marital status, prior-visit yes/no) —
+    the model did NOT reliably follow that instruction, returning all
+    three as plain `text` with no `options` instead. Not a code bug
+    (the schema is still valid, `text` is a legitimate type, nothing
+    crashed or mis-saved) — a genuine model instruction-following gap
+    on a secondary detail buried inside a long field list. The owner's
+    existing review-before-Apply step (`OwnerAgentPanel`'s schema
+    proposal card) is exactly the safety net this needs — the owner can
+    see and fix a field's type there before applying, same as any other
+    AI-drafted detail in this app. Worth remembering: at this field
+    count, a natural-language command that "just lists the fields" gets
+    the right SHAPE (count, keys, section grouping) reliably, but
+    doesn't uniformly nail every per-field styling nuance without
+    review.
+  - Both schemas/entries created during this pass were cleaned up
+    afterward; the dev DB is back to only its one pre-existing
+    `table_reservation` schema.
+- **Not independently verified this round**: an actual in-browser
+  click-through of the wizard (Next/Back navigation, the CTE editor's
+  new schema picker, the chat-bubble-embedded rendering) — the Chrome
+  browser extension has never connected in any session for this project
+  (see "Known gotchas"/"Suggested next step" below), so this stops at
+  API-level + build verification, same standing gap as most of this
+  app's other UI work.
+- **Deliberately out of scope this round**: no manual section/field-
+  reassignment editor in `IntentSchemaPanel` — regenerate-or-remove
+  only (the AI drafts, the owner accepts or discards; matches this
+  app's existing "no manual editor" posture for `order_status_options`/
+  `shipping_allowed_regions`). No review-before-submit summary step in
+  the wizard (submits directly from the last section). No file-upload
+  field type (the wizard's field types match `IntentField`'s own
+  vocabulary exactly — the existing `/chat/upload` attachment flow is a
+  separate mechanism this doesn't fold in this round).
+
 ## Product catalog + ordering (`backend/apis/products.py`, `backend/cart.py`)
 
 Added 2026-08-19, extended into a full storefront layer the same day —

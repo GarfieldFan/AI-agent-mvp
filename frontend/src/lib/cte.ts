@@ -126,7 +126,8 @@ export type EditableFieldType =
   | "block-button"
   | "block-product-list"
   | "block-product-card"
-  | "block-map";
+  | "block-map"
+  | "block-intent-form";
 
 export type CteSelection = {
   path: string;

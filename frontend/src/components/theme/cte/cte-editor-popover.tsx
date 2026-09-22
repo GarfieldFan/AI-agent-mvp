@@ -28,12 +28,14 @@ import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
 import { requestLayoutAdjust } from "@/lib/layout-adjust";
 import type { CteSelection } from "@/lib/cte";
+import { listIntentSchemas, type IntentSchema } from "@/lib/intent-schemas";
 import { listProducts, type Product } from "@/lib/products";
 import type {
   BlockWidth as BlockWidthValue,
   ButtonBlock as ButtonBlockValue,
   ContainerBlock as ContainerBlockValue,
   ImageBlock as ImageBlockValue,
+  IntentFormBlock as IntentFormBlockValue,
   MapBlock as MapBlockValue,
   ProductCardBlock as ProductCardBlockValue,
   ProductListBlock as ProductListBlockValue,
@@ -343,6 +345,7 @@ const BLOCK_FIELD_TYPES = [
   "block-product-list",
   "block-product-card",
   "block-map",
+  "block-intent-form",
 ] as const;
 
 type CteEditorPopoverProps = {
@@ -569,6 +572,19 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
   const mapValue = fieldType === "block-map" ? (value as MapBlockValue) : null;
   const [mapQuery, setMapQuery] = React.useState(mapValue?.query ?? "");
 
+  // block-intent-form draft (2026-09-22) — which IntentSchema's
+  // StructuredIntakeForm this block renders.
+  const intentFormValue = fieldType === "block-intent-form" ? (value as IntentFormBlockValue) : null;
+  const [ifSchemaKey, setIfSchemaKey] = React.useState<string | null>(intentFormValue?.schema_key ?? null);
+  const [intentSchemas, setIntentSchemas] = React.useState<IntentSchema[] | null>(null);
+  React.useEffect(() => {
+    if (fieldType !== "block-intent-form" || intentSchemas !== null) return;
+    listIntentSchemas()
+      .then(setIntentSchemas)
+      .catch(() => setIntentSchemas([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fieldType]);
+
   // Shared product catalog, fetched once for every fieldType with a
   // product picker (block-product-list, block-product-card,
   // block-container's link picker, block-button's add-to-cart picker) —
@@ -696,6 +712,8 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
       return { ...productCardValue, product_id: pcProductId, width: blockWidth } satisfies ProductCardBlockValue;
     } else if (fieldType === "block-map" && mapValue) {
       return { ...mapValue, query: mapQuery, width: blockWidth } satisfies MapBlockValue;
+    } else if (fieldType === "block-intent-form" && intentFormValue) {
+      return { ...intentFormValue, schema_key: ifSchemaKey, width: blockWidth } satisfies IntentFormBlockValue;
     }
     return undefined;
   }
@@ -780,6 +798,7 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
     plProductIds,
     pcProductId,
     mapQuery,
+    ifSchemaKey,
     blockWidth,
   ]);
 
@@ -1064,6 +1083,29 @@ export function CteEditorPopover({ selection, onSave, onCancel, onDelete }: CteE
                 placeholder="e.g. 1600 Amphitheatre Parkway, Mountain View, CA"
                 autoFocus
               />
+            </div>
+          ) : null}
+
+          {fieldType === "block-intent-form" ? (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">Intent schema</label>
+              <Select
+                value={ifSchemaKey ?? UNSET}
+                onValueChange={(next) => setIfSchemaKey(next === UNSET ? null : next)}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder={intentSchemas === null ? "Loading…" : "Pick a schema"} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={UNSET}>None</SelectItem>
+                  {(intentSchemas ?? []).map((s) => (
+                    <SelectItem key={s.id} value={s.key}>
+                      {s.label}
+                      {!s.form_template ? " (no form layout yet)" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           ) : null}
 

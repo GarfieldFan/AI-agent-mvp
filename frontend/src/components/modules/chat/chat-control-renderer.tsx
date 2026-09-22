@@ -11,6 +11,7 @@ import {
   SelectContent,
   SelectItem,
 } from "@/components/ui/select";
+import { StructuredIntakeForm } from "@/components/modules/structured-intake-form";
 import type { ChatControl } from "@/lib/types";
 
 type ChatControlRendererProps = {
@@ -18,13 +19,28 @@ type ChatControlRendererProps = {
   onSubmit: (value: string | string[]) => void;
 };
 
-/** Renders the structured control the LLM asked for (radio/checkbox/select)
- * below its message, in place of a free-text reply. This is the piece that
- * turns the chatbot's `{ type: "radio" | "checkbox" | "select" | "text" }`
- * JSON responses into an actual form control. */
+/** Renders the structured control the LLM asked for (radio/checkbox/select,
+ * or — 2026-09-22 — a whole StructuredIntakeForm) below its message, in
+ * place of a free-text reply. This is the piece that turns the chatbot's
+ * `{ type: "radio" | "checkbox" | "select" | "text" | "form" }` JSON
+ * responses into an actual form control. */
 export function ChatControlRenderer({ control, onSubmit }: ChatControlRendererProps) {
   const [selected, setSelected] = React.useState<string[]>([]);
   const [singleValue, setSingleValue] = React.useState("");
+
+  // "form" (2026-09-22) is a fundamentally different shape from the other
+  // three — it doesn't resolve to a plain-language message for the next
+  // sendChatMessage call the way a clicked radio/checkbox/select option
+  // does; StructuredIntakeForm makes its own dedicated /api/chat call
+  // (structured_submission) and shows its own inline confirmation once
+  // it succeeds, so `onSubmit` is never called for this control type.
+  if (control.type === "form" && control.schema_key) {
+    return (
+      <div className="pt-2">
+        <StructuredIntakeForm schemaKey={control.schema_key} compact />
+      </div>
+    );
+  }
 
   if (control.type === "text" || !control.options?.length) return null;
 
