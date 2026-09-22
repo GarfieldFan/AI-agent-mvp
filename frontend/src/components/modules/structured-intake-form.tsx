@@ -20,6 +20,13 @@ import { cn } from "@/lib/utils";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Matches backend/apis/chat.py's MAX_STRUCTURED_FIELD_VALUE_LENGTH — a
+// client-side maxLength is purely a UX nicety (immediate feedback while
+// typing), never the actual security boundary; the server re-enforces
+// this regardless of what the client sends (see that constant's own
+// comment for the real DoS finding that motivated it).
+const MAX_FIELD_VALUE_LENGTH = 5000;
+
 type StructuredIntakeFormProps = {
   /** IntentSchema.key whose form_template to render. */
   schemaKey: string;
@@ -256,7 +263,12 @@ export function StructuredIntakeForm({ schemaKey, compact, onSubmitted }: Struct
                   {field.required ? <span className="text-destructive"> *</span> : null}
                 </Label>
                 {field.field_type === "note" ? (
-                  <Textarea rows={3} value={value} onChange={(e) => setValue(field.field_key, e.target.value)} />
+                  <Textarea
+                    rows={3}
+                    maxLength={MAX_FIELD_VALUE_LENGTH}
+                    value={value}
+                    onChange={(e) => setValue(field.field_key, e.target.value)}
+                  />
                 ) : field.field_type === "select" ? (
                   <Select value={value || undefined} onValueChange={(v) => v && setValue(field.field_key, v)}>
                     <SelectTrigger className="w-full">
@@ -281,6 +293,7 @@ export function StructuredIntakeForm({ schemaKey, compact, onSubmitted }: Struct
                             ? "date"
                             : "text"
                     }
+                    maxLength={MAX_FIELD_VALUE_LENGTH}
                     value={value}
                     onChange={(e) => setValue(field.field_key, e.target.value)}
                   />

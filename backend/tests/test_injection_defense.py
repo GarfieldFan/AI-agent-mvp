@@ -17,7 +17,10 @@ RBAC architecture note), so the worst realistic outcome of an injected
 classification result was always a bogus CrmEntry/Order — these tests
 lock in that even that narrower blast radius holds."""
 
-from apis.chat import _apply_lead_capture
+import pytest
+from fastapi import HTTPException
+
+from apis.chat import MAX_STRUCTURED_FIELD_VALUE_LENGTH, StructuredSubmissionRequest, _apply_lead_capture, _validate_structured_submission
 from models import CrmEntry, IntentField, IntentSchema
 
 
@@ -124,3 +127,108 @@ async def test_apply_lead_capture_requires_a_real_looking_email_not_an_injected_
         .first()
         is None
     ), "a non-email contact_email with no other email source must not create a CrmEntry at all"
+
+
+# --- StructuredSubmissionRequest / _validate_structured_submission -------
+# Added 2026-09-22, after a real red-team pass on the structured-form
+# submission path (POST /api/chat's structured_submission) found two real
+# gaps, both reproduced live before being fixed: (1) no length cap on a
+# submitted field value — a single ~500KB value was accepted with zero
+# rejection and, because it gets folded into the main reply's LLM context
+# (_structured_submission_context_block), turned a normal request into an
+# 86-second one; a public, no-auth endpoint this cheap to abuse this
+# expensively is a real DoS/cost vector, not a hypothetical. (2) the
+# "email"-typed field's value was trusted via _LEAD_EMAIL_RE, a loose
+# `.search()` pattern built for finding an email SOMEWHERE inside
+# free-flowing chat text — for a field whose entire value is supposed to
+# BE an email, that let a crafted value like "not-an-email\r\nBcc:
+# evil@evil.com" pass (it contains an email-shaped substring) and get
+# stored/used as contact_email VERBATIM, control characters included.
+
+
+def _make_form_schema(db) -> IntentSchema:
+    schema = IntentSchema(key="test_structured_submission", label="Test form", description="for tests")
+    db.add(schema)
+    db.flush()
+    db.add(
+        IntentField(
+            intent_schema_id=schema.id, field_key="name", label="Name", field_type="text",
+            required=True, sort_order=0,
+        )
+    )
+    db.add(
+        IntentField(
+            intent_schema_id=schema.id, field_key="email", label="Email", field_type="email",
+            required=True, sort_order=1,
+        )
+    )
+    db.add(
+        IntentField(
+            intent_schema_id=schema.id, field_key="message", label="Message", field_type="note",
+            required=False, sort_order=2,
+        )
+    )
+    db.flush()
+    return schema
+
+
+def test_validate_structured_submission_rejects_an_oversized_field_value(db_session):
+    schema = _make_form_schema(db_session)
+    submitted = StructuredSubmissionRequest(
+        schema_key=schema.key,
+        fields={"name": "A", "email": "a@example.com", "message": "x" * (MAX_STRUCTURED_FIELD_VALUE_LENGTH + 1)},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_structured_submission(schema, submitted)
+    assert exc_info.value.status_code == 400
+
+
+def test_validate_structured_submission_accepts_a_value_right_at_the_cap(db_session):
+    schema = _make_form_schema(db_session)
+    submitted = StructuredSubmissionRequest(
+        schema_key=schema.key,
+        fields={"name": "A", "email": "a@example.com", "message": "x" * MAX_STRUCTURED_FIELD_VALUE_LENGTH},
+    )
+    clean, contact_email, _, _ = _validate_structured_submission(schema, submitted)
+    assert len(clean["message"]) == MAX_STRUCTURED_FIELD_VALUE_LENGTH
+    assert contact_email == "a@example.com"
+
+
+def test_validate_structured_submission_drops_field_keys_not_defined_on_the_schema(db_session):
+    schema = _make_form_schema(db_session)
+    submitted = StructuredSubmissionRequest(
+        schema_key=schema.key,
+        fields={
+            "name": "Bob",
+            "email": "bob@example.com",
+            "message": "hi",
+            "status": "closed",  # not a real field on this schema — must be dropped
+            "is_admin": "true",  # not a real field on this schema — must be dropped
+        },
+    )
+    clean, _, _, _ = _validate_structured_submission(schema, submitted)
+    assert clean == {"name": "Bob", "email": "bob@example.com", "message": "hi"}
+
+
+def test_validate_structured_submission_never_trusts_an_email_field_containing_injected_content(db_session):
+    """A value that merely CONTAINS an email-shaped substring (e.g. a
+    crafted header-injection attempt) must not be resolved as
+    contact_email — only a value that IS, in its entirety, a plausible
+    email address."""
+    schema = _make_form_schema(db_session)
+    submitted = StructuredSubmissionRequest(
+        schema_key=schema.key,
+        fields={"name": "Eve", "email": "not-an-email-at-all\r\nBcc:evil@evil.com", "message": "hi"},
+    )
+    _, contact_email, _, _ = _validate_structured_submission(schema, submitted)
+    assert contact_email is None
+
+
+def test_validate_structured_submission_resolves_a_genuinely_well_formed_email(db_session):
+    schema = _make_form_schema(db_session)
+    submitted = StructuredSubmissionRequest(
+        schema_key=schema.key,
+        fields={"name": "Carol", "email": "carol@example.com", "message": "hi"},
+    )
+    _, contact_email, _, _ = _validate_structured_submission(schema, submitted)
+    assert contact_email == "carol@example.com"

@@ -376,6 +376,20 @@ def _chunk_source_note(chunk: RetrievedChunk) -> str:
 # no email anywhere yet) needs a looser gate to work at all.
 _LEAD_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
+# A stricter, WHOLE-VALUE match (2026-09-22) — _LEAD_EMAIL_RE above is a
+# deliberately loose `.search()` pattern, built for finding an email
+# address that might appear anywhere inside free-flowing natural-language
+# chat text (e.g. "you can reach me at bob@x.com or whatever"). That's the
+# wrong tool for _validate_structured_submission's job below, where a
+# field's ENTIRE value is supposed to BE an email address: `.search()`
+# only confirms an email-shaped substring exists somewhere, so a crafted
+# value like "not-an-email-at-all\r\nBcc:evil@evil.com" would pass it and
+# then get stored/used as contact_email VERBATIM — control characters,
+# fake header line and all (a real gap found and fixed via a red-team
+# pass on the structured-submission path, not hypothetical). This one
+# requires the ENTIRE trimmed value to be nothing but a plausible email.
+_STRICT_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
 _LEAD_CATEGORIES = {"appointment", "quote", "claim", "inquiry"}
 
 # Recent lead history shown to the model when a caller is a signed-in
@@ -476,6 +490,21 @@ class StructuredSubmissionRequest(BaseModel):
     fields: dict[str, str]
 
 
+# Caps how long any single submitted field value can be (2026-09-22,
+# found via a real red-team pass on this feature, not a hypothetical
+# concern) — before this, a value of any length was accepted, and every
+# structured submission's field values get folded into the main reply's
+# LLM context via _structured_submission_context_block below. A
+# genuinely reproduced attack: a single 500KB field value was accepted
+# with zero rejection and turned a normal sub-second request into an
+# 86-second one (the whole payload gets sent to the chat model as
+# context) — cheap for an attacker (no login needed, this is a public
+# endpoint) to repeat and degrade this app's one uvicorn worker for
+# every other visitor. 5000 characters is generous for even a long
+# "note"-type field while bounding the worst case.
+MAX_STRUCTURED_FIELD_VALUE_LENGTH = 5000
+
+
 def _validate_structured_submission(
     schema: IntentSchema, submitted: StructuredSubmissionRequest
 ) -> tuple[dict[str, str], str | None, str | None, str | None]:
@@ -484,24 +513,46 @@ def _validate_structured_submission(
     _apply_lead_capture's matched_schema branch already applies to a
     model's output, here against a client-supplied dict instead, an
     equally untrusted source), then checks every required field actually
-    has a value — never trusts the frontend's own client-side validation
-    alone. Also best-effort resolves contact_email/contact_phone from
-    whichever field carries that field_type, and contact_name from a
+    has a value and no value exceeds MAX_STRUCTURED_FIELD_VALUE_LENGTH —
+    never trusts the frontend's own client-side validation alone. Also
+    best-effort resolves contact_email/contact_phone from whichever field
+    carries that field_type — an "email"-typed field's value is only
+    trusted as contact_email if it actually matches _LEAD_EMAIL_RE (the
+    field_type label alone was previously trusted blindly, letting a
+    non-email string reach CrmEntry.contact_email — a real gap found the
+    same red-team pass, not a hypothetical) — and contact_name from a
     field literally keyed "name" or "full_name" if present. Raises
-    HTTPException(400) on a missing required field. Doesn't resolve the
-    final contact_email fallback (a signed-in visitor's account email) —
-    that's chat()'s job, since only it has `current.email` in scope."""
+    HTTPException(400) on a missing required field or an oversized value.
+    Doesn't resolve the final contact_email fallback (a signed-in
+    visitor's account email) — that's chat()'s job, since only it has
+    `current.email` in scope."""
     valid_fields = {f.field_key: f for f in schema.fields}
     clean: dict[str, str] = {
         k: str(v).strip()
         for k, v in submitted.fields.items()
         if k in valid_fields and v is not None and str(v).strip()
     }
+
+    oversized = [f.label for f in schema.fields if len(clean.get(f.field_key, "")) > MAX_STRUCTURED_FIELD_VALUE_LENGTH]
+    if oversized:
+        raise HTTPException(
+            status_code=400,
+            detail=f"These fields are too long (max {MAX_STRUCTURED_FIELD_VALUE_LENGTH} characters): "
+            f"{', '.join(oversized)}.",
+        )
+
     missing = [f.label for f in schema.fields if f.required and not clean.get(f.field_key)]
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}.")
 
-    email_field = next((f for f in schema.fields if f.field_type == "email" and clean.get(f.field_key)), None)
+    email_field = next(
+        (
+            f
+            for f in schema.fields
+            if f.field_type == "email" and _STRICT_EMAIL_RE.fullmatch(clean.get(f.field_key, ""))
+        ),
+        None,
+    )
     phone_field = next((f for f in schema.fields if f.field_type == "phone" and clean.get(f.field_key)), None)
     name_key = next((k for k in ("name", "full_name") if clean.get(k)), None)
 
