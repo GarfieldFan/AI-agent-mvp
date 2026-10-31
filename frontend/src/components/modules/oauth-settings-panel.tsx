@@ -3,10 +3,10 @@
 import * as React from "react";
 import { KeyRound } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SecretKeyField } from "@/components/common/secret-key-field";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
@@ -128,18 +128,7 @@ export function OAuthSettingsPanel() {
           />
         </div>
         <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">Client secret</Label>
-          <Input
-            type="password"
-            value={googleClientSecretInput}
-            onChange={(e) => setGoogleClientSecretInput(e.target.value)}
-            placeholder={settings.google_client_secret_set ? "•••••••• (leave blank to keep saved key)" : "GOCSPX-…"}
-          />
-          {settings.google_client_secret_set ? (
-            <Badge variant="secondary" className="text-xs">
-              Saved
-            </Badge>
-          ) : null}
+          <SecretKeyField label="Client secret" value={googleClientSecretInput} onChange={setGoogleClientSecretInput} saved={settings.google_client_secret_set} placeholder={"GOCSPX-…"} />
         </div>
       </div>
 
@@ -161,18 +150,7 @@ export function OAuthSettingsPanel() {
           <Input value={facebookClientId} onChange={(e) => setFacebookClientId(e.target.value)} placeholder="123456789012345" />
         </div>
         <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">App secret</Label>
-          <Input
-            type="password"
-            value={facebookClientSecretInput}
-            onChange={(e) => setFacebookClientSecretInput(e.target.value)}
-            placeholder={settings.facebook_client_secret_set ? "•••••••• (leave blank to keep saved key)" : "…"}
-          />
-          {settings.facebook_client_secret_set ? (
-            <Badge variant="secondary" className="text-xs">
-              Saved
-            </Badge>
-          ) : null}
+          <SecretKeyField label="App secret" value={facebookClientSecretInput} onChange={setFacebookClientSecretInput} saved={settings.facebook_client_secret_set} placeholder={"…"} />
         </div>
       </div>
 
@@ -200,18 +178,7 @@ export function OAuthSettingsPanel() {
           <Input value={xClientId} onChange={(e) => setXClientId(e.target.value)} placeholder="…" />
         </div>
         <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">Client secret</Label>
-          <Input
-            type="password"
-            value={xClientSecretInput}
-            onChange={(e) => setXClientSecretInput(e.target.value)}
-            placeholder={settings.x_client_secret_set ? "•••••••• (leave blank to keep saved key)" : "…"}
-          />
-          {settings.x_client_secret_set ? (
-            <Badge variant="secondary" className="text-xs">
-              Saved
-            </Badge>
-          ) : null}
+          <SecretKeyField label="Client secret" value={xClientSecretInput} onChange={setXClientSecretInput} saved={settings.x_client_secret_set} placeholder={"…"} />
         </div>
       </div>
 

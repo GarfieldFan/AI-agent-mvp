@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from apis.deps import Role, require_role
 from db import get_db
-from models import AppSettings
+from models import AppSettings, get_or_create_app_settings
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -52,10 +52,7 @@ class UpdateTurnstileSettingsRequest(BaseModel):
 
 @admin_router.put("/turnstile-settings", response_model=TurnstileSettings)
 def update_turnstile_settings(req: UpdateTurnstileSettingsRequest, db: Session = Depends(get_db)) -> TurnstileSettings:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
 
     row.turnstile_enabled = req.turnstile_enabled
     if req.turnstile_site_key is not None:

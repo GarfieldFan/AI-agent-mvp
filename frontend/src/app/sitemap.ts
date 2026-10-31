@@ -1,6 +1,6 @@
 import type { MetadataRoute } from "next";
 
-import { listPublicPages } from "@/lib/pages";
+import { listPublicPages, pageHrefForSlug } from "@/lib/pages";
 import { listPublicProducts } from "@/lib/products";
 
 /** Enumerates every publicly-reachable content URL on the site
@@ -25,24 +25,13 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   try {
     const pages = await listPublicPages();
     for (const page of pages) {
-      // "home"/"about" map to the two fixed routes — see
-      // app/page.tsx/app/about/page.tsx's own slug convention. Every
-      // other slug renders at /p/[slug].
+      // "home" is already the root entry above.
       if (page.slug === "home") continue;
-      if (page.slug === "about") {
-        entries.push({
-          url: `${siteUrl}/about`,
-          lastModified: page.updated_at,
-          changeFrequency: "monthly",
-          priority: 0.6,
-        });
-        continue;
-      }
       entries.push({
-        url: `${siteUrl}/p/${encodeURIComponent(page.slug)}`,
+        url: `${siteUrl}${pageHrefForSlug(page.slug)}`,
         lastModified: page.updated_at,
         changeFrequency: "monthly",
-        priority: 0.5,
+        priority: page.slug === "about" ? 0.6 : 0.5,
       });
     }
   } catch {

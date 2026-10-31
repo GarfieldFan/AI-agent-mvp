@@ -12,7 +12,7 @@ from datetime import datetime
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from db import Base
 
@@ -519,6 +519,17 @@ class AppSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
+
+
+def get_or_create_app_settings(db: Session) -> AppSettings:
+    """The AppSettings singleton for a write — creating the (id=1) row on
+    first save if it doesn't exist yet. Read-only callers should keep using
+    `db.get(AppSettings, 1)` and treat None as "all defaults"."""
+    row = db.get(AppSettings, 1)
+    if row is None:
+        row = AppSettings(id=1)
+        db.add(row)
+    return row
 
 
 class OwnerAgentRun(Base):

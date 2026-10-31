@@ -67,7 +67,7 @@ ai-employee/
 │   └── README.md                 all three install paths — which script for which situation, plus the one-time manual AWS-console (or any VPS) steps
 ├── backend/                  FastAPI (Python) — see backend/main.py
 │   ├── db.py                  SQLAlchemy engine/session (DATABASE_URL), Base, get_db dependency
-│   ├── models.py               User / Page / PageVersion / Document / DocumentChunk / AppSettings / ChatSession / ChatMessage / CrmEntry ORM models
+│   ├── models.py               (also `get_or_create_app_settings(db)` — the one write-path accessor for the AppSettings singleton row) User / Page / PageVersion / Document / DocumentChunk / AppSettings / ChatSession / ChatMessage / CrmEntry ORM models
 │   ├── auth.py                 password hashing (bcrypt) + JWT sign/verify (PyJWT)
 │   ├── seed.py                 creates the 3 demo accounts — run manually after migrating, LOCAL DEMO ONLY, never on a real deployment (see create_owner.py)
 │   ├── create_owner.py          production-safe real-owner-account bootstrap — deploy/setup-server.sh's own first-run step, not seed.py

@@ -34,7 +34,7 @@ from apis.chat import DEFAULT_INTENT_PROMPT, SYSTEM_PROMPT
 from apis.deps import Role, require_role
 from apis.model_settings import resolve_chat_provider
 from db import get_db
-from models import AppSettings, IntentSchema
+from models import AppSettings, IntentSchema, get_or_create_app_settings
 from providers.base import ProviderNotConfigured
 
 router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
@@ -76,10 +76,7 @@ class UpdateChatPromptRequest(BaseModel):
 
 @router.put("/chat-settings", response_model=ChatPromptSettings)
 def update_chat_settings(req: UpdateChatPromptRequest, db: Session = Depends(get_db)) -> ChatPromptSettings:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
 
     row.chat_system_prompt = (req.chat_system_prompt or "").strip() or None
     row.chat_intent_prompt = (req.chat_intent_prompt or "").strip() or None

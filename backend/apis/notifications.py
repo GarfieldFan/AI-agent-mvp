@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from apis.deps import Role, require_role
 from db import get_db
-from models import AppSettings
+from models import AppSettings, get_or_create_app_settings
 from notifications import (
     EmailProvider,
     MailgunEmailProvider,
@@ -163,10 +163,7 @@ def update_notification_settings(
     if req.sms_provider not in ("test", "twilio"):
         raise HTTPException(status_code=400, detail=f"{req.sms_provider!r} isn't a supported SMS provider.")
 
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
 
     row.email_provider = req.email_provider
     row.mailgun_domain = req.mailgun_domain

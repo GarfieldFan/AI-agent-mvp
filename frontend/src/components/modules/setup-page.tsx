@@ -8,7 +8,7 @@ import { Container } from "@/components/layout/container";
 import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/common/empty-state";
 import { SetupWizard } from "@/components/modules/setup-wizard";
-import { useAuth } from "@/lib/auth";
+import { isStaffRole, useAuth } from "@/lib/auth";
 
 /** `/setup` — the first-run onboarding wizard (2026-09-09). Gated the
  * same as the rest of the dashboard's agent console (admin OR owner) —
@@ -19,7 +19,7 @@ import { useAuth } from "@/lib/auth";
  * wizard's embedded `ModelSettingsPanel` makes. */
 export function SetupPage() {
   const { role } = useAuth();
-  const canView = role === "admin" || role === "owner";
+  const canView = isStaffRole(role);
 
   return (
     <Container className="space-y-8 py-12">

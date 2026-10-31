@@ -3,11 +3,10 @@
 import * as React from "react";
 import { MapPin } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SecretKeyField } from "@/components/common/secret-key-field";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
@@ -113,18 +112,7 @@ export function MapSettingsPanel() {
 
       {provider === "google" ? (
         <div className="space-y-1 rounded-lg border border-dashed p-3">
-          <Label className="text-xs text-muted-foreground">Google Maps Embed API key</Label>
-          <Input
-            type="password"
-            value={apiKeyInput}
-            onChange={(e) => setApiKeyInput(e.target.value)}
-            placeholder={settings.google_maps_api_key_set ? "•••••••• (leave blank to keep saved key)" : "AIza…"}
-          />
-          {settings.google_maps_api_key_set ? (
-            <Badge variant="secondary" className="text-xs">
-              Saved
-            </Badge>
-          ) : null}
+          <SecretKeyField label="Google Maps Embed API key" value={apiKeyInput} onChange={setApiKeyInput} saved={settings.google_maps_api_key_set} placeholder={"AIza…"} />
         </div>
       ) : null}
 

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from apis.deps import Role, require_role
 from db import get_db
 from maps import GoogleMapsProvider, MapProvider, TestMapProvider
-from models import AppSettings
+from models import AppSettings, get_or_create_app_settings
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -54,10 +54,7 @@ def update_map_settings(req: UpdateMapSettingsRequest, db: Session = Depends(get
     if req.map_provider not in ("test", "google"):
         raise HTTPException(status_code=400, detail=f"{req.map_provider!r} isn't a supported map provider.")
 
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
 
     row.map_provider = req.map_provider
     if req.google_maps_api_key is not None:

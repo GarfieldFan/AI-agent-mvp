@@ -50,7 +50,7 @@ import { SetupStatusBanner } from "@/components/modules/setup-status-banner";
 import { UserManagementPanel } from "@/components/modules/user-management-panel";
 import { TurnstileSettingsPanel } from "@/components/modules/turnstile-settings-panel";
 import { ApiError, apiFetch } from "@/lib/api";
-import { clearAuth, useAuth } from "@/lib/auth";
+import { clearAuth, isStaffRole, useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
 type ConsoleItem = { id: string; label: string; render: () => ReactNode };
@@ -122,7 +122,7 @@ export function AgentConsoleSection() {
     };
   }, [role]);
 
-  const canView = !verifying && (role === "admin" || role === "owner");
+  const canView = !verifying && isStaffRole(role);
   // OwnerAgentPanel is gated stricter than the rest of this section — it
   // runs a real LLM tool-calling loop (owner-agent/, a separate isolated
   // service), not a single deterministic pipeline call, so only the owner

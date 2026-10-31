@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from apis.deps import Role, require_role
 from db import get_db
-from models import AppSettings, Page
+from models import AppSettings, Page, get_or_create_app_settings
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -89,10 +89,7 @@ def get_nav_menu(db: Session = Depends(get_db)) -> NavMenu:
 
 @admin_router.put("/nav-menu", response_model=NavMenu)
 def update_nav_menu(req: UpdateNavMenuRequest, db: Session = Depends(get_db)) -> NavMenu:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
     row.nav_menu = None if req.items is None else [item.model_dump() for item in req.items]
     db.commit()
     db.refresh(row)

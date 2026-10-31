@@ -5,14 +5,14 @@ import { Info } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Container } from "@/components/layout/container";
-import { useAuth } from "@/lib/auth";
+import { isStaffRole, useAuth } from "@/lib/auth";
 
 /** Shown above the system default landing page, to admin/owner only —
  * the equivalent of WordPress telling a logged-in admin "this is the
  * default theme." Visitors never see it. */
 export function DefaultHomeAdminNotice() {
   const { token, role } = useAuth();
-  if (!token || (role !== "admin" && role !== "owner")) return null;
+  if (!token || !isStaffRole(role)) return null;
 
   return (
     <Container className="pt-6">

@@ -34,7 +34,7 @@ from apis.deps import Role, require_role
 from apis.model_settings import resolve_chat_provider
 from db import get_db
 from llm_json import parse_lenient_json
-from models import AppSettings
+from models import AppSettings, get_or_create_app_settings
 from providers.base import ProviderNotConfigured
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
@@ -110,10 +110,7 @@ class UpdateBusinessProfileRequest(BaseModel):
 
 @admin_router.put("/business-profile", response_model=BusinessProfile)
 def update_business_profile(req: UpdateBusinessProfileRequest, db: Session = Depends(get_db)) -> BusinessProfile:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
 
     row.business_name = req.business_name
     row.business_description = req.business_description

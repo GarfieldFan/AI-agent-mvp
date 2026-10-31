@@ -5,18 +5,9 @@ import Link, { useLinkStatus } from "next/link";
 import { usePathname } from "next/navigation";
 import { LayoutDashboard, Loader2, MousePointerClick, Pencil, type LucideIcon } from "lucide-react";
 
-import { useAuth } from "@/lib/auth";
+import { isStaffRole, useAuth } from "@/lib/auth";
+import { slugForPagePath } from "@/lib/pages";
 import { cn } from "@/lib/utils";
-
-/** The saved-page slug a public route renders, or null for routes that
- * aren't CTE-editable pages — "/" is "home", "/about" is "about",
- * "/p/[slug]" is that slug (same convention app/page.tsx etc. follow). */
-function editableSlugFor(pathname: string): string | null {
-  if (pathname === "/") return "home";
-  if (pathname === "/about") return "about";
-  const match = pathname.match(/^\/p\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
 
 /** Swaps the link's icon for a spinner while its navigation is pending —
  * /dashboard in particular is heavy and can take a few seconds to
@@ -40,7 +31,7 @@ const LINK_CLASS =
 export function AdminBar() {
   const { token, role } = useAuth();
   const pathname = usePathname();
-  const visible = Boolean(token) && (role === "admin" || role === "owner");
+  const visible = Boolean(token) && isStaffRole(role);
 
   React.useEffect(() => {
     if (!visible) return;
@@ -52,7 +43,7 @@ export function AdminBar() {
 
   if (!visible) return null;
 
-  const editSlug = editableSlugFor(pathname);
+  const editSlug = slugForPagePath(pathname);
 
   return (
     <div className="h-9 border-b border-zinc-800 bg-zinc-900 text-xs">

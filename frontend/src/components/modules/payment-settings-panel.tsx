@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SecretKeyField } from "@/components/common/secret-key-field";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
@@ -168,18 +169,7 @@ export function PaymentSettingsPanel() {
       {provider === "stripe" ? (
         <div className="space-y-3 rounded-lg border border-dashed p-3">
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Secret key</Label>
-            <Input
-              type="password"
-              value={secretKeyInput}
-              onChange={(e) => setSecretKeyInput(e.target.value)}
-              placeholder={settings.stripe_secret_key_set ? "•••••••• (leave blank to keep saved key)" : "sk_test_…"}
-            />
-            {settings.stripe_secret_key_set ? (
-              <Badge variant="secondary" className="text-xs">
-                Saved
-              </Badge>
-            ) : null}
+            <SecretKeyField label="Secret key" value={secretKeyInput} onChange={setSecretKeyInput} saved={settings.stripe_secret_key_set} placeholder={"sk_test_…"} />
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-muted-foreground">Publishable key</Label>
@@ -190,20 +180,7 @@ export function PaymentSettingsPanel() {
             </p>
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Webhook signing secret</Label>
-            <Input
-              type="password"
-              value={webhookSecretInput}
-              onChange={(e) => setWebhookSecretInput(e.target.value)}
-              placeholder={
-                settings.stripe_webhook_secret_set ? "•••••••• (leave blank to keep saved key)" : "whsec_…"
-              }
-            />
-            {settings.stripe_webhook_secret_set ? (
-              <Badge variant="secondary" className="text-xs">
-                Saved
-              </Badge>
-            ) : null}
+            <SecretKeyField label="Webhook signing secret" value={webhookSecretInput} onChange={setWebhookSecretInput} saved={settings.stripe_webhook_secret_set} placeholder={"whsec_…"} />
             <p className="text-xs text-muted-foreground">
               Point a Stripe webhook (event: <code>checkout.session.completed</code>) at{" "}
               <code className="break-all">{webhookUrl}</code> and paste its signing secret here — without
@@ -291,18 +268,7 @@ export function PaymentSettingsPanel() {
             />
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">API key</Label>
-            <Input
-              type="password"
-              value={adyenApiKeyInput}
-              onChange={(e) => setAdyenApiKeyInput(e.target.value)}
-              placeholder={settings.adyen_api_key_set ? "•••••••• (leave blank to keep saved key)" : "AQE…"}
-            />
-            {settings.adyen_api_key_set ? (
-              <Badge variant="secondary" className="text-xs">
-                Saved
-              </Badge>
-            ) : null}
+            <SecretKeyField label="API key" value={adyenApiKeyInput} onChange={setAdyenApiKeyInput} saved={settings.adyen_api_key_set} placeholder={"AQE…"} />
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-muted-foreground">Client key</Label>
@@ -313,18 +279,7 @@ export function PaymentSettingsPanel() {
             </p>
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">HMAC key</Label>
-            <Input
-              type="password"
-              value={adyenHmacKeyInput}
-              onChange={(e) => setAdyenHmacKeyInput(e.target.value)}
-              placeholder={settings.adyen_hmac_key_set ? "•••••••• (leave blank to keep saved key)" : "64 hex characters…"}
-            />
-            {settings.adyen_hmac_key_set ? (
-              <Badge variant="secondary" className="text-xs">
-                Saved
-              </Badge>
-            ) : null}
+            <SecretKeyField label="HMAC key" value={adyenHmacKeyInput} onChange={setAdyenHmacKeyInput} saved={settings.adyen_hmac_key_set} placeholder={"64 hex characters…"} />
             <p className="text-xs text-muted-foreground">
               Point an Adyen standard webhook at{" "}
               <code className="break-all">{adyenWebhookUrl}</code> and paste its HMAC key here — without

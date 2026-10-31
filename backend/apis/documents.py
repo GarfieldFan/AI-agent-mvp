@@ -28,7 +28,7 @@ from apis.deps import CurrentUser, Role, get_current_user, require_role
 from apis.model_settings import resolve_chat_provider, resolve_embedding_provider
 from db import SessionLocal, get_db
 from ingest import chunk_text, parse_document
-from models import AppSettings, Document, DocumentChunk
+from models import AppSettings, Document, DocumentChunk, get_or_create_app_settings
 from providers.base import ProviderNotConfigured
 
 router = APIRouter(dependencies=[Depends(require_role(Role.admin, Role.owner))])
@@ -119,10 +119,7 @@ def _record_embedding_dimensions(db: Session, vectors: list[list[float]]) -> Non
     gives the owner-facing picker something real to display."""
     if not vectors:
         return
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
     row.embedding_dimensions = len(vectors[0])
 
 

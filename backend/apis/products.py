@@ -55,7 +55,7 @@ from cart import apply_order_delta, count_search_products, decrement_stock_and_n
 from db import get_db
 from ingest import parse_document
 from llm_json import parse_lenient_json_array
-from models import AppSettings, ChatSession, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation, StockItem
+from models import AppSettings, ChatSession, Order, OrderItem, Product, ProductFieldDefinition, ProductRelation, StockItem, get_or_create_app_settings
 from payments import PaymentProviderNotConfigured
 from providers.base import ProviderNotConfigured
 
@@ -762,10 +762,7 @@ def get_order_status_options(db: Session = Depends(get_db)) -> OrderStatusOption
 
 @admin_router.put("/agent/order-status-options", response_model=OrderStatusOptionsResponse)
 def set_order_status_options(req: OrderStatusOptionsPayload, db: Session = Depends(get_db)) -> OrderStatusOptionsResponse:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
     row.order_status_options = req.status_options or DEFAULT_ORDER_STATUS_OPTIONS
     db.commit()
     return OrderStatusOptionsResponse(status_options=row.order_status_options)
@@ -793,10 +790,7 @@ def get_shipping_settings(db: Session = Depends(get_db)) -> ShippingRegionsRespo
 
 @admin_router.put("/agent/shipping-settings", response_model=ShippingRegionsResponse)
 def set_shipping_settings(req: ShippingRegionsPayload, db: Session = Depends(get_db)) -> ShippingRegionsResponse:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
     # An empty list means "no restriction" — same as never having
     # configured it, not "block everything."
     row.shipping_allowed_regions = req.allowed_regions or None

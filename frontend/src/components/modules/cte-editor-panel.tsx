@@ -18,7 +18,7 @@ import { InsertGap } from "@/components/theme/cte/insert-gap";
 import { SectionInsertMenu } from "@/components/theme/cte/section-insert-menu";
 import { SectionRenderer } from "@/components/theme/section-renderer";
 import { ApiError } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import { isStaffRole, useAuth } from "@/lib/auth";
 import {
   appendByPath,
   getByPath,
@@ -50,7 +50,7 @@ const PAGE_BROWSE_SIZE = 8;
  * identical to production, not a separate editor-only preview. */
 export function CteEditorPanel({ initialSlug = "home" }: { initialSlug?: string }) {
   const { role } = useAuth();
-  const canEdit = role === "admin" || role === "owner";
+  const canEdit = isStaffRole(role);
 
   // `initialSlug` comes from `/editor?slug=` (AdminBar's "Edit this page").
   const [slugInput, setSlugInput] = React.useState(initialSlug);

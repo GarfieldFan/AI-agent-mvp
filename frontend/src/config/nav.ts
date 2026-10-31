@@ -15,14 +15,6 @@ export type NavItem = {
  * floating ChatBubbleWidget mounted in the root layout. */
 export const basePublicNav: NavItem[] = [{ title: "Home", href: "/" }];
 
-/** Backend links — never part of the public menu. Rendered only in the
- * role-gated AdminBar (WordPress-admin-bar style), for admin/owner.
- * Display-only gating: both routes re-verify the role server-side. */
-export const adminNav: NavItem[] = [
-  { title: "Page Editor", href: "/editor" },
-  { title: "Dashboard", href: "/dashboard" },
-];
-
 /** Mirrored by hand in backend/apis/nav_menu.py's get_nav_menu_overview
  * (owner-agent's get_site_menu) — change both together.
  *

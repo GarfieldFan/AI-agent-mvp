@@ -3,11 +3,11 @@
 import * as React from "react";
 import { Mail, MessageSquare, TriangleAlert } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SecretKeyField } from "@/components/common/secret-key-field";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
@@ -203,18 +203,7 @@ export function NotificationSettingsPanel() {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground">API key</Label>
-              <Input
-                type="password"
-                value={mailgunApiKeyInput}
-                onChange={(e) => setMailgunApiKeyInput(e.target.value)}
-                placeholder={settings.mailgun_api_key_set ? "•••••••• (leave blank to keep saved key)" : "key-…"}
-              />
-              {settings.mailgun_api_key_set ? (
-                <Badge variant="secondary" className="text-xs">
-                  Saved
-                </Badge>
-              ) : null}
+              <SecretKeyField label="API key" value={mailgunApiKeyInput} onChange={setMailgunApiKeyInput} saved={settings.mailgun_api_key_set} placeholder={"key-…"} />
             </div>
           </div>
         ) : null}
@@ -281,18 +270,7 @@ export function NotificationSettingsPanel() {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground">Auth token</Label>
-              <Input
-                type="password"
-                value={twilioAuthTokenInput}
-                onChange={(e) => setTwilioAuthTokenInput(e.target.value)}
-                placeholder={settings.twilio_auth_token_set ? "•••••••• (leave blank to keep saved key)" : "…"}
-              />
-              {settings.twilio_auth_token_set ? (
-                <Badge variant="secondary" className="text-xs">
-                  Saved
-                </Badge>
-              ) : null}
+              <SecretKeyField label="Auth token" value={twilioAuthTokenInput} onChange={setTwilioAuthTokenInput} saved={settings.twilio_auth_token_set} placeholder={"…"} />
             </div>
           </div>
         ) : null}

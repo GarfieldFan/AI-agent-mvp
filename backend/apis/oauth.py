@@ -72,7 +72,7 @@ from sqlalchemy.orm import Session
 from apis.deps import Role, require_role
 from auth import create_access_token
 from db import get_db
-from models import AppSettings, User
+from models import AppSettings, User, get_or_create_app_settings
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter(prefix="/auth")
@@ -158,10 +158,7 @@ class UpdateOAuthSettingsRequest(BaseModel):
 
 @admin_router.put("/oauth-settings", response_model=OAuthSettings)
 def update_oauth_settings(req: UpdateOAuthSettingsRequest, db: Session = Depends(get_db)) -> OAuthSettings:
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
 
     row.google_oauth_client_id = req.google_client_id or None
     if req.google_client_secret is not None:

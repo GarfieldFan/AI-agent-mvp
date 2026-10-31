@@ -1,5 +1,5 @@
 import { getPublicBusinessProfile } from "@/lib/business-profile";
-import { listPublicPages } from "@/lib/pages";
+import { listPublicPages, pageHrefForSlug } from "@/lib/pages";
 
 /** llms.txt (2026-09-08) — the AI-specific counterpart to robots.txt (a
  * 2024+ convention, not yet universally read by every AI system, but
@@ -48,10 +48,10 @@ export async function GET() {
       // sitemap.ts follows.
       if (page.slug === "home") continue;
       if (page.slug === "about") {
-        lines.push(`- [About](${siteUrl}/about): Background and services`);
+        lines.push(`- [About](${siteUrl}${pageHrefForSlug(page.slug)}): Background and services`);
         continue;
       }
-      lines.push(`- [${page.slug}](${siteUrl}/p/${encodeURIComponent(page.slug)})`);
+      lines.push(`- [${page.slug}](${siteUrl}${pageHrefForSlug(page.slug)})`);
     }
   } catch {
     // Best-effort — same posture as sitemap.ts.

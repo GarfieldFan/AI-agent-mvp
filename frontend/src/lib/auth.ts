@@ -9,6 +9,12 @@ import type { Role } from "@/lib/types";
  * round trip. Never trust `role`/`email` read from here for anything
  * privileged. */
 
+/** admin or owner — the roles that can see/use the site's backend
+ * (dashboard, editor, admin bar). Display-only, like everything here. */
+export function isStaffRole(role: Role): boolean {
+  return role === "admin" || role === "owner";
+}
+
 export type AuthState = {
   token: string | null;
   email: string | null;

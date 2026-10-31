@@ -3,11 +3,11 @@
 import * as React from "react";
 import { ShieldCheck } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
+import { SecretKeyField } from "@/components/common/secret-key-field";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
@@ -109,18 +109,7 @@ export function TurnstileSettingsPanel() {
           />
         </div>
         <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">Secret key</Label>
-          <Input
-            type="password"
-            value={secretKeyInput}
-            onChange={(e) => setSecretKeyInput(e.target.value)}
-            placeholder={settings.turnstile_secret_key_set ? "•••••••• (leave blank to keep saved key)" : "0x4AAAAAAA…"}
-          />
-          {settings.turnstile_secret_key_set ? (
-            <Badge variant="secondary" className="text-xs">
-              Saved
-            </Badge>
-          ) : null}
+          <SecretKeyField label="Secret key" value={secretKeyInput} onChange={setSecretKeyInput} saved={settings.turnstile_secret_key_set} placeholder={"0x4AAAAAAA…"} />
         </div>
         <p className="text-xs text-muted-foreground">
           Get both from the Cloudflare dashboard (Turnstile → Add site) — free, no account minimum.

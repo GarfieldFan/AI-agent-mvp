@@ -30,7 +30,7 @@ from apis.deps import Role, require_role
 from apis.notifications import notify_owner
 from cart import decrement_stock_and_notify
 from db import get_db
-from models import AppSettings, Order
+from models import AppSettings, Order, get_or_create_app_settings
 from payments import (
     AdyenPaymentProvider,
     PaymentProvider,
@@ -160,10 +160,7 @@ class UpdatePaymentSettingsRequest(BaseModel):
 def update_payment_settings(req: UpdatePaymentSettingsRequest, db: Session = Depends(get_db)) -> PaymentSettings:
     if req.payment_provider not in ("test", "stripe", "adyen"):
         raise HTTPException(status_code=400, detail=f"{req.payment_provider!r} isn't a supported payment provider.")
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
     row.payment_provider = req.payment_provider
     row.stripe_publishable_key = req.stripe_publishable_key
     if req.stripe_secret_key is not None:

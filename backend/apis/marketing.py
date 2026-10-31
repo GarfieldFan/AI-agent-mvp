@@ -24,7 +24,7 @@ from marketing import (
     MarketingProviderNotConfigured,
     TestMarketingProvider,
 )
-from models import AppSettings, CrmEntry
+from models import AppSettings, CrmEntry, get_or_create_app_settings
 
 router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 
@@ -87,10 +87,7 @@ def update_marketing_settings(req: UpdateMarketingSettingsRequest, db: Session =
         raise HTTPException(
             status_code=400, detail=f"{req.marketing_provider!r} isn't a supported marketing provider."
         )
-    row = db.get(AppSettings, 1)
-    if row is None:
-        row = AppSettings(id=1)
-        db.add(row)
+    row = get_or_create_app_settings(db)
     row.marketing_provider = req.marketing_provider
     row.mailchimp_audience_id = req.mailchimp_audience_id
     if req.mailchimp_api_key is not None:

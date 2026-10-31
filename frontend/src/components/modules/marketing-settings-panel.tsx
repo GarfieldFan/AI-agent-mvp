@@ -3,11 +3,11 @@
 import * as React from "react";
 import { Megaphone } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SecretKeyField } from "@/components/common/secret-key-field";
 import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import { ApiError } from "@/lib/api";
@@ -134,18 +134,7 @@ export function MarketingSettingsPanel() {
             </p>
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">API key</Label>
-            <Input
-              type="password"
-              value={mailchimpApiKeyInput}
-              onChange={(e) => setMailchimpApiKeyInput(e.target.value)}
-              placeholder={settings.mailchimp_api_key_set ? "•••••••• (leave blank to keep saved key)" : "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-us21"}
-            />
-            {settings.mailchimp_api_key_set ? (
-              <Badge variant="secondary" className="text-xs">
-                Saved
-              </Badge>
-            ) : null}
+            <SecretKeyField label="API key" value={mailchimpApiKeyInput} onChange={setMailchimpApiKeyInput} saved={settings.mailchimp_api_key_set} placeholder={"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-us21"} />
             <p className="text-xs text-muted-foreground">
               The datacenter (e.g. <code>us21</code>) is read from the end of the key itself — no separate
               field needed.
@@ -157,18 +146,7 @@ export function MarketingSettingsPanel() {
       {provider === "hubspot" ? (
         <div className="space-y-3 rounded-lg border border-dashed p-3">
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Private app access token</Label>
-            <Input
-              type="password"
-              value={hubspotAccessTokenInput}
-              onChange={(e) => setHubspotAccessTokenInput(e.target.value)}
-              placeholder={settings.hubspot_access_token_set ? "•••••••• (leave blank to keep saved key)" : "pat-…"}
-            />
-            {settings.hubspot_access_token_set ? (
-              <Badge variant="secondary" className="text-xs">
-                Saved
-              </Badge>
-            ) : null}
+            <SecretKeyField label="Private app access token" value={hubspotAccessTokenInput} onChange={setHubspotAccessTokenInput} saved={settings.hubspot_access_token_set} placeholder={"pat-…"} />
             <p className="text-xs text-muted-foreground">
               Create a private app in HubSpot (Settings &rarr; Integrations &rarr; Private Apps) with the{" "}
               <code>crm.objects.contacts.write</code> scope and paste its access token here.

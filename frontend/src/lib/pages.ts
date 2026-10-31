@@ -19,6 +19,26 @@ export type SaveVersionResponse = {
   version: PageVersionSummary;
 };
 
+/** The public URL a saved page's slug renders at — "home" is the site
+ * root, "about" its fixed /about route, everything else /p/[slug] (see
+ * app/page.tsx, app/about/page.tsx, app/p/[slug]). The one place this
+ * convention lives on the frontend; backend/apis/nav_menu.py's
+ * `_href_for_slug` mirrors it for owner-agent. */
+export function pageHrefForSlug(slug: string): string {
+  if (slug === "home") return "/";
+  if (slug === "about") return "/about";
+  return `/p/${encodeURIComponent(slug)}`;
+}
+
+/** The inverse of `pageHrefForSlug` — the saved-page slug a public path
+ * renders, or null for routes that aren't CTE-editable pages. */
+export function slugForPagePath(pathname: string): string | null {
+  if (pathname === "/") return "home";
+  if (pathname === "/about") return "about";
+  const match = pathname.match(/^\/p\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 /** Saves `content` as a new version of `slug` (creates the page if it's
  * new). Admin/owner only — see backend/apis/pages.py. */
 export function savePageVersion(slug: string, content: GeneratedPage, note?: string) {

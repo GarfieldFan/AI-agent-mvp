@@ -13,17 +13,9 @@ import { ErrorMessage } from "@/components/common/error-message";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
 import type { NavItem } from "@/config/nav";
 import { ApiError } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import { isStaffRole, useAuth } from "@/lib/auth";
 import { getDefaultNavItems, getNavMenu, MAX_MENU_ITEMS, updateNavMenu } from "@/lib/nav-menu";
-import { listPages } from "@/lib/pages";
-
-/** Saved-page slug → the public URL it renders at (same convention
- * app/page.tsx / app/about/page.tsx / app/p/[slug] follow). */
-function hrefForSlug(slug: string): string {
-  if (slug === "home") return "/";
-  if (slug === "about") return "/about";
-  return `/p/${encodeURIComponent(slug)}`;
-}
+import { listPages, pageHrefForSlug } from "@/lib/pages";
 
 function titleForSlug(slug: string): string {
   if (slug === "home") return "Home";
@@ -67,7 +59,7 @@ const withKey = (item: NavItem): Row => ({ ...item, key: crypto.randomUUID() });
  * a no-op visually. */
 export function NavMenuPanel() {
   const { role } = useAuth();
-  const canEdit = role === "admin" || role === "owner";
+  const canEdit = isStaffRole(role);
 
   const [rows, setRows] = React.useState<Row[] | null>(null);
   const [isDefault, setIsDefault] = React.useState(false);
@@ -269,7 +261,7 @@ export function NavMenuPanel() {
             disabled={!pagePick || full}
             onClick={() => {
               if (!pagePick) return;
-              addItem({ title: titleForSlug(pagePick), href: hrefForSlug(pagePick) });
+              addItem({ title: titleForSlug(pagePick), href: pageHrefForSlug(pagePick) });
               setPagePick(null);
             }}
           >
