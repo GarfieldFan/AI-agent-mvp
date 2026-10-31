@@ -123,6 +123,7 @@ RULES: dict[tuple[str, str], RateLimitRule] = {
 # making the exact attack that was found impossible to reproduce.
 PREFIX_RULES: dict[tuple[str, str], RateLimitRule] = {
     ("GET", "/api/pages"): RateLimitRule(window_seconds=10, max_requests=60),
+    ("GET", "/api/nav-menu"): RateLimitRule(window_seconds=10, max_requests=60),
     ("GET", "/api/products"): RateLimitRule(window_seconds=10, max_requests=60),
     ("GET", "/api/product-fields"): RateLimitRule(window_seconds=10, max_requests=60),
     ("GET", "/api/business-profile"): RateLimitRule(window_seconds=10, max_requests=60),

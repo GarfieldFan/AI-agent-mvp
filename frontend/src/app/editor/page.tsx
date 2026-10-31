@@ -2,21 +2,31 @@ import type { Metadata } from "next";
 
 import { Container } from "@/components/layout/container";
 import { PageHeader } from "@/components/layout/page-header";
-import { CteEditorPanel } from "@/components/modules/cte-editor-panel";
+import { EditorTabs } from "@/components/modules/editor-tabs";
 
 export const metadata: Metadata = {
   title: "Page Editor",
-  description: "Click-to-edit page editor.",
+  description: "Click-to-edit page editor and site menu.",
 };
 
-export default function EditorPage() {
+// `?tab=menu` opens the Menu tab, `?slug=` preloads a page — both linked
+// from AdminBar ("Menu", "Edit this page").
+export default async function EditorPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ slug?: string }>;
+}) {
+  // `?tab=` is read client-side by EditorTabs itself (it has to react to
+  // same-route URL changes); only the initial slug is needed here.
+  const { slug } = await searchParams;
+
   return (
     <Container className="space-y-8 py-12">
       <PageHeader
-        title="Click-to-Edit (CTE)"
-        description="Load a saved page, flip on Edit mode, and click a pencil badge to edit that text, image, or button — then save as a new version."
+        title="Page Editor"
+        description="Edit your pages in place (load a page, turn on Edit mode, click a pencil badge, save as a new version), and manage the menu visitors see in the site header and footer."
       />
-      <CteEditorPanel />
+      <EditorTabs initialSlug={slug || undefined} />
     </Container>
   );
 }

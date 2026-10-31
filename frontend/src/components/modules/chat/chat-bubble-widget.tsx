@@ -33,8 +33,26 @@ const HIDDEN_ROUTES = ["/chat", "/editor"];
 export function ChatBubbleWidget() {
   const pathname = usePathname();
   const [open, setOpen] = React.useState(false);
+  const hidden = HIDDEN_ROUTES.some((route) => pathname === route || pathname.startsWith(`${route}/`));
 
-  if (HIDDEN_ROUTES.some((route) => pathname === route || pathname.startsWith(`${route}/`))) {
+  // Any link whose href is exactly "#chat" (the default landing page's
+  // CTAs, or an owner's own CTE button) opens this bubble instead of
+  // navigating — the chatbot is system-level, not a page, so there's no
+  // route to link to. Window capture phase so this runs before Next's
+  // <Link> handler, which skips navigation once defaultPrevented is set.
+  React.useEffect(() => {
+    if (hidden) return;
+    function handleClick(event: MouseEvent) {
+      const anchor = (event.target as Element | null)?.closest?.("a");
+      if (anchor?.getAttribute("href") !== "#chat") return;
+      event.preventDefault();
+      setOpen(true);
+    }
+    window.addEventListener("click", handleClick, true);
+    return () => window.removeEventListener("click", handleClick, true);
+  }, [hidden]);
+
+  if (hidden) {
     return null;
   }
 

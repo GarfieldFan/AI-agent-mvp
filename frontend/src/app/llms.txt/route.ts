@@ -37,16 +37,20 @@ export async function GET() {
   lines.push(
     "",
     "## Core pages",
-    `- [About](${siteUrl}/about): Background and services`,
     `- [Products](${siteUrl}/search): Full catalog of products/services on offer`,
   );
 
   try {
     const pages = await listPublicPages();
     for (const page of pages) {
-      // "home"/"about" already map to the two fixed entries above — same
-      // slug convention sitemap.ts follows.
-      if (page.slug === "home" || page.slug === "about") continue;
+      // "home" is the site root; "about" lives at its fixed /about route
+      // (only once saved — there's no default one). Same slug convention
+      // sitemap.ts follows.
+      if (page.slug === "home") continue;
+      if (page.slug === "about") {
+        lines.push(`- [About](${siteUrl}/about): Background and services`);
+        continue;
+      }
       lines.push(`- [${page.slug}](${siteUrl}/p/${encodeURIComponent(page.slug)})`);
     }
   } catch {

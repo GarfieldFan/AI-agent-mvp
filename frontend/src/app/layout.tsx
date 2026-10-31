@@ -5,6 +5,7 @@ import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
+import { AdminBar } from "@/components/layout/admin-bar";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { SiteHeader } from "@/components/layout/site-header";
 import { SiteJsonLd } from "@/components/layout/site-json-ld";
@@ -73,7 +74,14 @@ export default function RootLayout({
         >
           <TooltipProvider>
             <SessionIdBootstrap />
-            <SiteHeader />
+            {/* One sticky wrapper for both bars so they stack instead of
+                overlapping at top-0. z-50: outranks anything a page renders
+                (e.g. /editor's z-40 hover toolbars); an open Sheet (also
+                z-50, portalled later in <body>) still wins the tie. */}
+            <div className="sticky top-0 z-50">
+              <AdminBar />
+              <SiteHeader />
+            </div>
             <main className="flex-1">{children}</main>
             <SiteFooter />
             <ChatBubbleWidget />

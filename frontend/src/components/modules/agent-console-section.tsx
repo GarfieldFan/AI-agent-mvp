@@ -1,12 +1,27 @@
 "use client";
 
-import { Lock } from "lucide-react";
-import { useEffect, useState } from "react";
+import Link from "next/link";
+import { usePathname, useSearchParams } from "next/navigation";
+import {
+  Bot,
+  ClipboardCheck,
+  Contact,
+  Cpu,
+  Library,
+  Lock,
+  MessageSquareText,
+  Plug,
+  Search,
+  ShieldCheck,
+  ShoppingBag,
+  Sparkles,
+  UserCog,
+  type LucideIcon,
+} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 
-import { Accordion, AccordionItem, AccordionPanel, AccordionTrigger } from "@/components/ui/accordion";
 import { EmptyState } from "@/components/common/empty-state";
 import { LoadingSpinner } from "@/components/common/loading-spinner";
-import { RoleBadge } from "@/components/common/role-badge";
 import { BusinessProfilePanel } from "@/components/modules/business-profile-panel";
 import { ChatPromptSettingsPanel } from "@/components/modules/chat-prompt-settings-panel";
 import { ChatSessionViewerPanel } from "@/components/modules/chat-session-viewer-panel";
@@ -36,23 +51,35 @@ import { UserManagementPanel } from "@/components/modules/user-management-panel"
 import { TurnstileSettingsPanel } from "@/components/modules/turnstile-settings-panel";
 import { ApiError, apiFetch } from "@/lib/api";
 import { clearAuth, useAuth } from "@/lib/auth";
+import { cn } from "@/lib/utils";
 
-/** Role-gated section: a plain `user` (including anyone not logged in)
- * sees a locked EmptyState, admin/owner see the real agent-console
- * capabilities. The role comes from a real JWT now (see lib/auth.ts) —
- * this is purely a UI convenience, the backend re-verifies on every
- * request.
+type ConsoleItem = { id: string; label: string; render: () => ReactNode };
+type ConsoleSection = { id: string; label: string; icon: LucideIcon; items: ConsoleItem[] };
+
+/** Builds `/dashboard?section=…&item=…` — the selected screen lives in
+ * the URL so it survives a refresh, can be linked to (e.g.
+ * DefaultHomeAdminNotice → the page generator), and Back works. */
+function consoleHref(pathname: string, section: string, item?: string): string {
+  const params = new URLSearchParams({ section });
+  if (item) params.set("item", item);
+  return `${pathname}?${params.toString()}`;
+}
+
+/** Role-gated, WordPress-admin-style console (2026-10-31, replaced one
+ * long collapsible Accordion of every panel, per direct user feedback): a
+ * dark left sidebar of sections, the active section's sub-items listed
+ * under it (like WP's "Dashboard → Home / Updates"), and ONE screen
+ * rendered at a time on the right. Only the selected panel is mounted, so
+ * opening the dashboard doesn't fire every panel's fetches at once.
  *
- * **2026-08-06**: the generic "Reserved capability" stub-card grid
- * (sample-payload `AgentCapabilityCard`s that just exercised the RBAC
- * gate against a still-501 endpoint) is gone — CRM entry capture and
- * report generation, its last two occupants, are both real now
- * (`CrmPanel`/`ReportPanel`), joining `generate_landing_page`/
- * `generate_poster`/`generate_geo_page` before them. Every capability
- * `backend/apis/agent.py` exposes is real as of this point; there's
- * nothing left to reserve a placeholder grid for. */
+ * A plain `user` (including anyone not logged in) sees a locked
+ * EmptyState instead. The role comes from a real JWT (see lib/auth.ts) —
+ * this is purely a UI convenience, the backend re-verifies on every
+ * request. */
 export function AgentConsoleSection() {
   const { role } = useAuth();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   // The cached role in localStorage can outlive the token that backs it —
   // e.g. the server's JWT_SECRET rotates, or the token simply expires
   // server-side between page loads. `useAuth()` alone can't tell a real
@@ -67,11 +94,10 @@ export function AgentConsoleSection() {
   // starts out "verifying" instead of flashing gated panels first.
   const [verifying, setVerifying] = useState(() => role !== "user");
   const [sessionExpired, setSessionExpired] = useState(false);
-  // Bumped whenever PageGeneratorPanel's SavePageForm saves a page — the
-  // signal that tells the sibling PageManager below (a separate
-  // component instance with its own independent fetch) to reload instead
-  // of showing stale data until a manual page refresh (see PageManager's
-  // own `refreshToken` doc comment).
+  // Bumped whenever PageGeneratorPanel's SavePageForm saves a page — tells
+  // PageManager to reload (see its own `refreshToken` doc comment). The
+  // two are separate screens now, so PageManager also refetches on every
+  // visit anyway; kept so that contract stays correct regardless.
   const [pagesRefreshToken, setPagesRefreshToken] = useState(0);
 
   useEffect(() => {
@@ -105,142 +131,220 @@ export function AgentConsoleSection() {
   // display-only check shows).
   const canViewOwnerAgent = !verifying && role === "owner";
 
+  const sections: ConsoleSection[] = [
+    {
+      id: "model",
+      label: "AI model",
+      icon: Cpu,
+      items: [{ id: "model", label: "AI model", render: () => <ModelSettingsPanel /> }],
+    },
+    {
+      id: "chat-prompts",
+      label: "Chat prompts",
+      icon: MessageSquareText,
+      items: [{ id: "prompts", label: "Chat prompts", render: () => <ChatPromptSettingsPanel /> }],
+    },
+    {
+      id: "knowledge",
+      label: "Knowledge base",
+      icon: Library,
+      items: [
+        { id: "documents", label: "Documents", render: () => <DocumentManager /> },
+        { id: "scheduled-tasks", label: "Scheduled tasks", render: () => <ScheduledTasksPanel /> },
+      ],
+    },
+    {
+      id: "content",
+      label: "Content",
+      icon: Sparkles,
+      items: [
+        {
+          id: "page-generator",
+          label: "Page generator",
+          render: () => <PageGeneratorPanel onSaved={() => setPagesRefreshToken((t) => t + 1)} />,
+        },
+        { id: "pages", label: "Saved pages", render: () => <PageManager refreshToken={pagesRefreshToken} /> },
+        { id: "posters", label: "Posters", render: () => <PosterGeneratorPanel /> },
+        { id: "geo-page", label: "GEO page", render: () => <GeoPagePanel /> },
+      ],
+    },
+    {
+      id: "seo",
+      label: "SEO & AI discoverability",
+      icon: Search,
+      items: [{ id: "business-profile", label: "Business profile", render: () => <BusinessProfilePanel /> }],
+    },
+    {
+      id: "crm",
+      label: "CRM & reporting",
+      icon: Contact,
+      items: [
+        { id: "leads", label: "Leads", render: () => <CrmPanel /> },
+        { id: "request-types", label: "Request types", render: () => <IntentSchemaPanel /> },
+        { id: "reports", label: "Reports", render: () => <ReportPanel /> },
+        { id: "chat-history", label: "Chat history", render: () => <ChatSessionViewerPanel /> },
+      ],
+    },
+    {
+      id: "review-queues",
+      label: "Review queues",
+      icon: ClipboardCheck,
+      items: [{ id: "queues", label: "Review queues", render: () => <ReviewQueuePanel /> }],
+    },
+    {
+      id: "commerce",
+      label: "Products & orders",
+      icon: ShoppingBag,
+      items: [
+        { id: "products", label: "Products", render: () => <ProductPanel /> },
+        { id: "stock", label: "Stock", render: () => <StockItemPanel /> },
+        { id: "orders", label: "Orders", render: () => <OrderPanel /> },
+      ],
+    },
+    {
+      // Split out of "Products & orders" (2026-10-31) — these only lived
+      // there for lack of a better home; they're third-party service
+      // credentials, not catalog/order management.
+      id: "integrations",
+      label: "Integrations",
+      icon: Plug,
+      items: [
+        { id: "payments", label: "Payments", render: () => <PaymentSettingsPanel /> },
+        { id: "notifications", label: "Email & SMS", render: () => <NotificationSettingsPanel /> },
+        { id: "marketing", label: "Marketing", render: () => <MarketingSettingsPanel /> },
+        { id: "maps", label: "Maps", render: () => <MapSettingsPanel /> },
+      ],
+    },
+    {
+      id: "users",
+      label: "Users & access",
+      icon: UserCog,
+      items: [
+        { id: "users", label: "Users", render: () => <UserManagementPanel /> },
+        { id: "social-login", label: "Social login", render: () => <OAuthSettingsPanel /> },
+      ],
+    },
+    {
+      id: "security",
+      label: "Security",
+      icon: ShieldCheck,
+      items: [
+        { id: "bot-verification", label: "Bot verification", render: () => <TurnstileSettingsPanel /> },
+        { id: "error-log", label: "Error log", render: () => <ErrorLogPanel /> },
+      ],
+    },
+    ...(canViewOwnerAgent
+      ? [
+          {
+            id: "owner-agent",
+            label: "Owner agent",
+            icon: Bot,
+            items: [{ id: "agent", label: "Owner agent", render: () => <OwnerAgentPanel /> }],
+          },
+        ]
+      : []),
+  ];
+
+  // Unknown/missing ids fall back to the first section/item — the model
+  // picker, since nothing else works until a model is connected.
+  const activeSection = sections.find((s) => s.id === searchParams.get("section")) ?? sections[0];
+  const activeItem = activeSection.items.find((i) => i.id === searchParams.get("item")) ?? activeSection.items[0];
+  const hasSubItems = activeSection.items.length > 1;
+
+  if (verifying) return <LoadingSpinner label="Checking your session…" className="p-10" />;
+
+  if (!canView) {
+    return (
+      <EmptyState
+        icon={Lock}
+        title={sessionExpired ? "Your session has expired" : "Admin/owner access required"}
+        description={
+          sessionExpired
+            ? "You were logged out because your session is no longer valid — log in again (see /login) to continue."
+            : "Log in as an admin or owner account (see /login) to manage this site."
+        }
+      />
+    );
+  }
+
   return (
-    <section className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="space-y-1">
-          <h2 className="text-xl font-bold">Agent console (admin / owner only)</h2>
-          <p className="text-sm text-muted-foreground">
-            Reserved capabilities a plain `user` chatbot visitor can never
-            reach — each is RBAC-gated on the backend.
-          </p>
-        </div>
-        <RoleBadge role={role} />
-      </div>
-
-      {verifying ? (
-        <LoadingSpinner label="Checking your session…" className="p-10" />
-      ) : canView ? (
-        <div className="space-y-4">
-        <SetupStatusBanner />
-        {/* Grouped into a collapsible accordion (2026-08-19) — 8 panels
-            stacked flat had grown hard to navigate. `multiple` so more
-            than one group can stay open at once (e.g. Model settings open
-            while checking Document manager). `defaultValue={["model"]}`
-            (2026-09-09, per direct user feedback) — the model picker is
-            the one thing almost every session actually needs first
-            (nothing else works until a model is connected), so it starts
-            open while every other group starts collapsed. */}
-        <Accordion multiple defaultValue={["model"]}>
-          <AccordionItem value="model">
-            <AccordionTrigger>AI model</AccordionTrigger>
-            <AccordionPanel>
-              <ModelSettingsPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="chat-prompts">
-            <AccordionTrigger>Chat prompts</AccordionTrigger>
-            <AccordionPanel>
-              <ChatPromptSettingsPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="ai-kb">
-            <AccordionTrigger>Knowledge base</AccordionTrigger>
-            <AccordionPanel>
-              <DocumentManager />
-              <ScheduledTasksPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="content-gen">
-            <AccordionTrigger>Content generation</AccordionTrigger>
-            <AccordionPanel>
-              <GeoPagePanel />
-              <PosterGeneratorPanel />
-              <PageGeneratorPanel onSaved={() => setPagesRefreshToken((t) => t + 1)} />
-              <div className="space-y-2 rounded-xl border bg-muted/40 p-4">
-                <h3 className="text-lg font-semibold">Saved pages</h3>
-                <PageManager refreshToken={pagesRefreshToken} />
+    <div className="flex flex-col gap-6 md:flex-row md:items-start">
+      <aside className="shrink-0 md:sticky md:top-[calc(var(--site-chrome-h)+1.5rem)] md:w-56">
+        <nav
+          aria-label="Dashboard sections"
+          className="flex gap-1 overflow-x-auto rounded-xl bg-zinc-900 p-2 text-sm text-zinc-300 md:flex-col md:overflow-visible"
+        >
+          {sections.map((section) => {
+            const active = section.id === activeSection.id;
+            const Icon = section.icon;
+            return (
+              <div key={section.id} className="shrink-0">
+                <Link
+                  href={consoleHref(pathname, section.id)}
+                  aria-current={active ? "page" : undefined}
+                  className={cn(
+                    "flex items-center gap-2 rounded-lg px-3 py-2 whitespace-nowrap transition-colors hover:bg-zinc-800 hover:text-white",
+                    active && "bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground",
+                  )}
+                >
+                  <Icon className="size-4 shrink-0" />
+                  {section.label}
+                </Link>
+                {/* Sub-items under the active section only, WP-style.
+                    Desktop only — on mobile they render as a pill row
+                    above the content instead (see below). */}
+                {active && hasSubItems ? (
+                  <ul className="mt-1 mb-2 hidden space-y-0.5 pl-9 md:block">
+                    {section.items.map((item) => (
+                      <li key={item.id}>
+                        <Link
+                          href={consoleHref(pathname, section.id, item.id)}
+                          aria-current={item.id === activeItem.id ? "page" : undefined}
+                          className={cn(
+                            "block rounded px-2 py-1 text-zinc-400 transition-colors hover:text-white",
+                            item.id === activeItem.id && "font-medium text-white",
+                          )}
+                        >
+                          {item.label}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
               </div>
-            </AccordionPanel>
-          </AccordionItem>
+            );
+          })}
+        </nav>
+      </aside>
 
-          <AccordionItem value="seo-geo">
-            <AccordionTrigger>SEO & AI discoverability</AccordionTrigger>
-            <AccordionPanel>
-              <BusinessProfilePanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="crm-reporting">
-            <AccordionTrigger>CRM & reporting</AccordionTrigger>
-            <AccordionPanel>
-              <IntentSchemaPanel />
-              <CrmPanel />
-              <ReportPanel />
-              <ChatSessionViewerPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="products-orders">
-            <AccordionTrigger>Products & orders</AccordionTrigger>
-            <AccordionPanel>
-              <ProductPanel />
-              <StockItemPanel />
-              <OrderPanel />
-              <PaymentSettingsPanel />
-              <NotificationSettingsPanel />
-              <MarketingSettingsPanel />
-              <ErrorLogPanel />
-              <MapSettingsPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="review-queues">
-            <AccordionTrigger>Review queues</AccordionTrigger>
-            <AccordionPanel>
-              <ReviewQueuePanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="users-access">
-            <AccordionTrigger>Users & access</AccordionTrigger>
-            <AccordionPanel>
-              <UserManagementPanel />
-              <OAuthSettingsPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          <AccordionItem value="security">
-            <AccordionTrigger>Security</AccordionTrigger>
-            <AccordionPanel>
-              <TurnstileSettingsPanel />
-            </AccordionPanel>
-          </AccordionItem>
-
-          {canViewOwnerAgent ? (
-            <AccordionItem value="owner-agent">
-              <AccordionTrigger>Owner agent</AccordionTrigger>
-              <AccordionPanel>
-                <OwnerAgentPanel />
-              </AccordionPanel>
-            </AccordionItem>
+      <div className="min-w-0 flex-1 space-y-4">
+        <SetupStatusBanner />
+        <div className="space-y-2 border-b pb-3">
+          <h1 className="text-xl font-semibold">
+            {activeSection.label}
+            {hasSubItems ? <span className="text-muted-foreground"> / {activeItem.label}</span> : null}
+          </h1>
+          {hasSubItems ? (
+            <div className="flex gap-1 overflow-x-auto md:hidden">
+              {activeSection.items.map((item) => (
+                <Link
+                  key={item.id}
+                  href={consoleHref(pathname, activeSection.id, item.id)}
+                  className={cn(
+                    "shrink-0 rounded-full border px-3 py-1 text-xs",
+                    item.id === activeItem.id ? "bg-foreground text-background" : "text-muted-foreground",
+                  )}
+                >
+                  {item.label}
+                </Link>
+              ))}
+            </div>
           ) : null}
-        </Accordion>
         </div>
-      ) : (
-        <EmptyState
-          icon={Lock}
-          title={sessionExpired ? "Your session has expired" : "Admin/owner access required"}
-          description={
-            sessionExpired
-              ? "You were logged out because your session is no longer valid — log in again (see /login) to continue."
-              : "Log in as an admin or owner account (see /login) to see and test these reserved capabilities."
-          }
-        />
-      )}
-    </section>
+        {/* key: remount on switch so each screen starts fresh, like a real
+            page navigation (and the old Accordion's unmount-on-close). */}
+        <div key={`${activeSection.id}/${activeItem.id}`}>{activeItem.render()}</div>
+      </div>
+    </div>
   );
 }

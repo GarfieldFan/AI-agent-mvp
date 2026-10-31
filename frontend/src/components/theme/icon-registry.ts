@@ -1,6 +1,7 @@
 import { createElement } from "react";
 import {
   BarChart3,
+  Calendar,
   FileText,
   HelpCircle,
   Home,
@@ -14,6 +15,7 @@ import {
   Rocket,
   Settings,
   ShieldCheck,
+  ShoppingBag,
   Sparkles,
   Star,
   Users,
@@ -39,6 +41,8 @@ const ICONS: Record<string, LucideIcon> = {
   image: ImageIcon,
   "bar-chart": BarChart3,
   settings: Settings,
+  calendar: Calendar,
+  "shopping-bag": ShoppingBag,
 };
 
 /** Resolves a schema icon key (e.g. `"shield-check"`, possibly chosen by

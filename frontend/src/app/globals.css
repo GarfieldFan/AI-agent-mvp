@@ -49,6 +49,10 @@
 }
 
 :root {
+  /* Height of the sticky site chrome (SiteHeader's h-14, plus AdminBar's
+     h-9 while an admin/owner is signed in — see admin-bar.tsx). Anything
+     sticky that must sit just below the chrome offsets by this. */
+  --site-chrome-h: 3.5rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -127,4 +131,7 @@
   html {
     @apply font-sans;
   }
+}
+:root[data-admin-bar] {
+  --site-chrome-h: 5.75rem;
 }

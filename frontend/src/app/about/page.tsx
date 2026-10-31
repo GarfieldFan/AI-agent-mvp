@@ -1,45 +1,37 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 
 import { SectionRenderer } from "@/components/theme/section-renderer";
-import { DEFAULT_ABOUT_SECTIONS } from "@/config/default-theme";
 import { extractPageSummary } from "@/lib/theme";
 import { getPublicPage } from "@/lib/pages";
 
 const FALLBACK_TITLE = "About";
-const FALLBACK_DESCRIPTION = "Project background and technology choices.";
 
-// 2026-09-08 — was a static `export const metadata` with hardcoded
-// placeholder copy; now reflects the actual saved "about" content
-// once the owner has customized it (same extractPageSummary this app's
-// other content pages use), falling back to the original static copy
-// for an unconfigured/default install. See the root AGENTS.md's GEO/
-// business-profile section.
+// No built-in About content — this route only exists once an admin/owner
+// has saved an "about" page (PageGeneratorPanel's save form, or
+// PageManager's "New blank page" + /editor). Until then it 404s, and
+// "About" stays out of the public nav (config/nav.ts's buildPublicNav).
 export async function generateMetadata(): Promise<Metadata> {
   const saved = await getPublicPage("about");
-  const { title, description } = extractPageSummary(saved?.sections ?? DEFAULT_ABOUT_SECTIONS);
+  if (!saved) return { title: FALLBACK_TITLE };
+
+  const { title, description } = extractPageSummary(saved.sections);
   const trimmed = description ? description.slice(0, 200) : undefined;
 
   return {
     title: title || FALLBACK_TITLE,
-    description: trimmed || FALLBACK_DESCRIPTION,
-    openGraph: {
-      title: title || FALLBACK_TITLE,
-      description: trimmed || FALLBACK_DESCRIPTION,
-    },
+    description: trimmed,
+    openGraph: { title: title || FALLBACK_TITLE, description: trimmed },
   };
 }
 
 // Same reasoning as app/page.tsx: fetch fresh on every request so a saved
-// "about" version shows up immediately, no rebuild needed. Falls back to
-// DEFAULT_ABOUT_SECTIONS (never a blank page) until one's been saved.
+// "about" version shows up immediately, no rebuild needed.
 export const dynamic = "force-dynamic";
 
 export default async function AboutPage() {
   const saved = await getPublicPage("about");
+  if (!saved) notFound();
 
-  if (saved) {
-    return <SectionRenderer sections={saved.sections} accentColor={saved.accent_color} />;
-  }
-
-  return <SectionRenderer sections={DEFAULT_ABOUT_SECTIONS} />;
+  return <SectionRenderer sections={saved.sections} accentColor={saved.accent_color} />;
 }

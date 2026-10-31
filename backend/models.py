@@ -296,6 +296,15 @@ class AppSettings(Base):
     # that function's own docstring. No manual dashboard editor in v1,
     # same posture as order_status_options above.
     shipping_allowed_regions: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=None)
+    # Public site navigation menu (2026-10-31, apis/nav_menu.py) — an
+    # ordered list of {"label", "href"} dicts the header/footer render.
+    # Null means "never configured": the frontend falls back to its
+    # built-in default (Home, plus About once an "about" page is saved),
+    # so an upgrade never leaves a site with an empty menu. An explicit
+    # empty list IS honored (owner chose no public nav links). Admin
+    # links (Page Editor/Dashboard) are never stored here — they live in
+    # the frontend's role-gated AdminBar.
+    nav_menu: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True, default=None)
     # Payment gate (2026-08-20, see backend/payments.py) — same
     # "swappable provider, null means use the default" posture as every
     # AI provider above, extended to a new capability domain: actually

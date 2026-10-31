@@ -1,5 +1,7 @@
 import { SectionRenderer } from "@/components/theme/section-renderer";
-import { DEFAULT_HOME_SECTIONS } from "@/config/default-theme";
+import { DefaultHomeAdminNotice } from "@/components/modules/default-home-admin-notice";
+import { buildDefaultHomeSections } from "@/config/default-theme";
+import { getPublicBusinessProfile } from "@/lib/business-profile";
 import { getPublicPage } from "@/lib/pages";
 
 // Fetches fresh on every request rather than being statically generated
@@ -16,5 +18,14 @@ export default async function Home() {
     return <SectionRenderer sections={saved.sections} accentColor={saved.accent_color} />;
   }
 
-  return <SectionRenderer sections={DEFAULT_HOME_SECTIONS} />;
+  // No saved "home" page — render the system's default landing page
+  // (config/default-theme.ts), personalized with the business profile if
+  // one exists. A profile-fetch failure just means the generic copy.
+  const profile = await getPublicBusinessProfile().catch(() => undefined);
+  return (
+    <>
+      <DefaultHomeAdminNotice />
+      <SectionRenderer sections={buildDefaultHomeSections(profile)} />
+    </>
+  );
 }

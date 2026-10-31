@@ -1,47 +1,31 @@
-import type { LucideIcon } from "lucide-react";
-import { Home, Info, LayoutDashboard, MessagesSquare, MousePointerClick } from "lucide-react";
-
+/** Plain, serializable nav entry — crosses the Server → Client Component
+ * boundary (SiteHeader → NavLink/MobileNav), so no component refs. The
+ * backend's stored menu uses {label, href} — lib/nav-menu.ts maps it. */
 export type NavItem = {
   title: string;
   href: string;
-  description: string;
-  icon: LucideIcon;
-  /** Requires an authenticated session once auth ships (Phase 1). */
-  requiresAuth?: boolean;
 };
 
-/** Single source of truth for primary navigation — consumed by the header,
- * mobile nav sheet, and footer sitemap so they never drift out of sync. */
-export const primaryNav: NavItem[] = [
-  {
-    title: "Home",
-    href: "/",
-    description: "Landing page",
-    icon: Home,
-  },
-  {
-    title: "About",
-    href: "/about",
-    description: "About this project",
-    icon: Info,
-  },
-  {
-    title: "Chatbot",
-    href: "/chat",
-    description: "RAG-grounded conversational assistant",
-    icon: MessagesSquare,
-  },
-  {
-    title: "Page Editor",
-    href: "/editor",
-    description: "Click-to-edit (CTE)",
-    icon: MousePointerClick,
-  },
-  {
-    title: "Dashboard",
-    href: "/dashboard",
-    description: "User dashboard",
-    icon: LayoutDashboard,
-    requiresAuth: true,
-  },
+/** Public, visitor-facing navigation — what every visitor sees, logged in
+ * or not, until an admin/owner saves their own menu (/editor → Menu, see
+ * lib/nav-menu.ts) — this is only the built-in default. Deliberately
+ * minimal, WordPress-default-theme style: just Home, plus "About" once an
+ * "about" page is saved (`buildPublicNav`). The chatbot
+ * is never a nav entry — it's system-level, always available via the
+ * floating ChatBubbleWidget mounted in the root layout. */
+export const basePublicNav: NavItem[] = [{ title: "Home", href: "/" }];
+
+/** Backend links — never part of the public menu. Rendered only in the
+ * role-gated AdminBar (WordPress-admin-bar style), for admin/owner.
+ * Display-only gating: both routes re-verify the role server-side. */
+export const adminNav: NavItem[] = [
+  { title: "Page Editor", href: "/editor" },
+  { title: "Dashboard", href: "/dashboard" },
 ];
+
+/** Public nav for this request: the fixed base entries plus whichever
+ * owner-created pages exist. Takes already-resolved facts, not a fetch,
+ * so SiteHeader/SiteFooter decide once how to look them up. */
+export function buildPublicNav({ hasAboutPage }: { hasAboutPage: boolean }): NavItem[] {
+  return hasAboutPage ? [...basePublicNav, { title: "About", href: "/about" }] : basePublicNav;
+}

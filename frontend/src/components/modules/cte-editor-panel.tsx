@@ -48,11 +48,12 @@ const PAGE_BROWSE_SIZE = 8;
  * same SectionRenderer every public route renders through, wrapped in a
  * CteProvider (components/theme/cte/) so what you see here is pixel-
  * identical to production, not a separate editor-only preview. */
-export function CteEditorPanel() {
+export function CteEditorPanel({ initialSlug = "home" }: { initialSlug?: string }) {
   const { role } = useAuth();
   const canEdit = role === "admin" || role === "owner";
 
-  const [slugInput, setSlugInput] = React.useState("home");
+  // `initialSlug` comes from `/editor?slug=` (AdminBar's "Edit this page").
+  const [slugInput, setSlugInput] = React.useState(initialSlug);
   const [loadedSlug, setLoadedSlug] = React.useState<string | null>(null);
   const [sections, setSections] = React.useState<PageSection[] | null>(null);
   const [accentColor, setAccentColor] = React.useState<string | undefined>(undefined);
@@ -421,9 +422,10 @@ export function CteEditorPanel() {
           <div className="rounded-xl border">
             {/* Sticky within the preview, not just above it (2026-08-06,
                user request) — a long page used to mean scrolling all the
-               way back up just to toggle edit mode or hit Save. `top-14`
-               sits it directly below SiteHeader's own sticky h-14 bar
-               (see layout/site-header.tsx) rather than overlapping it.
+               way back up just to toggle edit mode or hit Save.
+               `--site-chrome-h` (globals.css) sits it directly below the
+               sticky site chrome — SiteHeader, plus AdminBar when shown —
+               rather than overlapping it.
                Solid-ish background (not the old bg-muted/30) so
                scrolled-past section content doesn't show through.
 
@@ -441,7 +443,7 @@ export function CteEditorPanel() {
                Reload) must always stay clickable. Kept below `Sheet`'s
                `z-50` (shadcn/ui's `sheet.tsx`) so the field-editor popover
                still always wins over everything in this preview. */}
-            <div className="sticky top-14 z-[45] flex flex-wrap items-center justify-between gap-2 rounded-t-xl border-b bg-background/95 px-4 py-2 backdrop-blur supports-backdrop-filter:bg-background/80">
+            <div className="sticky top-[var(--site-chrome-h)] z-[45] flex flex-wrap items-center justify-between gap-2 rounded-t-xl border-b bg-background/95 px-4 py-2 backdrop-blur supports-backdrop-filter:bg-background/80">
               <div className="flex items-center gap-2">
                 <Switch id="cte-edit-mode" checked={editModeOn} onCheckedChange={setEditModeOn} />
                 <Label htmlFor="cte-edit-mode" className="text-sm">

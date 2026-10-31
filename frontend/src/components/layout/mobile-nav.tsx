@@ -12,9 +12,9 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { NavLink } from "@/components/layout/nav-link";
-import { primaryNav } from "@/config/nav";
+import type { NavItem } from "@/config/nav";
 
-export function MobileNav() {
+export function MobileNav({ publicItems }: { publicItems: NavItem[] }) {
   const [open, setOpen] = React.useState(false);
 
   return (
@@ -29,9 +29,9 @@ export function MobileNav() {
           <SheetTitle>Menu</SheetTitle>
         </SheetHeader>
         <nav className="flex flex-col gap-4 px-4 pb-4">
-          {primaryNav.map((item) => (
+          {publicItems.map((item) => (
             <NavLink
-              key={item.href}
+              key={`${item.href}-${item.title}`}
               href={item.href}
               title={item.title}
               onNavigate={() => setOpen(false)}

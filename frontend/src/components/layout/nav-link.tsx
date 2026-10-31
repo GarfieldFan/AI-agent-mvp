@@ -22,7 +22,9 @@ type NavLinkProps = {
  * serializable. */
 export function NavLink({ href, title, className, onNavigate }: NavLinkProps) {
   const pathname = usePathname();
-  const isActive = href === "/" ? pathname === "/" : pathname.startsWith(href);
+  // Only site-relative paths can be "the current page" — a menu item may
+  // also be an external URL or an in-page anchor like "#chat".
+  const isActive = href === "/" ? pathname === "/" : href.startsWith("/") && pathname.startsWith(href);
 
   return (
     <Link

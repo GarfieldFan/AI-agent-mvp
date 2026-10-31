@@ -30,6 +30,8 @@ from apis.maps import public_router as maps_public_router
 from apis.marketing import router as marketing_router
 from apis.model_settings import router as model_settings_router
 from apis.my_account import router as my_account_router
+from apis.nav_menu import admin_router as nav_menu_admin_router
+from apis.nav_menu import public_router as nav_menu_public_router
 from apis.notifications import router as notifications_router
 from apis.oauth import admin_router as oauth_admin_router
 from apis.oauth import public_router as oauth_public_router
@@ -135,6 +137,8 @@ app.include_router(error_log_router, prefix="/api")
 app.include_router(turnstile_admin_router, prefix="/api")
 app.include_router(turnstile_public_router, prefix="/api")
 app.include_router(ollama_admin_router, prefix="/api")
+app.include_router(nav_menu_admin_router, prefix="/api")
+app.include_router(nav_menu_public_router, prefix="/api")
 
 # Serves apis/media.py's uploaded images back out — publicly readable by
 # filename (no RBAC), same as ComfyUI's own /view endpoint for generated

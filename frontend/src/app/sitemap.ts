@@ -10,25 +10,34 @@ import { listPublicProducts } from "@/lib/products";
  * `listPublicPages()`/`listPublicProducts()` resolve through
  * `INTERNAL_API_URL` automatically (lib/api.ts). Best-effort: if either
  * fetch fails (backend briefly unreachable at build/request time), that
- * section is just omitted rather than failing the whole sitemap —
- * `/`/`/about` are always included regardless, since those two routes
- * always resolve to *something* (a saved page or the hand-authored
- * default template, see app/page.tsx/app/about/page.tsx). */
+ * section is just omitted rather than failing the whole sitemap — `/` is
+ * always included regardless (it always resolves to a saved page or the
+ * system default landing page, see app/page.tsx). `/about` is only listed
+ * once an "about" page has actually been saved — there's no default one
+ * anymore, so it 404s until then. */
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
 
   const entries: MetadataRoute.Sitemap = [
     { url: `${siteUrl}/`, changeFrequency: "weekly", priority: 1 },
-    { url: `${siteUrl}/about`, changeFrequency: "monthly", priority: 0.6 },
   ];
 
   try {
     const pages = await listPublicPages();
     for (const page of pages) {
-      // "home"/"about" already map to the two fixed routes above — see
+      // "home"/"about" map to the two fixed routes — see
       // app/page.tsx/app/about/page.tsx's own slug convention. Every
       // other slug renders at /p/[slug].
-      if (page.slug === "home" || page.slug === "about") continue;
+      if (page.slug === "home") continue;
+      if (page.slug === "about") {
+        entries.push({
+          url: `${siteUrl}/about`,
+          lastModified: page.updated_at,
+          changeFrequency: "monthly",
+          priority: 0.6,
+        });
+        continue;
+      }
       entries.push({
         url: `${siteUrl}/p/${encodeURIComponent(page.slug)}`,
         lastModified: page.updated_at,
