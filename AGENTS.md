@@ -96,7 +96,7 @@ ai-employee/
 │       └── deps.py            RBAC: Role enum + require_role() dependency, backed by real JWTs
 ├── owner-agent/               isolated LLM tool-calling loop, own container/port 8100 — see "Owner agent" below
 │   ├── deps.py                 owner-only JWT check (duplicated from backend, not imported — see below)
-│   ├── tools.py                 fixed 30-tool allowlist + execute_tool() (HTTP calls onto backend)
+│   ├── tools.py                 fixed 33-tool allowlist + execute_tool() (HTTP calls onto backend)
 │   ├── agent_loop.py             the loop itself: JSON-envelope tool selection against Ollama
 │   ├── logging_.py                action log: stdout + logs/runs.jsonl (never the bearer token)
 │   └── main.py                  FastAPI app: GET /health, POST /run
@@ -440,7 +440,7 @@ belongs in a separate, narrowly-scoped worker.
 
 That worker now exists: **`owner-agent/`** (its own docker-compose
 service, port 8100). It's a real LLM tool-calling loop — the owner types a
-command, a local Ollama model decides which of a fixed 30-tool allowlist to
+command, a local Ollama model decides which of a fixed 33-tool allowlist to
 call, in what order, chaining results turn-to-turn (see "Owner agent" in
 Phase 6 below for the full design). It independently re-verifies the
 caller's JWT and requires `Role.owner` specifically (stricter than
@@ -5638,6 +5638,17 @@ a separate admin bar.
   selection in `?section=&item=` (see `frontend/AGENTS.md`'s
   `agent-console-section.tsx` row for the full section map). Replaced a
   single long Accordion of every panel.
+- **owner-agent can edit the menu** — `get_site_menu` (`GET
+  /agent/nav-menu/overview`: saved items, `is_default`,
+  `effective_items` = what visitors see now, `saved_pages` with their
+  hrefs) and `set_site_menu` (`PUT /agent/nav-menu`, full replacement,
+  applies immediately like `set_order_status_options`; `null` resets).
+  The overview's default rule (Home + About-if-saved) duplicates
+  `config/nav.ts`'s `buildPublicNav` by hand — keep both in sync.
+  Verified with two real runs against the configured model: "add
+  product-list as Shop after Home, plus Chat with us at the end" and
+  "rename Shop to Store and move it to the end" — both called
+  `get_site_menu` first and sent the correct full list.
 - **Admin bar** (`AdminBar`) — a dark strip above the header, only for
   admin/owner: Dashboard, Page Editor (the Menu is a tab inside it), and a contextual "Edit this
   page" (`/editor?slug=`). Admin links never appear in the public
@@ -5873,7 +5884,7 @@ considering it fully settled.
 - **Phase 6 — Agent security layer**: **started, not complete**. The
   isolated worker now exists — `owner-agent/` (own container/port 8100,
   see "Architecture decisions" above and "Owner agent" below) — with a
-  real LLM tool-calling loop over a fixed 30-tool allowlist, its own
+  real LLM tool-calling loop over a fixed 33-tool allowlist, its own
   owner-only auth check, and action logging to stdout + a bind-mounted
   `logs/runs.jsonl` (per-step, durable). The worker's "brain" model
   selection is now wired to the owner-facing model picker too
@@ -5897,7 +5908,7 @@ this is the one place the model itself decides which action(s) to take.
   `owner-agent` service → a loop against whatever chat provider/model the
   owner has picked in `ModelSettingsPanel` (2026-08-18, see the
   "brain call" bullet below) asks the model, each turn, to emit one JSON
-  envelope: either call one of 30 tools (`generate_poster`,
+  envelope: either call one of 33 tools (`generate_poster`,
   `generate_landing_page`, `crm_create_entry`, `crm_list_entries`,
   `crm_delete_entry`, `generate_report`, `generate_geo_page`,
   `scan_crm_attachment`, `cleanup_chat_uploads`, `cleanup_stale_crm_entries`,
@@ -5913,7 +5924,8 @@ this is the one place the model itself decides which action(s) to take.
   `edit_page_field`, `create_document`, `suggest_business_profile`
   (2026-09-10, see "Owner talks, AI operates" below),
   `sync_crm_entry_to_marketing` (2026-09-21, see "Marketing/CRM platform
-  sync" below) — each
+  sync" below), `get_site_menu`/`set_site_menu` (2026-10-31, see "Site
+  navigation, admin bar, menu" below) — each
   a thin HTTP call onto an already-real `backend/apis/agent.py`/
   `apis/intent_schemas.py`/`apis/products.py`/`apis/documents.py`/
   `apis/scheduled_tasks.py`/`apis/seo_audit.py`/`apis/marketing.py`

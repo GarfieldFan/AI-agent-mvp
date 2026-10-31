@@ -340,6 +340,35 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         method="PUT",
         path="/api/agent/shipping-settings",
     ),
+    "get_site_menu": ToolSpec(
+        name="get_site_menu",
+        description=(
+            "Returns the public site menu (the links visitors see in the header/footer) plus every saved "
+            "page you could link to. No arguments. Response: items (the saved menu, or null when the "
+            "site is still on the built-in default), is_default, effective_items (what visitors see "
+            "right now either way), saved_pages ([{slug, href}] — use these exact hrefs to link a page). "
+            "ALWAYS call this before set_site_menu, since set_site_menu replaces the whole menu."
+        ),
+        method="GET",
+        path="/api/agent/nav-menu/overview",
+    ),
+    "set_site_menu": ToolSpec(
+        name="set_site_menu",
+        description=(
+            "Replaces the WHOLE public site menu (header + footer links), in order. Args: "
+            '{"items": [{"label": "<text shown>", "href": "<link>"}, ...]} — or {"items": null} to reset '
+            "to the built-in default (Home, plus About once an about page exists). To add/move/rename/"
+            "remove a single link, call get_site_menu first, start from its effective_items, change only "
+            "what the owner asked for, and send the full resulting list — anything you leave out is "
+            "removed. hrefs: a saved page's href from get_site_menu's saved_pages, \"/search\" for the "
+            "product catalog, \"#chat\" to open the chat assistant, or a full https:// / mailto: / tel: "
+            "link; nothing else is accepted. Max 20 items, labels max 60 chars. Admin links (Dashboard, "
+            "Page Editor) are never part of this menu — don't add them. Applies immediately (cheap to "
+            "change back), so state the final menu order in your final answer."
+        ),
+        method="PUT",
+        path="/api/agent/nav-menu",
+    ),
     "generate_landing_page": ToolSpec(
         name="generate_landing_page",
         description=(

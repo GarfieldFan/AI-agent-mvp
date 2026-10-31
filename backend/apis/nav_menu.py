@@ -14,11 +14,12 @@ rather than this file hardcoding a second copy of it. Admin links
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from apis.deps import Role, require_role
 from db import get_db
-from models import AppSettings
+from models import AppSettings, Page
 
 admin_router = APIRouter(prefix="/agent", dependencies=[Depends(require_role(Role.admin, Role.owner))])
 public_router = APIRouter()
@@ -96,6 +97,53 @@ def update_nav_menu(req: UpdateNavMenuRequest, db: Session = Depends(get_db)) ->
     db.commit()
     db.refresh(row)
     return _to_menu(row)
+
+
+class SavedPageLink(BaseModel):
+    slug: str
+    href: str
+
+
+class NavMenuOverview(BaseModel):
+    """Everything owner-agent's `get_site_menu` tool needs to edit the menu
+    in one call: what's saved, what visitors actually see right now, and
+    which pages exist to link to."""
+
+    items: list[NavMenuItem] | None
+    is_default: bool
+    effective_items: list[NavMenuItem]
+    saved_pages: list[SavedPageLink]
+
+
+def _href_for_slug(slug: str) -> str:
+    # Same slug → route convention the frontend follows (app/page.tsx,
+    # app/about/page.tsx, app/p/[slug]).
+    if slug == "home":
+        return "/"
+    if slug == "about":
+        return "/about"
+    return f"/p/{slug}"
+
+
+@admin_router.get("/nav-menu/overview", response_model=NavMenuOverview)
+def get_nav_menu_overview(db: Session = Depends(get_db)) -> NavMenuOverview:
+    menu = _to_menu(db.get(AppSettings, 1))
+    slugs = list(db.scalars(select(Page.slug).order_by(Page.slug)))
+    if menu.items is not None:
+        effective = menu.items
+    else:
+        # Mirrors the frontend's built-in default (config/nav.ts's
+        # buildPublicNav): Home, plus About once an "about" page exists.
+        # Kept in sync by hand — it's two lines on each side.
+        effective = [NavMenuItem(label="Home", href="/")]
+        if "about" in slugs:
+            effective.append(NavMenuItem(label="About", href="/about"))
+    return NavMenuOverview(
+        items=menu.items,
+        is_default=menu.items is None,
+        effective_items=effective,
+        saved_pages=[SavedPageLink(slug=slug, href=_href_for_slug(slug)) for slug in slugs],
+    )
 
 
 @public_router.get("/nav-menu", response_model=NavMenu)

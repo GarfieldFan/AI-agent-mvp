@@ -23,7 +23,10 @@ export const adminNav: NavItem[] = [
   { title: "Dashboard", href: "/dashboard" },
 ];
 
-/** Public nav for this request: the fixed base entries plus whichever
+/** Mirrored by hand in backend/apis/nav_menu.py's get_nav_menu_overview
+ * (owner-agent's get_site_menu) — change both together.
+ *
+ * Public nav for this request: the fixed base entries plus whichever
  * owner-created pages exist. Takes already-resolved facts, not a fetch,
  * so SiteHeader/SiteFooter decide once how to look them up. */
 export function buildPublicNav({ hasAboutPage }: { hasAboutPage: boolean }): NavItem[] {
